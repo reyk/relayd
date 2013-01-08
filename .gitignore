@@ -12,6 +12,7 @@ a.out
 ktrace.out
 mklog
 obj
+parse.c
 */relayctl
 */relayd
 regress/relayd.conf
