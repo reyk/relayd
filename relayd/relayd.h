@@ -87,7 +87,6 @@ struct shuffle {
 	int		 isindex;
 };
 
-
 typedef u_int32_t objid_t;
 
 struct ctl_flags {
@@ -113,6 +112,19 @@ struct ctl_relaytable {
 	objid_t		 relayid;
 	int		 mode;
 	u_int32_t	 flags;
+};
+
+struct ctl_kvlen {
+	ssize_t		 key;
+	ssize_t		 value;
+};
+
+struct ctl_rule {
+	struct ctl_kvlen cookie;
+	struct ctl_kvlen headerXXX;
+	struct ctl_kvlen path;
+	struct ctl_kvlen query;
+	struct ctl_kvlen url;
 };
 
 struct ctl_script {
@@ -150,22 +162,10 @@ struct ctl_tcp_event {
 	SSL			*ssl;
 };
 
-enum httpmethod {
-	HTTP_METHOD_NONE	= 0,
-	HTTP_METHOD_GET		= 1,
-	HTTP_METHOD_HEAD	= 2,
-	HTTP_METHOD_POST	= 3,
-	HTTP_METHOD_PUT		= 4,
-	HTTP_METHOD_DELETE	= 5,
-	HTTP_METHOD_OPTIONS	= 6,
-	HTTP_METHOD_TRACE	= 7,
-	HTTP_METHOD_CONNECT	= 8,
-	HTTP_METHOD_RESPONSE	= 9	/* Server response */
-};
-
 enum direction {
-	RELAY_DIR_REQUEST	= 0,
-	RELAY_DIR_RESPONSE	= 1
+	RELAY_DIR_ANY		= 0,
+	RELAY_DIR_REQUEST	= 1,
+	RELAY_DIR_RESPONSE	= 2
 };
 
 struct ctl_relay_event {
@@ -177,23 +177,18 @@ struct ctl_relay_event {
 	struct ctl_relay_event	*dst;
 	struct rsession		*con;
 	SSL			*ssl;
-	u_int8_t		*nodes;
-	struct proto_tree	*tree;
-
-	char			*path;
-	char			*args;
-	char			*version;
 
 	off_t			 splicelen;
 	int			 line;
 	off_t			 toread;
-	int			 chunked;
 	int			 done;
-	enum httpmethod		 method;
 	enum direction		 dir;
 
 	u_int8_t		*buf;
 	int			 buflen;
+
+	/* protocol-specific descriptor */
+	void			*desc;
 };
 
 struct ctl_natlook {
@@ -233,6 +228,40 @@ struct ctl_stats {
 	u_int32_t		 avg_day;
 	u_int32_t		 last_day;
 };
+
+enum keyaction {
+	KEY_ACTION_NONE		= 0,
+	KEY_ACTION_APPEND,
+	KEY_ACTION_SET,
+	KEY_ACTION_REMOVE,
+	KEY_ACTION_HASH,
+	KEY_ACTION_LOG
+};
+
+enum keytype {
+	KEY_TYPE_NONE		= 0,
+	KEY_TYPE_COOKIE,
+	KEY_TYPE_HEADER,
+	KEY_TYPE_PATH,
+	KEY_TYPE_QUERY,
+	KEY_TYPE_URL
+};
+
+struct kv {
+	char			*kv_key;
+	char			*kv_value;
+
+	enum keyaction		 kv_action;
+	enum keytype		 kv_type;
+
+	/* A few pointers used by the rule actions */
+	struct kv		*kv_match;
+	struct kvlist		*kv_matchlist;
+	struct kv		**kv_matchptr;
+
+	TAILQ_ENTRY(kv)		 kv_entry;
+};
+TAILQ_HEAD(kvlist, kv);
 
 struct portrange {
 	in_port_t		 val[2];
@@ -380,6 +409,7 @@ struct table_config {
 	int			 retcode;
 	int			 skip_cnt;
 	char			 name[TABLE_NAME_SIZE];
+	size_t			 name_len;
 	char			 path[MAXPATHLEN];
 	char			 exbuf[64];
 	char			 digest[41]; /* length of sha1 digest * 2 */
@@ -460,78 +490,85 @@ struct rsession {
 };
 SPLAY_HEAD(session_tree, rsession);
 
-enum nodeaction {
-	NODE_ACTION_NONE	= 0,
-	NODE_ACTION_APPEND	= 1,
-	NODE_ACTION_CHANGE	= 2,
-	NODE_ACTION_REMOVE	= 3,
-	NODE_ACTION_EXPECT	= 4,
-	NODE_ACTION_FILTER	= 5,
-	NODE_ACTION_HASH	= 6,
-	NODE_ACTION_LOG		= 7,
-	NODE_ACTION_MARK	= 8
-};
-
-enum nodetype {
-	NODE_TYPE_HEADER	= 0,
-	NODE_TYPE_QUERY		= 1,
-	NODE_TYPE_COOKIE	= 2,
-	NODE_TYPE_PATH		= 3,
-	NODE_TYPE_URL		= 4
-};
-
-#define PNFLAG_MACRO			0x01
-#define PNFLAG_MARK			0x02
-#define PNFLAG_LOG			0x04
-#define PNFLAG_LOOKUP_QUERY		0x08
-#define PNFLAG_LOOKUP_COOKIE		0x10
-#define PNFLAG_LOOKUP_URL		0xe0
-#define PNFLAG_LOOKUP_URL_DIGEST	0xc0
-#define PNFLAG_LOOKUP_DIGEST(x)		(0x20 << x)
-
-enum noderesult {
-	PN_DROP			= 0,
-	PN_PASS			= 1,
-	PN_FAIL			= -1
-};
-
-struct protonode_config {
-	objid_t				 protoid;
-	size_t				 keylen;
-	size_t				 valuelen;
-	size_t				 len;
-	size_t                           labelnamelen;
-	u_int				 dir;
-};
-
-struct protonode {
-	struct protonode_config		 conf;
-	objid_t				 id;
-	enum nodeaction			 action;
-	u_int8_t			 flags;
-	enum nodetype			 type;
-	u_int16_t			 mark;
-	u_int16_t			 label;
-
-	char                            *labelname;
-	char				*key;
-	char				*value;
-
-	SIMPLEQ_HEAD(, protonode)	 head;
-	SIMPLEQ_ENTRY(protonode)	 entry;
-
-	RB_ENTRY(protonode)		 nodes;
-};
-RB_HEAD(proto_tree, protonode);
-
-#define PROTONODE_FOREACH(elm, root, field)				\
-	for (elm = root; elm != NULL; elm = SIMPLEQ_NEXT(elm, entry))	\
-
 enum prototype {
 	RELAY_PROTO_TCP		= 0,
-	RELAY_PROTO_HTTP	= 1,
-	RELAY_PROTO_DNS		= 2
+	RELAY_PROTO_HTTP,
+	RELAY_PROTO_DNS
 };
+
+enum relay_result {
+	RES_DROP		= 0,
+	RES_PASS		= 1,
+	RES_FAIL		= -1
+};
+
+enum rule_type {
+	RULE_TYPE_MATCH		= 0,
+	RULE_TYPE_PASS,
+	RULE_TYPE_BLOCK
+};
+
+struct rule_addr {
+	int				 addr_af;
+	struct sockaddr_storage		 addr;
+	u_int8_t			 addr_mask;
+	int				 addr_net;
+	in_port_t			 addr_port;
+};
+
+#define RELAY_ADDR_EQ(_a, _b)						\
+	((_a)->addr_mask == (_b)->addr_mask &&				\
+	sockaddr_cmp((struct sockaddr *)&(_a)->addr,			\
+	(struct sockaddr *)&(_b)->addr, (_a)->addr_mask) == 0)
+
+#define RELAY_ADDR_CMP(_a, _b)						\
+	sockaddr_cmp((struct sockaddr *)&(_a)->addr,			\
+	(struct sockaddr *)(_b), (_a)->addr_mask)
+
+#define RELAY_ADDR_NEQ(_a, _b)						\
+	((_a)->addr_mask != (_b)->addr_mask ||				\
+	sockaddr_cmp((struct sockaddr *)&(_a)->addr,			\
+	(struct sockaddr *)&(_b)->addr, (_a)->addr_mask) != 0)
+
+struct relay_rule {
+	objid_t			 rule_id;
+	objid_t			 rule_protoid;
+
+	u_int			 rule_type;
+
+#define RULE_SKIP_PROTO		 0
+#define RULE_SKIP_DIR		 1
+#define RULE_SKIP_AF		 2
+#define RULE_SKIP_SRC		 3
+#define RULE_SKIP_DST		 4
+#define RULE_SKIP_METHOD	 5
+#define RULE_SKIP_COUNT		 6
+	struct relay_rule	*rule_skip[RULE_SKIP_COUNT];
+
+#define RULE_FLAG_QUICK		0x01
+#define RULE_FLAG_FORWARD_TABLE	0x02
+	u_int8_t		 rule_flags;
+
+	u_int			 rule_dir;
+	u_int			 rule_proto;
+	int			 rule_af;
+	struct rule_addr	 rule_src;
+	struct rule_addr	 rule_dst;
+
+	u_int			 rule_method;
+	u_int			 rule_header;
+	char			 rule_tablename[TABLE_NAME_SIZE];
+
+	struct ctl_rule		 rule_ctl;
+	struct kv		 rule_cookie;
+	struct kv		 rule_headerXXX;
+	struct kv		 rule_path;
+	struct kv		 rule_query;
+	struct kv		 rule_url;
+
+	TAILQ_ENTRY(relay_rule)	 rule_entry;
+};
+TAILQ_HEAD(relay_rules, relay_rule);
 
 #define TCPFLAG_NODELAY		0x01
 #define TCPFLAG_NNODELAY	0x02
@@ -575,16 +612,15 @@ struct protocol {
 	int			 lateconnect;
 	char			*style;
 
-	int			 request_nodes;
-	struct proto_tree	 request_tree;
-	int			 response_nodes;
-	struct proto_tree	 response_tree;
-
 	int			(*cmp)(struct rsession *, struct rsession *);
 	void			*(*validate)(struct rsession *, struct relay *,
 				    struct sockaddr_storage *,
 				    u_int8_t *, size_t);
 	int			(*request)(struct rsession *);
+	void			(*close)(struct rsession *);
+
+	struct relay_rules	 rules;
+	int			 rulecount;
 
 	TAILQ_ENTRY(protocol)	 entry;
 };
@@ -804,7 +840,7 @@ enum imsg_type {
 	IMSG_CFG_ROUTER,
 	IMSG_CFG_ROUTE,
 	IMSG_CFG_PROTO,
-	IMSG_CFG_PROTONODE,
+	IMSG_CFG_RULE,
 	IMSG_CFG_RELAY,
 	IMSG_CFG_RELAY_TABLE,
 	IMSG_CFG_DONE
@@ -974,6 +1010,7 @@ void	 hce_notify_done(struct host *, enum host_error);
 /* relay.c */
 pid_t	 relay(struct privsep *, struct privsep_proc *);
 int	 relay_privinit(struct relay *);
+int	 relay_http_descinit(struct ctl_relay_event *);
 void	 relay_notify_done(struct host *, const char *);
 int	 relay_session_cmp(struct rsession *, struct rsession *);
 int	 relay_load_certfiles(struct relay *);
@@ -989,29 +1026,35 @@ int	 relay_cmp_af(struct sockaddr_storage *,
 void	 relay_write(struct bufferevent *, void *);
 void	 relay_read(struct bufferevent *, void *);
 void	 relay_error(struct bufferevent *, short, void *);
-int	 relay_lognode(struct rsession *,
-	    struct protonode *, struct protonode *, char *, size_t);
 int	 relay_connect(struct rsession *);
 void	 relay_connected(int, short, void *);
 void	 relay_bindanyreq(struct rsession *, in_port_t, int);
 void	 relay_bindany(int, short, void *);
 void	 relay_dump(struct ctl_relay_event *, const void *, size_t);
 int	 relay_bufferevent_add(struct event *, int);
-int	 relay_bufferevent_print(struct ctl_relay_event *, char *);
+int	 relay_bufferevent_print(struct ctl_relay_event *, const char *);
 int	 relay_bufferevent_write_buffer(struct ctl_relay_event *,
 	    struct evbuffer *);
 int	 relay_bufferevent_write_chunk(struct ctl_relay_event *,
 	    struct evbuffer *, size_t);
 int	 relay_bufferevent_write(struct ctl_relay_event *,
 	    void *, size_t);
+int	 relay_test(struct protocol *, struct ctl_relay_event *);
+void	 relay_calc_skip_steps(struct relay_rules *);
 
-RB_PROTOTYPE(proto_tree, protonode, se_nodes, relay_proto_cmp);
 SPLAY_PROTOTYPE(session_tree, rsession, se_nodes, relay_session_cmp);
 
 /* relay_http.c */
+void	 relay_http(struct relayd *);
+void	 relay_http_init(struct relay *);
 void	 relay_abort_http(struct rsession *, u_int, const char *,
 	    u_int16_t);
 void	 relay_read_http(struct bufferevent *, void *);
+void	 relay_close_http(struct rsession *);
+u_int	 relay_httpmethod_byname(const char *);
+const char
+	*relay_httpmethod_byid(u_int);
+u_int	 relay_httpheader_byname(const char *);
 
 /* relay_udp.c */
 void	 relay_udp_privinit(struct relayd *, struct relay *);
@@ -1064,17 +1107,10 @@ struct relay	*relay_findbyname(struct relayd *, const char *);
 struct relay	*relay_findbyaddr(struct relayd *, struct relay_config *);
 int		 expand_string(char *, size_t, const char *, const char *);
 void		 translate_string(char *);
-void		 purge_tree(struct proto_tree *);
 void		 purge_table(struct tablelist *, struct table *);
 void		 purge_relay(struct relayd *, struct relay *);
 char		*digeststr(enum digest_type, const u_int8_t *, size_t, char *);
 const char	*canonicalize_host(const char *, char *, size_t);
-struct protonode *protonode_header(enum direction, struct protocol *,
-		    struct protonode *);
-int		 protonode_add(enum direction, struct protocol *,
-		    struct protonode *);
-int		 protonode_load(enum direction, struct protocol *,
-		    struct protonode *, const char *);
 int		 map6to4(struct sockaddr_storage *);
 int		 map4to6(struct sockaddr_storage *, struct sockaddr_storage *);
 void		 imsg_event_add(struct imsgev *);
@@ -1083,8 +1119,19 @@ int		 imsg_compose_event(struct imsgev *, u_int16_t, u_int32_t,
 void		 socket_rlimit(int);
 char		*get_string(u_int8_t *, size_t);
 void		*get_data(u_int8_t *, size_t);
+int		 sockaddr_cmp(struct sockaddr *, struct sockaddr *, int);
+struct in6_addr *prefixlen2mask6(u_int8_t, u_int32_t *);
+u_int32_t	 prefixlen2mask(u_int8_t);
 int		 accept_reserve(int sockfd, struct sockaddr *addr,
 		    socklen_t *addrlen, int reserve, volatile int *);
+struct kv	*kv_add(struct kvlist *, char *, char *);
+int		 kv_set(struct kv *, char *, ...);
+int		 kv_setkey(struct kv *, char *, ...);
+void		 kv_delete(struct kvlist *, struct kv *);
+struct kv	*kv_extend(struct kvlist *, char *);
+void		 kv_purge(struct kvlist *);
+void		 kv_free(struct kv *);
+int		 kv_log(struct evbuffer *, const char *, struct kv *);
 
 /* carp.c */
 int	 carp_demote_init(char *, int);
@@ -1159,12 +1206,10 @@ int	 config_getvirt(struct relayd *, struct imsg *);
 int	 config_setrt(struct relayd *, struct router *);
 int	 config_getrt(struct relayd *, struct imsg *);
 int	 config_getroute(struct relayd *, struct imsg *);
-int	 config_setproto(struct relayd *env, struct protocol *);
+int	 config_setproto(struct relayd *, struct protocol *);
 int	 config_getproto(struct relayd *, struct imsg *);
-int	 config_setprotonode(struct relayd *, enum privsep_procid,
-	    struct protocol *, enum direction);
-int	 config_getprotonode(struct relayd *, struct imsg *);
-int	 config_setrelay(struct relayd *env, struct relay *);
+int	 config_getrule(struct relayd *, struct imsg *);
+int	 config_setrelay(struct relayd *, struct relay *);
 int	 config_getrelay(struct relayd *, struct imsg *);
 int	 config_getrelaytable(struct relayd *, struct imsg *);
 

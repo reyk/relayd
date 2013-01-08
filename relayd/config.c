@@ -115,8 +115,6 @@ config_init(struct relayd *env)
 		env->sc_proto_default.type = RELAY_PROTO_TCP;
 		(void)strlcpy(env->sc_proto_default.name, "default",
 		    sizeof(env->sc_proto_default.name));
-		RB_INIT(&env->sc_proto_default.request_tree);
-		RB_INIT(&env->sc_proto_default.response_tree);
 	}
 	if (what & CONFIG_RTS) {
 		if ((env->sc_rts =
@@ -142,6 +140,7 @@ config_purge(struct relayd *env, u_int reset)
 	struct rdr		*rdr;
 	struct address		*virt;
 	struct protocol		*proto;
+	struct relay_rule	*rule;
 	struct relay		*rlay;
 	struct netroute		*nr;
 	struct router		*rt;
@@ -173,8 +172,15 @@ config_purge(struct relayd *env, u_int reset)
 	if (what & CONFIG_PROTOS && env->sc_protos != NULL) {
 		while ((proto = TAILQ_FIRST(env->sc_protos)) != NULL) {
 			TAILQ_REMOVE(env->sc_protos, proto, entry);
-			purge_tree(&proto->request_tree);
-			purge_tree(&proto->response_tree);
+			while ((rule = TAILQ_FIRST(&proto->rules)) != NULL) {
+				TAILQ_REMOVE(&proto->rules, rule, rule_entry);
+				kv_free(&rule->rule_cookie);
+				kv_free(&rule->rule_headerXXX);
+				kv_free(&rule->rule_path);
+				kv_free(&rule->rule_query);
+				kv_free(&rule->rule_url);
+				free(rule);
+			}
 			if (proto->style != NULL)
 				free(proto->style);
 			free(proto);
@@ -575,8 +581,9 @@ int
 config_setproto(struct relayd *env, struct protocol *proto)
 {
 	struct privsep		*ps = env->sc_ps;
+	struct relay_rule	*rule;
 	int			 id;
-	struct iovec		 iov[2];
+	struct iovec		 iov[IOV_MAX];
 	size_t			 c;
 
 	for (id = 0; id < PROC_MAX; id++) {
@@ -599,12 +606,37 @@ config_setproto(struct relayd *env, struct protocol *proto)
 		/* XXX struct protocol should be split */
 		proc_composev_imsg(ps, id, -1, IMSG_CFG_PROTO, -1, iov, c);
 
-		/* Now send all the protocol key/value nodes */
-		if (config_setprotonode(env, id, proto,
-		    RELAY_DIR_REQUEST) == -1 ||
-		    config_setprotonode(env, id, proto,
-		    RELAY_DIR_RESPONSE) == -1)
-			return (-1);
+		/* XXX Now send all the rules */
+		TAILQ_FOREACH(rule, &proto->rules, rule_entry) {
+			rule->rule_protoid = proto->id;
+			bzero(&rule->rule_ctl, sizeof(rule->rule_ctl));
+
+			c = 0;
+			iov[c].iov_base = rule;
+			iov[c++].iov_len = sizeof(*rule);
+
+#define _ADDKV(_x, _y)	{						\
+	if (rule->rule_##_x.kv_##_y != NULL) {				\
+		rule->rule_ctl._x._y = strlen(rule->rule_##_x.kv_##_y);	\
+		iov[c].iov_base = rule->rule_##_x.kv_##_y;		\
+		iov[c++].iov_len = rule->rule_ctl._x._y;		\
+	} else								\
+		rule->rule_ctl._x._y = -1;				\
+}
+#define ADDKV(_x)	{						\
+	_ADDKV(_x, key);						\
+	_ADDKV(_x, value);						\
+}
+
+			ADDKV(cookie);
+			ADDKV(headerXXX);
+			ADDKV(path);
+			ADDKV(query);
+			ADDKV(url);
+
+			proc_composev_imsg(ps, id, -1,
+			    IMSG_CFG_RULE, -1, iov, c);
+		}
 	}
 
 	return (0);
@@ -633,10 +665,7 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 		}
 	}
 
-	proto->request_nodes = 0;
-	proto->response_nodes = 0;
-	RB_INIT(&proto->request_tree);
-	RB_INIT(&proto->response_tree);
+	TAILQ_INIT(&proto->rules);
 
 	TAILQ_INSERT_TAIL(env->sc_protos, proto, entry);
 
@@ -650,144 +679,63 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 }
 
 int
-config_setprotonode(struct relayd *env, enum privsep_procid id,
-    struct protocol *proto, enum direction dir)
+config_getrule(struct relayd *env, struct imsg *imsg)
 {
-	struct privsep		*ps = env->sc_ps;
-	struct iovec		 iov[IOV_MAX];
-	size_t			 c, sz;
-	struct protonode	*proot, *pn;
-	struct proto_tree	*tree;
+	struct protocol		*proto;
+	struct relay_rule	*rule;
+	size_t			 s;
+	u_int8_t		*p = imsg->data;
+	ssize_t			 len;
 
-	if (dir == RELAY_DIR_RESPONSE)
-		tree = &proto->response_tree;
-	else
-		tree = &proto->request_tree;
+	if ((rule = calloc(1, sizeof(*rule))) == NULL)
+		return (-1);
 
-	sz = c = 0;
-	RB_FOREACH(proot, proto_tree, tree) {
-		PROTONODE_FOREACH(pn, proot, entry) {
-			pn->conf.protoid = proto->id;
-			pn->conf.dir = dir;
-			pn->conf.keylen = pn->key ? strlen(pn->key) : 0;
-			pn->conf.valuelen = pn->value ? strlen(pn->value) : 0;
-			if (pn->label != 0 && pn->labelname == NULL)
-				pn->labelname = strdup(pn_id2name(pn->label));
-			pn->conf.labelnamelen = pn->labelname ?
-			    strlen(pn->labelname) : 0;
+	IMSG_SIZE_CHECK(imsg, rule);
+	memcpy(rule, p, sizeof(*rule));
+	s = sizeof(*rule);
+	len = IMSG_DATA_SIZE(imsg) - s;
 
-			pn->conf.len = sizeof(*pn) +
-			    pn->conf.keylen + pn->conf.valuelen +
-			    pn->conf.labelnamelen;
-
-			if (pn->conf.len > (MAX_IMSGSIZE - IMSG_HEADER_SIZE))
-				return (-1);
-
-			if (c && ((c + 3) >= IOV_MAX || (sz + pn->conf.len) >
-			    (MAX_IMSGSIZE - IMSG_HEADER_SIZE))) {
-				proc_composev_imsg(ps, id, -1,
-				    IMSG_CFG_PROTONODE, -1, iov, c);
-				c = sz = 0;
-			}
-
-			iov[c].iov_base = pn;
-			iov[c++].iov_len = sizeof(*pn);
-			if (pn->conf.keylen) {
-				iov[c].iov_base = pn->key;
-				iov[c++].iov_len = pn->conf.keylen;
-			}
-			if (pn->conf.valuelen) {
-				iov[c].iov_base = pn->value;
-				iov[c++].iov_len = pn->conf.valuelen;
-			}
-			if (pn->conf.labelnamelen) {
-				iov[c].iov_base = pn->labelname;
-				iov[c++].iov_len = pn->conf.labelnamelen;
-			}
-			sz += pn->conf.len;
-		}
+	if ((proto = proto_find(env, rule->rule_protoid)) == NULL) {
+		free(rule);
+		return (-1);
 	}
 
-	if (c && sz)
-		proc_composev_imsg(ps, id, -1, IMSG_CFG_PROTONODE, -1, iov, c);
-
-	return (0);
+#define _GETKV(_n, _f)	{						\
+	if (rule->rule_ctl._n._f >= 0) {				\
+		/* Also accept "empty" 0-length strings */		\
+		if ((len < rule->rule_ctl._n._f) ||			\
+		    (rule->rule_##_n.kv_##_f =				\
+		    get_string(p + s, rule->rule_ctl._n._f)) == NULL) {	\
+			free(rule);					\
+			return (-1);					\
+		}							\
+		s += rule->rule_ctl._n._f;				\
+		len -= rule->rule_ctl._n._f;				\
+									\
+		DPRINTF("%s: %s %s (len %d, action %d): %s", __func__,	\
+		    #_n, #_f, rule->rule_ctl._n._f,			\
+		    rule->rule_##_n.kv_action,				\
+		    rule->rule_##_n.kv_##_f);				\
+	}								\
+}
+#define GETKV(_n)	{						\
+	_GETKV(_n, key);						\
+	_GETKV(_n, value);						\
 }
 
-int
-config_getprotonode(struct relayd *env, struct imsg *imsg)
-{
-	struct protocol		*proto = NULL;
-	struct protonode	 pn;
-	size_t			 z, s, c = 0;
-	u_int8_t		*p = imsg->data;
+	GETKV(cookie);
+	GETKV(headerXXX);
+	GETKV(path);
+	GETKV(query);
+	GETKV(url);
 
-	bzero(&pn, sizeof(pn));
+	rule->rule_id = proto->rulecount++;
 
-	IMSG_SIZE_CHECK(imsg, &pn);
-	for (z = 0; z < (IMSG_DATA_SIZE(imsg) - sizeof(pn)); z += pn.conf.len) {
-		s = z;
-		memcpy(&pn, p + s, sizeof(pn));
-		s += sizeof(pn);
+	TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
 
-		if ((proto = proto_find(env, pn.conf.protoid)) == NULL) {
-			log_debug("%s: unknown protocol %d", __func__,
-			    pn.conf.protoid);
-			return (-1);
-		}
-
-		pn.key = pn.value = pn.labelname = NULL;
-		bzero(&pn.entry, sizeof(pn.entry));
-		bzero(&pn.nodes, sizeof(pn.nodes));
-		bzero(&pn.head, sizeof(pn.head));
-
-		if (pn.conf.keylen) {
-			if ((pn.key = get_string(p + s,
-			    pn.conf.keylen)) == NULL) {
-				log_debug("%s: failed to get key", __func__);
-				return (-1);
-			}
-			s += pn.conf.keylen;
-		}
-		if (pn.conf.valuelen) {
-			if ((pn.value = get_string(p + s,
-			    pn.conf.valuelen)) == NULL) {
-				log_debug("%s: failed to get value", __func__);
-				if (pn.key != NULL)
-					free(pn.key);
-				return (-1);
-			}
-			s += pn.conf.valuelen;
-		}
-		if (pn.conf.labelnamelen) {
-			if ((pn.labelname = get_string(p + s,
-			    pn.conf.labelnamelen)) == NULL) {
-				log_debug("%s: failed to get labelname",
-				    __func__);
-				return (-1);
-			}
-			s += pn.conf.labelnamelen;
-		}
-
-		if (protonode_add(pn.conf.dir, proto, &pn) == -1) {
-			if (pn.key != NULL)
-				free(pn.key);
-			if (pn.value != NULL)
-				free(pn.value);
-			if (pn.labelname != NULL)
-				free(pn.labelname);
-			log_debug("%s: failed to add protocol node", __func__);
-			return (-1);
-		}
-		c++;
-	}
-
-	if (!c)
-		return (0);
-
-	DPRINTF("%s: %s %d received %lu nodes for protocol %s", __func__,
+	DPRINTF("%s: %s %d received rule %lu for protocol %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
-	    c, proto->name);
+	    rule->rule_id, proto->name);
 
 	return (0);
 }

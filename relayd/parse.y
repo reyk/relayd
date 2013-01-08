@@ -55,6 +55,7 @@
 #include <openssl/ssl.h>
 
 #include "relayd.h"
+#include "http.h"
 
 TAILQ_HEAD(files, file)		 files = TAILQ_HEAD_INITIALIZER(files);
 static struct file {
@@ -104,11 +105,9 @@ static struct relay	*rlay = NULL;
 static struct host	*hst = NULL;
 struct relaylist	 relays;
 static struct protocol	*proto = NULL;
-static struct protonode	 node;
+static struct relay_rule *rule = NULL;
 static struct router	*router = NULL;
-static u_int16_t	 label = 0;
 static in_port_t	 tableport = 0;
-static int		 nodedirection;
 static int		 dstmode;
 
 struct address	*host_v4(const char *);
@@ -134,6 +133,7 @@ typedef struct {
 		struct timeval		 tv;
 		struct table		*table;
 		struct portrange	 port;
+		enum direction		 dir;
 		struct {
 			struct sockaddr_storage	 ss;
 			char			 name[MAXHOSTNAMELEN];
@@ -148,30 +148,32 @@ typedef struct {
 
 %}
 
-%token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE CHANGE CHECK
-%token	CIPHERS CODE COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT
-%token	EXTERNAL FILENAME FILTER FORWARD FROM HASH HEADER HOST ICMP
-%token	INCLUDE INET INET6 INTERFACE INTERVAL IP LABEL LISTEN
-%token	LOADBALANCE LOG LOOKUP MARK MARKED MODE NAT NO DESTINATION
+%token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK
+%token	CIPHERS CODE COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK
+%token	EXTERNAL FILENAME FORWARD FROM HASH HEADER HOST ICMP
+%token	INCLUDE INET INET6 INTERFACE INTERVAL IP LABEL LISTEN VALUE
+%token	LOADBALANCE LOG LOOKUP METHOD MODE NAT NO DESTINATION
 %token	NODELAY NOTHING ON PARENT PATH PORT PREFORK PRIORITY PROTO
-%token	QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE RETRY
+%token	QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE RETRY QUICK
 %token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SOCKET SPLICE
 %token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
 %token	RANDOM LEASTSTATES SRCHASH
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
-%type	<v.string>	hostname interface table
-%type	<v.number>	http_type loglevel mark
-%type	<v.number>	direction dstmode flag forwardmode retry
+%type	<v.string>	hostname interface table value
+%type	<v.number>	http_type loglevel quick
+%type	<v.number>	dstmode flag forwardmode retry
 %type	<v.number>	optssl optsslclient sslcache
 %type	<v.number>	redirect_proto relay_proto match
+%type	<v.number>	action ruleaf keyaction
 %type	<v.port>	port
 %type	<v.host>	host
 %type	<v.addr>	address
 %type	<v.tv>		timeout
 %type	<v.digest>	digest
 %type	<v.table>	tablespec
+%type	<v.dir>		dir
 
 %%
 
@@ -624,6 +626,7 @@ tablespec	: table			{
 			(void)strlcpy(tb->conf.name, $1, sizeof(tb->conf.name));
 			free($1);
 			table = tb;
+			dstmode = RELAY_DSTMODE_DEFAULT;
 		} tableopts_l		{
 			struct table	*tb;
 			if (table->conf.port == 0)
@@ -837,6 +840,9 @@ proto		: relay_proto PROTO STRING	{
 			p->tcpflags = TCPFLAG_DEFAULT;
 			p->sslflags = SSLFLAG_DEFAULT;
 			p->tcpbacklog = RELAY_BACKLOG;
+			TAILQ_INIT(&p->rules);
+			if (p->type == RELAY_PROTO_HTTP)
+				p->lateconnect = 1;
 			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
 			    sizeof(p->sslciphers));
 			if (last_proto_id == INT_MAX) {
@@ -844,8 +850,6 @@ proto		: relay_proto PROTO STRING	{
 				free(p);
 				YYERROR;
 			}
-			RB_INIT(&p->request_tree);
-			RB_INIT(&p->response_tree);
 			proto = p;
 		} protopts_n			{
 			conf->sc_protocount++;
@@ -874,35 +878,8 @@ protoptsl	: SSL sslflags
 		| TCP '{' tcpflags_l '}'
 		| RETURN ERROR opteflags	{ proto->flags |= F_RETURN; }
 		| RETURN ERROR '{' eflags_l '}'	{ proto->flags |= F_RETURN; }
-		| LABEL STRING			{
-			label = pn_name2id($2);
-			free($2);
-			if (label == 0) {
-				yyerror("invalid protocol action label");
-				YYERROR;
-			}
-		}
-		| NO LABEL			{
-			label = 0;
-		}
-		| direction			{
-			node.label = label;
-			node.labelname = NULL;
-			nodedirection = $1;
-		} protonode {
-			if (nodedirection != -1 &&
-			    protonode_add(nodedirection, proto, &node) == -1) {
-				yyerror("failed to add protocol node");
-				YYERROR;
-			}
-			bzero(&node, sizeof(node));
-		}
+		| filterrule
 		| include
-		;
-
-direction	: /* empty */		{ $$ = RELAY_DIR_REQUEST; }
-		| REQUEST		{ $$ = RELAY_DIR_REQUEST; }
-		| RESPONSE		{ $$ = RELAY_DIR_RESPONSE; }
 		;
 
 tcpflags_l	: tcpflags comma tcpflags_l
@@ -995,212 +972,6 @@ flag		: STRING			{
 		}
 		;
 
-protonode	: nodetype APPEND STRING TO STRING nodeopts		{
-			node.action = NODE_ACTION_APPEND;
-			node.key = strdup($5);
-			node.value = strdup($3);
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			if (strchr(node.value, '$') != NULL)
-				node.flags |= PNFLAG_MACRO;
-			free($5);
-			free($3);
-		}
-		| nodetype CHANGE STRING TO STRING nodeopts		{
-			node.action = NODE_ACTION_CHANGE;
-			node.key = strdup($3);
-			node.value = strdup($5);
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			if (strchr(node.value, '$') != NULL)
-				node.flags |= PNFLAG_MACRO;
-			free($5);
-			free($3);
-		}
-		| nodetype REMOVE STRING nodeopts			{
-			node.action = NODE_ACTION_REMOVE;
-			node.key = strdup($3);
-			node.value = NULL;
-			if (node.key == NULL)
-				fatal("out of memory");
-			free($3);
-		}
-		| nodetype REMOVE					{
-			node.action = NODE_ACTION_REMOVE;
-			node.key = NULL;
-			node.value = NULL;
-		} nodefile
-		| nodetype EXPECT STRING FROM STRING nodeopts		{
-			node.action = NODE_ACTION_EXPECT;
-			node.key = strdup($5);
-			node.value = strdup($3);
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($5);
-			free($3);
-			proto->lateconnect++;
-		}
-		| nodetype EXPECT STRING nodeopts			{
-			node.action = NODE_ACTION_EXPECT;
-			node.key = strdup($3);
-			node.value = strdup("*");
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($3);
-			proto->lateconnect++;
-		}
-		| nodetype EXPECT					{
-			node.action = NODE_ACTION_EXPECT;
-			node.key = NULL;
-			node.value = "*";
-			proto->lateconnect++;
-		} nodefile
-		| nodetype EXPECT digest nodeopts			{
-			if (node.type != NODE_TYPE_URL) {
-				yyerror("digest not supported for this type");
-				free($3.digest);
-				YYERROR;
-			}
-			node.action = NODE_ACTION_EXPECT;
-			node.key = strdup($3.digest);
-			node.flags |= PNFLAG_LOOKUP_DIGEST($3.type);
-			node.value = strdup("*");
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($3.digest);
-			proto->lateconnect++;
-		}
-		| nodetype FILTER STRING FROM STRING nodeopts		{
-			node.action = NODE_ACTION_FILTER;
-			node.key = strdup($5);
-			node.value = strdup($3);
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($5);
-			free($3);
-			proto->lateconnect++;
-		}
-		| nodetype FILTER STRING nodeopts			{
-			node.action = NODE_ACTION_FILTER;
-			node.key = strdup($3);
-			node.value = strdup("*");
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($3);
-			proto->lateconnect++;
-		}
-		| nodetype FILTER					{
-			node.action = NODE_ACTION_FILTER;
-			node.key = NULL;
-			node.value = "*";
-			proto->lateconnect++;
-		} nodefile
-		| nodetype FILTER digest nodeopts			{
-			if (node.type != NODE_TYPE_URL) {
-				yyerror("digest not supported for this type");
-				free($3.digest);
-				YYERROR;
-			}
-			node.action = NODE_ACTION_FILTER;
-			node.key = strdup($3.digest);
-			node.flags |= PNFLAG_LOOKUP_DIGEST($3.type);
-			node.value = strdup("*");
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($3.digest);
-			proto->lateconnect++;
-		}
-		| nodetype HASH STRING nodeopts				{
-			node.action = NODE_ACTION_HASH;
-			node.key = strdup($3);
-			node.value = NULL;
-			if (node.key == NULL)
-				fatal("out of memory");
-			free($3);
-			proto->lateconnect++;
-		}
-		| nodetype LOG STRING nodeopts				{
-			node.action = NODE_ACTION_LOG;
-			node.key = strdup($3);
-			node.value = NULL;
-			node.flags |= PNFLAG_LOG;
-			if (node.key == NULL)
-				fatal("out of memory");
-			free($3);
-		}
-		| nodetype LOG						{
-			node.action = NODE_ACTION_LOG;
-			node.key = NULL;
-			node.value = NULL;
-			node.flags |= PNFLAG_LOG;
-		} nodefile
-		| nodetype MARK STRING FROM STRING WITH mark log	{
-			node.action = NODE_ACTION_MARK;
-			node.key = strdup($5);
-			node.value = strdup($3);
-			node.mark = $7;
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($3);
-			free($5);
-		}
-		| nodetype MARK STRING WITH mark nodeopts		{
-			node.action = NODE_ACTION_MARK;
-			node.key = strdup($3);
-			node.value = strdup("*");
-			node.mark = $5;	/* overwrite */
-			if (node.key == NULL || node.value == NULL)
-				fatal("out of memory");
-			free($3);
-		}
-		;
-
-nodefile	: FILENAME STRING nodeopts			{
-			if (protonode_load(nodedirection,
-			    proto, &node, $2) == -1) {
-				yyerror("failed to load from file: %s", $2);
-				free($2);
-				YYERROR;
-			}
-			free($2);
-			nodedirection = -1;	/* don't add template node */
-		}
-		;
-
-nodeopts	: marked log
-		;
-
-marked		: /* empty */
-		| MARKED mark			{ node.mark = $2; }
-		;
-
-log		: /* empty */
-		| LOG				{ node.flags |= PNFLAG_LOG; }
-		;
-
-mark		: NUMBER					{
-			if ($1 <= 0 || $1 >= (int)USHRT_MAX) {
-				yyerror("invalid mark: %d", $1);
-				YYERROR;
-			}
-			$$ = $1;
-		}
-		;
-
-nodetype	: HEADER			{
-			node.type = NODE_TYPE_HEADER;
-		}
-		| QUERYSTR			{ node.type = NODE_TYPE_QUERY; }
-		| COOKIE			{
-			node.type = NODE_TYPE_COOKIE;
-		}
-		| PATH				{
-			proto->flags |= F_LOOKUP_PATH;
-			node.type = NODE_TYPE_PATH;
-		}
-		| URL				{ node.type = NODE_TYPE_URL; }
-		;
-
 sslcache	: NUMBER			{
 			if ($1 < 0) {
 				yyerror("invalid sslcache value: %d", $1);
@@ -1209,6 +980,130 @@ sslcache	: NUMBER			{
 			$$ = $1;
 		}
 		| DISABLE			{ $$ = -2; }
+		;
+
+filterrule	: action dir quick ruleaf rulesrc ruledst {
+			if ((rule = calloc(1, sizeof(*rule))) == NULL)
+				fatal("out of memory");
+
+			rule->rule_type = $1;
+			rule->rule_proto = proto->type;
+			rule->rule_dir = $2;
+			rule->rule_flags |= $3;
+			rule->rule_af = $4;
+		} ruleopts_l				{
+			TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
+		}
+		;
+
+action		: PASS				{ $$ = RULE_TYPE_PASS; }
+		| BLOCK				{ $$ = RULE_TYPE_BLOCK; }
+		| MATCH				{ $$ = RULE_TYPE_MATCH; }
+		;
+
+dir		: /* empty */			{ $$ = RELAY_DIR_ANY; }
+		| REQUEST			{ $$ = RELAY_DIR_REQUEST; }
+		| RESPONSE			{ $$ = RELAY_DIR_RESPONSE; }
+		;
+
+quick		: /* empty */			{ $$ = 0; }
+		| QUICK				{ $$ = RULE_FLAG_QUICK; }
+		;
+
+ruleaf		: /* empty */			{ $$ = AF_UNSPEC; }
+		| INET6				{ $$ = AF_INET6; }
+		| INET				{ $$ = AF_INET; }
+		;
+
+rulesrc		: /* XXX */
+		;
+
+ruledst		: /* XXX */
+		;
+
+ruleopts_l	: /* empty */
+		| ruleopts_t
+		;
+
+ruleopts_t	: ruleopts ruleopts_t
+		| ruleopts
+		;
+
+ruleopts	: METHOD STRING			{
+			u_int	id;
+			if ((id = relay_httpmethod_byname($2)) ==
+			    HTTP_HEADER_NONE) {
+				yyerror("unknown HTTP method currently not "
+				    "supported");
+				free($2);
+				YYERROR;
+			}
+			rule->rule_method = id;
+		}
+		| COOKIE keyaction STRING value		{
+			rule->rule_cookie.kv_action = $2;
+			rule->rule_cookie.kv_key = $3;
+			rule->rule_cookie.kv_value = $4;
+			rule->rule_cookie.kv_type = KEY_TYPE_COOKIE;
+
+		}
+		| HEADER keyaction STRING value		{
+			rule->rule_header =
+			    relay_httpheader_byname($3);
+			rule->rule_headerXXX.kv_action = $2;
+			rule->rule_headerXXX.kv_key = $3;
+			rule->rule_headerXXX.kv_value = $4;
+			rule->rule_headerXXX.kv_type = KEY_TYPE_HEADER;
+		}
+		| PATH keyaction STRING value		{
+			rule->rule_path.kv_action = $2;
+			rule->rule_path.kv_key = $3;
+			rule->rule_path.kv_value = $4;
+			rule->rule_path.kv_type = KEY_TYPE_PATH;
+
+		}
+		| QUERYSTR keyaction STRING value		{
+			rule->rule_query.kv_action = $2;
+			rule->rule_query.kv_key = $3;
+			rule->rule_query.kv_value = $4;
+			rule->rule_cookie.kv_type = KEY_TYPE_QUERY;
+
+		}
+		| URL keyaction STRING value		{
+			rule->rule_url.kv_action = $2;
+			rule->rule_url.kv_key = $3;
+			rule->rule_url.kv_value = $4;
+			rule->rule_url.kv_type = KEY_TYPE_URL;
+
+		}
+		| FORWARD TO table		{
+			if (table_findbyname(conf, $3) == NULL) {
+				yyerror("undefined forward table");
+				free($3);
+				YYERROR;
+			}
+			if (strlcpy(rule->rule_tablename, $3,
+			    sizeof(rule->rule_tablename)) >=
+			    sizeof(rule->rule_tablename)) {
+				yyerror("invalid forward table name");
+				free($3);
+				YYERROR;
+			}
+			rule->rule_flags |= RULE_FLAG_FORWARD_TABLE;
+			free($3);
+		}
+		;
+
+value		: /* empty */		{ $$ = NULL; }
+		| VALUE STRING		{ $$ = $2; }
+		;
+
+keyaction	: /* empty */		{ $$ = KEY_ACTION_NONE; }
+		| APPEND		{ $$ = KEY_ACTION_APPEND; }
+		| SET			{ $$ = KEY_ACTION_SET; }
+		| REMOVE		{ $$ = KEY_ACTION_REMOVE; }
+		| HASH			{ $$ = KEY_ACTION_HASH; }
+		| LOG			{ $$ = KEY_ACTION_LOG; }
 		;
 
 relay		: RELAY STRING	{
@@ -1616,7 +1511,7 @@ dstaf		: /* empty */		{
 		}
 		;
 
-interface	: /*empty*/		{ $$ = NULL; }
+interface	: /* empty */		{ $$ = NULL; }
 		| INTERFACE STRING	{ $$ = $2; }
 		;
 
@@ -1785,10 +1680,10 @@ lookup(char *s)
 		{ "append",		APPEND },
 		{ "backlog",		BACKLOG },
 		{ "backup",		BACKUP },
+		{ "block",		BLOCK },
 		{ "buffer",		BUFFER },
 		{ "ca",			CA },
 		{ "cache",		CACHE },
-		{ "change",		CHANGE },
 		{ "check",		CHECK },
 		{ "ciphers",		CIPHERS },
 		{ "code",		CODE },
@@ -1801,7 +1696,6 @@ lookup(char *s)
 		{ "expect",		EXPECT },
 		{ "external",		EXTERNAL },
 		{ "file",		FILENAME },
-		{ "filter",		FILTER },
 		{ "forward",		FORWARD },
 		{ "from",		FROM },
 		{ "hash",		HASH },
@@ -1820,9 +1714,8 @@ lookup(char *s)
 		{ "loadbalance",	LOADBALANCE },
 		{ "log",		LOG },
 		{ "lookup",		LOOKUP },
-		{ "mark",		MARK },
-		{ "marked",		MARKED },
 		{ "match",		MATCH },
+		{ "method",		METHOD },
 		{ "mode",		MODE },
 		{ "nat",		NAT },
 		{ "no",			NO },
@@ -1830,12 +1723,14 @@ lookup(char *s)
 		{ "nothing",		NOTHING },
 		{ "on",			ON },
 		{ "parent",		PARENT },
+		{ "pass",		PASS },
 		{ "path",		PATH },
 		{ "port",		PORT },
 		{ "prefork",		PREFORK },
 		{ "priority",		PRIORITY },
 		{ "protocol",		PROTO },
 		{ "query",		QUERYSTR },
+		{ "quick",		QUICK },
 		{ "random",		RANDOM },
 		{ "real",		REAL },
 		{ "redirect",		REDIRECT },
@@ -1854,6 +1749,7 @@ lookup(char *s)
 		{ "script",		SCRIPT },
 		{ "send",		SEND },
 		{ "session",		SESSION },
+		{ "set",		SET },
 		{ "socket",		SOCKET },
 		{ "source-hash",	SRCHASH },
 		{ "splice",		SPLICE },
@@ -1870,6 +1766,7 @@ lookup(char *s)
 		{ "ttl",		TTL },
 		{ "updates",		UPDATES },
 		{ "url",		URL },
+		{ "value",		VALUE },
 		{ "virtual",		VIRTUAL },
 		{ "with",		WITH }
 	};

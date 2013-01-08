@@ -52,7 +52,7 @@ extern objid_t relay_conid;
 extern int proc_id;
 extern int debug;
 
-struct relayd *env = NULL;
+static struct relayd *env = NULL;
 struct shuffle relay_shuffle;
 
 int		 relay_udp_socket(struct sockaddr_storage *, in_port_t,
@@ -250,8 +250,6 @@ relay_udp_server(int fd, short sig, void *arg)
 	con->se_out.con = con;
 	con->se_relay = rlay;
 	con->se_id = ++relay_conid;
-	con->se_in.tree = &proto->request_tree;
-	con->se_out.tree = &proto->response_tree;
 	con->se_in.dir = RELAY_DIR_REQUEST;
 	con->se_out.dir = RELAY_DIR_RESPONSE;
 	con->se_retry = rlay->rl_conf.dstretry;

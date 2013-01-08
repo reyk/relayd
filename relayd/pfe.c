@@ -194,8 +194,6 @@ pfe_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_CFG_PROTO:
 		config_getproto(env, imsg);
 		break;
-	case IMSG_CFG_PROTONODE:
-		break;
 	case IMSG_CFG_RELAY:
 		config_getrelay(env, imsg);
 		break;
