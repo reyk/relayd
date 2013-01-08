@@ -1,17 +1,19 @@
-# Object files
-*.o
-
-# Libraries
-*.lib
+*.core
+*.log
+*.manlint
 *.a
-
-# Shared objects (inc. Windows DLLs)
-*.dll
+*.cat?
+*.o
+*.pem
 *.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
+*~
+.#*
+a.out
+ktrace.out
+mklog
+obj
+*/relayctl
+*/relayd
+relayd.conf
+stamp-*
+y.tab.h
