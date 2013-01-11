@@ -8,7 +8,7 @@ relayd is free software under OpenBSD's ISC-style license.
 * The regress tests have been written by Alexander Bluhm <bluhm@openbsd.org>
 * Please refer to the individual source files for other copyright holders!
 
-> Copyright (c) 2010-2013 Reyk Floeter <reyk@openbsd.org>
+> Copyright (c) 2006-2013 Reyk Floeter <reyk@openbsd.org>
 > 
 > Permission to use, copy, modify, and distribute this software for any
 > purpose with or without fee is hereby granted, provided that the above
