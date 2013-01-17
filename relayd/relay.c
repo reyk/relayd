@@ -82,8 +82,10 @@ void		 relay_ssl_connect(int, short, void *);
 void		 relay_ssl_connected(struct ctl_relay_event *);
 void		 relay_ssl_readcb(int, short, void *);
 void		 relay_ssl_writecb(int, short, void *);
+X509		*relay_ssl_updatecert(struct rsession *);
 
 char		*relay_load_file(const char *, off_t *);
+char		*relay_load_key(const char *, off_t *, char *pass);
 static __inline int
 		 relay_proto_cmp(struct protonode *, struct protonode *);
 extern void	 bufferevent_read_pressure_cb(struct evbuffer *, size_t,
@@ -617,6 +619,8 @@ relay_connected(int fd, short sig, void *arg)
 	socklen_t		 len;
 	int			 error;
 
+	log_debug("%s: session %d: pid %d", __func__, con->se_id, getpid());
+
 	if (sig == EV_TIMEOUT) {
 		relay_abort_http(con, 504, "connect timeout", 0);
 		return;
@@ -1064,6 +1068,13 @@ relay_accept(int fd, short event, void *arg)
 		return;
 	}
 
+	/* XXX SSL MITM */
+	if ((rlay->rl_conf.flags & (F_SSLCLIENT|F_DIVERT)) ==
+	    (F_SSLCLIENT|F_DIVERT) && rlay->rl_ssl_cakey != NULL) {
+		relay_preconnect(con);
+		return;
+	}
+
 	relay_session(con);
 	return;
  err:
@@ -1381,11 +1392,31 @@ relay_connect_retry(int fd, short sig, void *arg)
 }
 
 int
+relay_preconnect(struct rsession *con)
+{
+	log_debug("%s: session %d: pid %d", __func__, con->se_id, getpid());
+	return (relay_connect(con));
+}
+
+int
 relay_connect(struct rsession *con)
 {
 	struct relay	*rlay = (struct relay *)con->se_relay;
 	struct timeval	 evtpause = { 1, 0 };
 	int		 bnds = -1, ret;
+
+	log_debug("%s: session %d: call %d, s %d, ssl %p", __func__,
+	    con->se_id, ++con->se_connectcount,
+	    con->se_out.s, con->se_out.ssl);
+
+	/* Connection is already established but session not active */
+	if ((rlay->rl_conf.flags & F_SSLCLIENT) &&
+	    con->se_out.s != -1) {// && con->se_out.ssl != NULL) {
+		if (con->se_out.ssl == NULL)
+			fatalx("relay_connect: ssl connection failed");
+		relay_connected(con->se_out.s, EV_WRITE, con);
+		return (0);
+	}
 
 	if (relay_inflight < 1)
 		fatalx("relay_connect: no connection in flight");
@@ -1511,6 +1542,8 @@ relay_close(struct rsession *con, const char *msg)
 			SSL_shutdown(con->se_in.ssl);
 		SSL_free(con->se_in.ssl);
 	}
+	if (con->se_in.sslcert != NULL)
+		X509_free(con->se_in.sslcert);
 	if (con->se_in.s != -1) {
 		close(con->se_in.s);
 		if (con->se_out.s == -1) {
@@ -1540,6 +1573,8 @@ relay_close(struct rsession *con, const char *msg)
 			SSL_shutdown(con->se_out.ssl);
 		SSL_free(con->se_out.ssl);
 	}
+	if (con->se_out.sslcert != NULL)
+		X509_free(con->se_out.sslcert);
 	if (con->se_out.s != -1) {
 		close(con->se_out.s);
 
@@ -1840,7 +1875,11 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 		cb = relay_ssl_accept;
 		method = SSLv23_server_method();
 		flag = EV_READ;
+
+		if (cre->sslcert != NULL)
+			SSL_use_certificate(ssl, cre->sslcert);
 	} else {
+		log_debug("%s: session %d: pid %d", __func__, con->se_id, getpid());
 		cb = relay_ssl_connect;
 		method = SSLv23_client_method();
 		flag = EV_WRITE;
@@ -1973,8 +2012,19 @@ relay_ssl_connect(int fd, short event, void *arg)
 #else
 	log_debug(
 #endif
-	    "relay %s, session %d connected (%d active)",
+	    "relay %s, ssl session %d connected (%d active)",
 	    rlay->rl_conf.name, con->se_id, relay_sessions);
+
+	/* XXX SSL MITM */
+	if (rlay->rl_ssl_cakey != NULL) {
+		if ((con->se_in.sslcert =
+		    relay_ssl_updatecert(con)) == NULL) {
+			relay_close(con, "could not create certificate");
+			return;
+		}
+		relay_session(con);
+		return;
+	}
 
 	relay_connected(fd, EV_WRITE, con);
 	return;
@@ -1984,6 +2034,85 @@ retry:
 	    (retry_flag == EV_READ) ? "EV_READ" : "EV_WRITE");
 	event_again(&con->se_ev, fd, EV_TIMEOUT|retry_flag, relay_ssl_connect,
 	    &con->se_tv_start, &rlay->rl_conf.timeout, con);
+}
+
+X509 *
+relay_ssl_updatecert(struct rsession *con)
+{
+#ifdef DEBUG_CERT
+	char		 name[2][SSL_NAME_SIZE];
+#endif
+	struct relay	*rlay = (struct relay *)con->se_relay;
+	X509		*servercert, *cert = NULL, *cacert = NULL;
+	EVP_PKEY	*key = NULL, *cakey = NULL;
+	BIO		*bio = NULL;
+
+	/* Get SSL key */
+	if ((bio = BIO_new_mem_buf(rlay->rl_ssl_key,
+	    rlay->rl_conf.ssl_key_len)) == NULL)
+		goto done;
+	if ((key = PEM_read_bio_PrivateKey(bio, &key, NULL, NULL)) == NULL)
+		goto done;
+
+	/* Get CA key */
+	BIO_free_all(bio);
+	if ((bio = BIO_new_mem_buf(rlay->rl_ssl_cakey,
+	    rlay->rl_conf.ssl_cakey_len)) == NULL)
+		goto done;
+	if ((cakey = PEM_read_bio_PrivateKey(bio, &cakey, NULL, NULL)) == NULL)
+		goto done;
+
+	/* Get CA certificate */
+	BIO_free_all(bio);
+	if ((bio = BIO_new_mem_buf(rlay->rl_ssl_cacert,
+	    rlay->rl_conf.ssl_cacert_len)) == NULL)
+		goto done;
+	if ((cacert = PEM_read_bio_X509(bio, &cacert, NULL, NULL)) == NULL)
+		goto done;
+
+	if ((servercert = SSL_get_peer_certificate(con->se_out.ssl)) == NULL)
+		goto done;
+
+#ifdef DEBUG_CERT
+	if (!X509_NAME_oneline(X509_get_subject_name(servercert),
+	    name[0], sizeof(name[0])) ||
+	    !X509_NAME_oneline(X509_get_issuer_name(servercert),
+	    name[1], sizeof(name[1])))
+		goto done;
+#endif
+
+	if ((cert = X509_dup(servercert)) == NULL)
+		goto done;
+
+	X509_set_pubkey(cert, key);
+	X509_set_issuer_name(cert, X509_get_subject_name(cacert));
+
+	if (!X509_sign(cert, cakey, EVP_sha1())) {
+		X509_free(cert);
+		cert = NULL;
+	}
+
+#if DEBUG_CERT
+	log_debug("%s: subject %s", __func__, name[0]);
+	log_debug("%s: issuer %s", __func__, name[1]);
+#if DEBUG > 2
+	X509_print_fp(stdout, cert);
+#endif
+#endif
+
+ done:
+	if (cert == NULL)
+		ssl_error(__func__, rlay->rl_conf.name);
+	if (bio != NULL)
+		BIO_free_all(bio);
+	if (key != NULL)
+		EVP_PKEY_free(key);
+	if (cacert != NULL)
+		X509_free(cacert);
+	if (cakey != NULL)
+		EVP_PKEY_free(cakey);
+
+	return (cert);
 }
 
 void
@@ -2289,6 +2418,55 @@ relay_load_file(const char *name, off_t *len)
 	return (NULL);
 }
 
+char *
+relay_load_key(const char *name, off_t *len, char *pass)
+{
+	FILE		*fp;
+	EVP_PKEY	*key = NULL;
+	BIO		*bio = NULL;
+	long		 size;
+	char		*data, *buf = NULL;
+
+	/* Initialize SSL library once */
+	ssl_init(env);
+
+	/*
+	 * Read (possibly) encrypted key from file
+	 */
+	if ((fp = fopen(name, "r")) == NULL)
+		return (NULL);
+
+	key = PEM_read_PrivateKey(fp, NULL, NULL, pass);
+	fclose(fp);
+	if (key == NULL)
+		goto fail;
+
+	/*
+	 * Write unencrypted key to memory buffer
+	 */
+	if ((bio = BIO_new(BIO_s_mem())) == NULL)
+		goto fail;
+	if (!PEM_write_bio_PrivateKey(bio, key, NULL, NULL, 0, NULL, NULL))
+		goto fail;
+	if ((size = BIO_get_mem_data(bio, &data)) <= 0)
+		goto fail;
+	if ((buf = calloc(1, size)) == NULL)
+		goto fail;
+	memcpy(buf, data, size);
+
+	BIO_free_all(bio);
+	*len = (off_t)size;
+	return (buf);
+
+ fail:
+	ssl_error(__func__, name);
+
+	free(buf);
+	if (bio != NULL)
+		BIO_free_all(bio);
+	return (NULL);
+}
+
 int
 relay_load_certfiles(struct relay *rlay)
 {
@@ -2297,11 +2475,31 @@ relay_load_certfiles(struct relay *rlay)
 	struct protocol *proto = rlay->rl_proto;
 	int	 useport = htons(rlay->rl_conf.port);
 
-	if ((rlay->rl_conf.flags & F_SSLCLIENT) && strlen(proto->sslca)) {
-		if ((rlay->rl_ssl_ca = relay_load_file(proto->sslca,
-		    &rlay->rl_conf.ssl_ca_len)) == NULL)
-			return (-1);
-		log_debug("%s: using ca %s", __func__, proto->sslca);
+	if (rlay->rl_conf.flags & F_SSLCLIENT) {
+		if (strlen(proto->sslca)) {
+			if ((rlay->rl_ssl_ca =
+			    relay_load_file(proto->sslca,
+			    &rlay->rl_conf.ssl_ca_len)) == NULL)
+				return (-1);
+			log_debug("%s: using ca %s", __func__, proto->sslca);
+		}
+		if (strlen(proto->sslcacert)) {
+			if ((rlay->rl_ssl_cacert =
+			    relay_load_file(proto->sslcacert,
+			    &rlay->rl_conf.ssl_cacert_len)) == NULL)
+				return (-1);
+			log_debug("%s: using ca certificate %s", __func__,
+			    proto->sslcacert);
+		}
+		if (strlen(proto->sslcakey) && proto->sslcapass != NULL) {
+			if ((rlay->rl_ssl_cakey =
+			    relay_load_key(proto->sslcakey,
+			    &rlay->rl_conf.ssl_cakey_len,
+			    proto->sslcapass)) == NULL)
+				return (-1);
+			log_debug("%s: using ca key %s", __func__,
+			    proto->sslcakey);
+		}
 	}
 
 	if ((rlay->rl_conf.flags & F_SSL) == 0)
@@ -2334,8 +2532,8 @@ relay_load_certfiles(struct relay *rlay)
 		    "/etc/ssl/private/%s.key", hbuf) == -1)
 			return -1;
 	}
-	if ((rlay->rl_ssl_key = relay_load_file(certfile,
-	    &rlay->rl_conf.ssl_key_len)) == NULL)
+	if ((rlay->rl_ssl_key = relay_load_key(certfile,
+	    &rlay->rl_conf.ssl_key_len, NULL)) == NULL)
 		return (-1);
 	log_debug("%s: using private key %s", __func__, certfile);
 

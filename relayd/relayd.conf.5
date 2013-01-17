@@ -1006,6 +1006,11 @@ Set the SSL options and session settings.
 This is only used if SSL is enabled in the relay.
 Valid options are:
 .Bl -tag -width Ds
+.It Ic ca cert Ar path
+Specify a CA certificate for SSL interception.
+For more information, see the
+.Ic ca key
+option below.
 .It Ic ca file Ar path
 This option enables CA verification in SSL client mode.
 The daemon will load the CA (Certificate Authority) certificates from
@@ -1013,6 +1018,35 @@ the specified path to verify the server certificates.
 .Ox
 provides a default CA bundle in
 .Pa /etc/ssl/cert.pem .
+.It Ic ca key Ar path Ic password Ar password
+Specify a CA key for SSL interception.
+The
+.Ar password
+argument will specify the password to decrypt the CA key
+(typically an RSA key).
+This option will enable SSL interception if the following conditions
+are true:
+.Pp
+.Bl -bullet -compact -offset indent
+.It
+SSL client mode is enabled by the
+.Ic listen
+directive:
+.Ic listen on ... ssl .
+.It
+SSL server mode and divert lookups are enabled by the
+.Ic forward
+directive:
+.Ic forward with ssl to destination .
+.It
+The
+.Ic ca cert
+option is specified.
+.It
+The
+.Ic ca key
+option is specified.
+.El
 .It Ic ciphers Ar string
 Set the string defining the SSL cipher suite.
 If not specified, the default value

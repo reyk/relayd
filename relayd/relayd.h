@@ -47,6 +47,7 @@
 #define SRV_NAME_SIZE		64
 #define MAX_NAME_SIZE		64
 #define SRV_MAX_VIRTS		16
+#define SSL_NAME_SIZE		512
 
 #define FD_RESERVE		5
 
@@ -77,6 +78,7 @@
 
 #if DEBUG > 1
 #define DPRINTF		log_debug
+#define DEBUG_CERT	1
 #else
 #define DPRINTF(x...)	do {} while(0)
 #endif
@@ -177,6 +179,7 @@ struct ctl_relay_event {
 	struct ctl_relay_event	*dst;
 	struct rsession		*con;
 	SSL			*ssl;
+	X509			*sslcert;
 	u_int8_t		*nodes;
 	struct proto_tree	*tree;
 
@@ -448,6 +451,7 @@ struct rsession {
 	int				 se_done;
 	int				 se_retry;
 	int				 se_retrycount;
+	int				 se_connectcount;
 	u_int16_t			 se_mark;
 	struct evbuffer			*se_log;
 	struct relay			*se_relay;
@@ -569,6 +573,9 @@ struct protocol {
 	u_int8_t		 sslflags;
 	char			 sslciphers[768];
 	char			 sslca[MAXPATHLEN];
+	char			 sslcacert[MAXPATHLEN];
+	char			 sslcakey[MAXPATHLEN];
+	char			*sslcapass;
 	char			 name[MAX_NAME_SIZE];
 	int			 cache;
 	enum prototype		 type;
@@ -618,6 +625,8 @@ struct relay_config {
 	off_t			 ssl_cert_len;
 	off_t			 ssl_key_len;
 	off_t			 ssl_ca_len;
+	off_t			 ssl_cacert_len;
+	off_t			 ssl_cakey_len;
 };
 
 struct relay {
@@ -641,6 +650,8 @@ struct relay {
 	char			*rl_ssl_cert;
 	char			*rl_ssl_key;
 	char			*rl_ssl_ca;
+	char			*rl_ssl_cacert;
+	char			*rl_ssl_cakey;
 
 	struct ctl_stats	 rl_stats[RELAY_MAXPROC + 1];
 
@@ -887,6 +898,7 @@ struct relayd {
 	u_int16_t		 sc_prefork_relay;
 	char			 sc_demote_group[IFNAMSIZ];
 	u_int16_t		 sc_id;
+	pid_t			 sc_sslinit;
 
 	struct event		 sc_statev;
 	struct timeval		 sc_statinterval;
@@ -991,6 +1003,7 @@ void	 relay_read(struct bufferevent *, void *);
 void	 relay_error(struct bufferevent *, short, void *);
 int	 relay_lognode(struct rsession *,
 	    struct protonode *, struct protonode *, char *, size_t);
+int	 relay_preconnect(struct rsession *);
 int	 relay_connect(struct rsession *);
 void	 relay_connected(int, short, void *);
 void	 relay_bindanyreq(struct rsession *, in_port_t, int);

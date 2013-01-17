@@ -240,12 +240,17 @@ ssl_error(const char *where, const char *what)
 void
 ssl_init(struct relayd *env)
 {
+	if (env->sc_sslinit && env->sc_sslinit == getpid())
+		return;
+
 	SSL_library_init();
 	SSL_load_error_strings();
 
 	/* Init hardware crypto engines. */
 	ENGINE_load_builtin_engines();
 	ENGINE_register_all_complete();
+
+	env->sc_sslinit = getpid();
 }
 
 void

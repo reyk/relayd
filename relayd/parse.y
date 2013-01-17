@@ -158,7 +158,7 @@ typedef struct {
 %token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SOCKET SPLICE
 %token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
-%token	RANDOM LEASTSTATES SRCHASH
+%token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table
@@ -970,6 +970,34 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 			    sizeof(proto->sslca)) >=
 			    sizeof(proto->sslca)) {
 				yyerror("sslca truncated");
+				free($3);
+				YYERROR;
+			}
+			free($3);
+		}
+		| CA KEY STRING PASSWORD STRING	{
+			if (strlcpy(proto->sslcakey, $3,
+			    sizeof(proto->sslcakey)) >=
+			    sizeof(proto->sslcakey)) {
+				yyerror("sslcakey truncated");
+				free($3);
+				free($5);
+				YYERROR;
+			}
+			if ((proto->sslcapass = strdup($5)) == NULL) {
+				yyerror("sslcapass");
+				free($3);
+				free($5);
+				YYERROR;
+			}
+			free($3);
+			free($5);
+		}
+		| CA CERTIFICATE STRING		{
+			if (strlcpy(proto->sslcacert, $3,
+			    sizeof(proto->sslcacert)) >=
+			    sizeof(proto->sslcacert)) {
+				yyerror("sslcacert truncated");
 				free($3);
 				YYERROR;
 			}
@@ -1788,6 +1816,7 @@ lookup(char *s)
 		{ "buffer",		BUFFER },
 		{ "ca",			CA },
 		{ "cache",		CACHE },
+		{ "cert",		CERTIFICATE },
 		{ "change",		CHANGE },
 		{ "check",		CHECK },
 		{ "ciphers",		CIPHERS },
@@ -1814,6 +1843,7 @@ lookup(char *s)
 		{ "interface",		INTERFACE },
 		{ "interval",		INTERVAL },
 		{ "ip",			IP },
+		{ "key",		KEY },
 		{ "label",		LABEL },
 		{ "least-states",	LEASTSTATES },
 		{ "listen",		LISTEN },
@@ -1830,6 +1860,7 @@ lookup(char *s)
 		{ "nothing",		NOTHING },
 		{ "on",			ON },
 		{ "parent",		PARENT },
+		{ "password",		PASSWORD },
 		{ "path",		PATH },
 		{ "port",		PORT },
 		{ "prefork",		PREFORK },
