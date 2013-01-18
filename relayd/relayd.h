@@ -278,6 +278,7 @@ TAILQ_HEAD(addresslist, address);
 #define F_MATCH			0x00800000
 #define F_DIVERT		0x01000000
 #define F_SCRIPT		0x02000000
+#define F_SSLINTERCEPT		0x04000000
 
 #define F_BITS								\
 	"\10\01DISABLE\02BACKUP\03USED\04DOWN\05ADD\06DEL\07CHANGED"	\
@@ -1051,6 +1052,9 @@ void	 ssl_init(struct relayd *);
 void	 ssl_transaction(struct ctl_tcp_event *);
 SSL_CTX	*ssl_ctx_create(struct relayd *);
 void	 ssl_error(const char *, const char *);
+char	*ssl_load_key(struct relayd *, const char *, off_t *, char *);
+X509	*ssl_update_certificate(X509 *, char *, off_t,
+	    char *, off_t, char *, off_t);
 
 /* ssl_privsep.c */
 int	 ssl_ctx_use_private_key(SSL_CTX *, char *, off_t);

@@ -1,7 +1,7 @@
 /*	$OpenBSD: relay.c,v 1.160 2012/12/18 15:58:25 reyk Exp $	*/
 
 /*
- * Copyright (c) 2006 - 2012 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2006 - 2013 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -82,10 +82,8 @@ void		 relay_ssl_connect(int, short, void *);
 void		 relay_ssl_connected(struct ctl_relay_event *);
 void		 relay_ssl_readcb(int, short, void *);
 void		 relay_ssl_writecb(int, short, void *);
-X509		*relay_ssl_updatecert(struct rsession *);
 
 char		*relay_load_file(const char *, off_t *);
-char		*relay_load_key(const char *, off_t *, char *pass);
 static __inline int
 		 relay_proto_cmp(struct protonode *, struct protonode *);
 extern void	 bufferevent_read_pressure_cb(struct evbuffer *, size_t,
@@ -619,8 +617,6 @@ relay_connected(int fd, short sig, void *arg)
 	socklen_t		 len;
 	int			 error;
 
-	log_debug("%s: session %d: pid %d", __func__, con->se_id, getpid());
-
 	if (sig == EV_TIMEOUT) {
 		relay_abort_http(con, 504, "connect timeout", 0);
 		return;
@@ -1068,9 +1064,7 @@ relay_accept(int fd, short event, void *arg)
 		return;
 	}
 
-	/* XXX SSL MITM */
-	if ((rlay->rl_conf.flags & (F_SSLCLIENT|F_DIVERT)) ==
-	    (F_SSLCLIENT|F_DIVERT) && rlay->rl_ssl_cakey != NULL) {
+	if (rlay->rl_conf.flags & F_SSLINTERCEPT) {
 		relay_preconnect(con);
 		return;
 	}
@@ -1394,7 +1388,8 @@ relay_connect_retry(int fd, short sig, void *arg)
 int
 relay_preconnect(struct rsession *con)
 {
-	log_debug("%s: session %d: pid %d", __func__, con->se_id, getpid());
+	log_debug("%s: session %d: process %d", __func__,
+	    con->se_id, privsep_process);
 	return (relay_connect(con));
 }
 
@@ -1405,15 +1400,12 @@ relay_connect(struct rsession *con)
 	struct timeval	 evtpause = { 1, 0 };
 	int		 bnds = -1, ret;
 
-	log_debug("%s: session %d: call %d, s %d, ssl %p", __func__,
-	    con->se_id, ++con->se_connectcount,
-	    con->se_out.s, con->se_out.ssl);
-
 	/* Connection is already established but session not active */
-	if ((rlay->rl_conf.flags & F_SSLCLIENT) &&
-	    con->se_out.s != -1) {// && con->se_out.ssl != NULL) {
-		if (con->se_out.ssl == NULL)
-			fatalx("relay_connect: ssl connection failed");
+	if ((rlay->rl_conf.flags & F_SSLINTERCEPT) && con->se_out.s != -1) {
+		if (con->se_out.ssl == NULL) {
+			log_debug("%s: ssl connect failed", __func__);
+			return (-1);
+		}
 		relay_connected(con->se_out.s, EV_WRITE, con);
 		return (0);
 	}
@@ -1876,10 +1868,10 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 		method = SSLv23_server_method();
 		flag = EV_READ;
 
+		/* Use session-specific certificate for SSL interception. */
 		if (cre->sslcert != NULL)
 			SSL_use_certificate(ssl, cre->sslcert);
 	} else {
-		log_debug("%s: session %d: pid %d", __func__, con->se_id, getpid());
 		cb = relay_ssl_connect;
 		method = SSLv23_client_method();
 		flag = EV_WRITE;
@@ -1976,6 +1968,7 @@ relay_ssl_connect(int fd, short event, void *arg)
 	int		 retry_flag = 0;
 	int		 ssl_err = 0;
 	int		 ret;
+	X509		*servercert;
 
 	if (event == EV_TIMEOUT) {
 		relay_close(con, "SSL connect timeout");
@@ -2015,10 +2008,14 @@ relay_ssl_connect(int fd, short event, void *arg)
 	    "relay %s, ssl session %d connected (%d active)",
 	    rlay->rl_conf.name, con->se_id, relay_sessions);
 
-	/* XXX SSL MITM */
-	if (rlay->rl_ssl_cakey != NULL) {
-		if ((con->se_in.sslcert =
-		    relay_ssl_updatecert(con)) == NULL) {
+	if (rlay->rl_conf.flags & F_SSLINTERCEPT) {
+		if ((servercert =
+		    SSL_get_peer_certificate(con->se_out.ssl)) == NULL ||
+		    (con->se_in.sslcert = ssl_update_certificate(servercert,
+		    rlay->rl_ssl_key, rlay->rl_conf.ssl_key_len,
+		    rlay->rl_ssl_cakey, rlay->rl_conf.ssl_cakey_len,
+		    rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len))
+		    == NULL) {
 			relay_close(con, "could not create certificate");
 			return;
 		}
@@ -2034,85 +2031,6 @@ retry:
 	    (retry_flag == EV_READ) ? "EV_READ" : "EV_WRITE");
 	event_again(&con->se_ev, fd, EV_TIMEOUT|retry_flag, relay_ssl_connect,
 	    &con->se_tv_start, &rlay->rl_conf.timeout, con);
-}
-
-X509 *
-relay_ssl_updatecert(struct rsession *con)
-{
-#ifdef DEBUG_CERT
-	char		 name[2][SSL_NAME_SIZE];
-#endif
-	struct relay	*rlay = (struct relay *)con->se_relay;
-	X509		*servercert, *cert = NULL, *cacert = NULL;
-	EVP_PKEY	*key = NULL, *cakey = NULL;
-	BIO		*bio = NULL;
-
-	/* Get SSL key */
-	if ((bio = BIO_new_mem_buf(rlay->rl_ssl_key,
-	    rlay->rl_conf.ssl_key_len)) == NULL)
-		goto done;
-	if ((key = PEM_read_bio_PrivateKey(bio, &key, NULL, NULL)) == NULL)
-		goto done;
-
-	/* Get CA key */
-	BIO_free_all(bio);
-	if ((bio = BIO_new_mem_buf(rlay->rl_ssl_cakey,
-	    rlay->rl_conf.ssl_cakey_len)) == NULL)
-		goto done;
-	if ((cakey = PEM_read_bio_PrivateKey(bio, &cakey, NULL, NULL)) == NULL)
-		goto done;
-
-	/* Get CA certificate */
-	BIO_free_all(bio);
-	if ((bio = BIO_new_mem_buf(rlay->rl_ssl_cacert,
-	    rlay->rl_conf.ssl_cacert_len)) == NULL)
-		goto done;
-	if ((cacert = PEM_read_bio_X509(bio, &cacert, NULL, NULL)) == NULL)
-		goto done;
-
-	if ((servercert = SSL_get_peer_certificate(con->se_out.ssl)) == NULL)
-		goto done;
-
-#ifdef DEBUG_CERT
-	if (!X509_NAME_oneline(X509_get_subject_name(servercert),
-	    name[0], sizeof(name[0])) ||
-	    !X509_NAME_oneline(X509_get_issuer_name(servercert),
-	    name[1], sizeof(name[1])))
-		goto done;
-#endif
-
-	if ((cert = X509_dup(servercert)) == NULL)
-		goto done;
-
-	X509_set_pubkey(cert, key);
-	X509_set_issuer_name(cert, X509_get_subject_name(cacert));
-
-	if (!X509_sign(cert, cakey, EVP_sha1())) {
-		X509_free(cert);
-		cert = NULL;
-	}
-
-#if DEBUG_CERT
-	log_debug("%s: subject %s", __func__, name[0]);
-	log_debug("%s: issuer %s", __func__, name[1]);
-#if DEBUG > 2
-	X509_print_fp(stdout, cert);
-#endif
-#endif
-
- done:
-	if (cert == NULL)
-		ssl_error(__func__, rlay->rl_conf.name);
-	if (bio != NULL)
-		BIO_free_all(bio);
-	if (key != NULL)
-		EVP_PKEY_free(key);
-	if (cacert != NULL)
-		X509_free(cacert);
-	if (cakey != NULL)
-		EVP_PKEY_free(cakey);
-
-	return (cert);
 }
 
 void
@@ -2418,55 +2336,6 @@ relay_load_file(const char *name, off_t *len)
 	return (NULL);
 }
 
-char *
-relay_load_key(const char *name, off_t *len, char *pass)
-{
-	FILE		*fp;
-	EVP_PKEY	*key = NULL;
-	BIO		*bio = NULL;
-	long		 size;
-	char		*data, *buf = NULL;
-
-	/* Initialize SSL library once */
-	ssl_init(env);
-
-	/*
-	 * Read (possibly) encrypted key from file
-	 */
-	if ((fp = fopen(name, "r")) == NULL)
-		return (NULL);
-
-	key = PEM_read_PrivateKey(fp, NULL, NULL, pass);
-	fclose(fp);
-	if (key == NULL)
-		goto fail;
-
-	/*
-	 * Write unencrypted key to memory buffer
-	 */
-	if ((bio = BIO_new(BIO_s_mem())) == NULL)
-		goto fail;
-	if (!PEM_write_bio_PrivateKey(bio, key, NULL, NULL, 0, NULL, NULL))
-		goto fail;
-	if ((size = BIO_get_mem_data(bio, &data)) <= 0)
-		goto fail;
-	if ((buf = calloc(1, size)) == NULL)
-		goto fail;
-	memcpy(buf, data, size);
-
-	BIO_free_all(bio);
-	*len = (off_t)size;
-	return (buf);
-
- fail:
-	ssl_error(__func__, name);
-
-	free(buf);
-	if (bio != NULL)
-		BIO_free_all(bio);
-	return (NULL);
-}
-
 int
 relay_load_certfiles(struct relay *rlay)
 {
@@ -2493,7 +2362,7 @@ relay_load_certfiles(struct relay *rlay)
 		}
 		if (strlen(proto->sslcakey) && proto->sslcapass != NULL) {
 			if ((rlay->rl_ssl_cakey =
-			    relay_load_key(proto->sslcakey,
+			    ssl_load_key(env, proto->sslcakey,
 			    &rlay->rl_conf.ssl_cakey_len,
 			    proto->sslcapass)) == NULL)
 				return (-1);
@@ -2532,7 +2401,7 @@ relay_load_certfiles(struct relay *rlay)
 		    "/etc/ssl/private/%s.key", hbuf) == -1)
 			return -1;
 	}
-	if ((rlay->rl_ssl_key = relay_load_key(certfile,
+	if ((rlay->rl_ssl_key = ssl_load_key(env, certfile,
 	    &rlay->rl_conf.ssl_key_len, NULL)) == NULL)
 		return (-1);
 	log_debug("%s: using private key %s", __func__, certfile);

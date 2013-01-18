@@ -195,6 +195,7 @@ main(int argc, char *argv[])
 	ps->ps_env = env;
 	env->sc_conffile = conffile;
 	env->sc_opts = opts;
+	env->sc_sslinit = -1;
 
 	if (parse_config(env->sc_conffile, env) == -1)
 		exit(1);
@@ -290,8 +291,16 @@ parent_configure(struct relayd *env)
 		config_setrt(env, rt);
 	TAILQ_FOREACH(proto, env->sc_protos, entry)
 		config_setproto(env, proto);
-	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry)
+	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry) {
+		/* Check for SSL Interception */
+		if ((rlay->rl_conf.flags & (F_SSL|F_SSLCLIENT)) ==
+		    (F_SSL|F_SSLCLIENT) &&
+		    rlay->rl_conf.ssl_cacert_len &&
+		    rlay->rl_conf.ssl_cakey_len)
+			rlay->rl_conf.flags |= F_SSLINTERCEPT;
+
 		config_setrelay(env, rlay);
+	}
 
 	/* HCE, PFE and the preforked relays need to reload their config. */
 	env->sc_reload = 2 + env->sc_prefork_relay;
