@@ -48,7 +48,8 @@ http protocol httpfilter {
         ssl ca key "/etc/ssl/private/ca.key" password "humppa"
         ssl ca cert "/etc/ssl/ca.crt"
 }
-
+```
+```
 relay sslproxy {
         # Listen on localhost, accept diverted connections from pf(4)
         listen on 127.0.0.1 port 8443 ssl
