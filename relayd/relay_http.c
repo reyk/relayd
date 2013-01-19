@@ -489,7 +489,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 			line = evbuffer_readline(src);
 			if (line != NULL)
 				free(line);
-			if (relay_bufferevent_print(cre->dst, "\r\n\r\n") == -1)
+			if (relay_bufferevent_print(cre->dst, "\r\n") == -1)
 				goto fail;
 		}
 	}
