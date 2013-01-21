@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_http.c,v 1.5 2012/11/27 05:00:28 guenther Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.6 2013/01/17 20:34:18 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2012 Reyk Floeter <reyk@openbsd.org>
@@ -121,10 +121,10 @@ relay_http_descinit(struct ctl_relay_event *cre)
 void
 relay_read_http(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = (struct ctl_relay_event *)arg;
-	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
+	struct ctl_relay_event	*cre = arg;
+	struct http_descriptor	*desc = cre->desc;
 	struct rsession		*con = cre->con;
-	struct relay		*rlay = (struct relay *)con->se_relay;
+	struct relay		*rlay = con->se_relay;
 	struct protocol		*proto = rlay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	char			*line, *key, *value;
@@ -388,7 +388,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 void
 relay_read_httpcontent(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = (struct ctl_relay_event *)arg;
+	struct ctl_relay_event	*cre = arg;
 	struct rsession		*con = cre->con;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	size_t			 size;
@@ -423,7 +423,7 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 void
 relay_read_httpchunks(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = (struct ctl_relay_event *)arg;
+	struct ctl_relay_event	*cre = arg;
 	struct rsession		*con = cre->con;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	char			*line;
@@ -711,7 +711,7 @@ void
 relay_abort_http(struct rsession *con, u_int code, const char *msg,
     u_int16_t labelid)
 {
-	struct relay		*rlay = (struct relay *)con->se_relay;
+	struct relay		*rlay = con->se_relay;
 	struct bufferevent	*bev = con->se_in.bev;
 	const char		*httperr = print_httperror(code), *text = "";
 	char			*httpmsg;
@@ -817,7 +817,7 @@ char *
 relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf, size_t len)
 {
 	struct rsession	*con = cre->con;
-	struct relay	*rlay = (struct relay *)con->se_relay;
+	struct relay	*rlay = con->se_relay;
 	char		 ibuf[128];
 
 	(void)strlcpy(buf, val, len);
