@@ -242,8 +242,9 @@ ssl_error(const char *where, const char *what)
 void
 ssl_init(struct relayd *env)
 {
-	if (env->sc_sslinit != -1 &&
-	    env->sc_sslinit == privsep_process)
+	static int	 inited = 0;
+
+	if (inited)
 		return;
 
 	SSL_library_init();
@@ -253,7 +254,7 @@ ssl_init(struct relayd *env)
 	ENGINE_load_builtin_engines();
 	ENGINE_register_all_complete();
 
-	env->sc_sslinit = privsep_process;
+	inited = 1;
 }
 
 void

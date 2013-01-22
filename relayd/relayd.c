@@ -195,7 +195,6 @@ main(int argc, char *argv[])
 	ps->ps_env = env;
 	env->sc_conffile = conffile;
 	env->sc_opts = opts;
-	env->sc_sslinit = -1;
 
 	if (parse_config(env->sc_conffile, env) == -1)
 		exit(1);

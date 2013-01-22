@@ -899,7 +899,6 @@ struct relayd {
 	u_int16_t		 sc_prefork_relay;
 	char			 sc_demote_group[IFNAMSIZ];
 	u_int16_t		 sc_id;
-	pid_t			 sc_sslinit;
 
 	struct event		 sc_statev;
 	struct timeval		 sc_statinterval;
