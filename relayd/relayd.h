@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.163 2012/11/27 05:00:28 guenther Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.168 2013/04/27 16:39:30 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2012 Reyk Floeter <reyk@openbsd.org>
@@ -199,6 +199,13 @@ struct ctl_relay_event {
 	int			 buflen;
 };
 
+enum httpchunk {
+	TOREAD_UNLIMITED		= -1,
+	TOREAD_HTTP_HEADER		= -2,
+	TOREAD_HTTP_CHUNK_LENGTH	= -3,
+	TOREAD_HTTP_CHUNK_TRAILER	= -4
+};
+
 struct ctl_natlook {
 	objid_t			 id;
 	int			 proc;
@@ -226,7 +233,7 @@ struct ctl_stats {
 	objid_t			 id;
 	int			 proc;
 
-	u_int			 interval;
+	u_int64_t		 interval;
 	u_int64_t		 cnt;
 	u_int32_t		 tick;
 	u_int32_t		 avg;
@@ -950,7 +957,7 @@ const char *print_host(struct sockaddr_storage *, char *, size_t);
 const char *print_time(struct timeval *, struct timeval *, char *, size_t);
 const char *print_httperror(u_int);
 const char *printb_flags(const u_int32_t, const char *);
-
+void	 getmonotime(struct timeval *);
 
 /* pfe.c */
 pid_t	 pfe(struct privsep *, struct privsep_proc *);
@@ -1000,6 +1007,9 @@ int	 relay_cmp_af(struct sockaddr_storage *,
 	    struct sockaddr_storage *);
 void	 relay_write(struct bufferevent *, void *);
 void	 relay_read(struct bufferevent *, void *);
+int	 relay_splice(struct ctl_relay_event *);
+int	 relay_splicelen(struct ctl_relay_event *);
+int	 relay_spliceadjust(struct ctl_relay_event *);
 void	 relay_error(struct bufferevent *, short, void *);
 int	 relay_lognode(struct rsession *,
 	    struct protonode *, struct protonode *, char *, size_t);
@@ -1132,6 +1142,7 @@ void	log_warn(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
 void	log_warnx(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
 void	log_info(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
 void	log_debug(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
+void	vlog(int, const char *, va_list) __attribute__((__format__ (printf, 2, 0)));
 __dead void fatal(const char *);
 __dead void fatalx(const char *);
 

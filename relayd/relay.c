@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.161 2013/01/17 20:34:18 bluhm Exp $	*/
+/*	$OpenBSD: relay.c,v 1.165 2013/04/20 17:45:02 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -69,9 +69,6 @@ void		 relay_accept(int, short, void *);
 void		 relay_input(struct rsession *);
 
 u_int32_t	 relay_hash_addr(struct sockaddr_storage *, u_int32_t);
-
-int		 relay_splice(struct ctl_relay_event *);
-int		 relay_splicelen(struct ctl_relay_event *);
 
 SSL_CTX		*relay_ssl_ctx_create(struct relay *);
 void		 relay_ssl_transaction(struct rsession *,
@@ -321,8 +318,7 @@ relay_statistics(int fd, short events, void *arg)
 	 */
 
 	timerclear(&tv);
-	if (gettimeofday(&tv_now, NULL) == -1)
-		fatal("relay_init: gettimeofday");
+	getmonotime(&tv_now);
 
 	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry) {
 		bzero(&crs, sizeof(crs));
@@ -643,6 +639,7 @@ relay_connected(int fd, short sig, void *arg)
 	case RELAY_PROTO_HTTP:
 		/* Check the servers's HTTP response */
 		if (!RB_EMPTY(&rlay->rl_proto->response_tree)) {
+			con->se_out.toread = TOREAD_HTTP_HEADER;
 			outrd = relay_read_http;
 			if ((con->se_out.nodes = calloc(proto->response_nodes,
 			    sizeof(u_int8_t))) == NULL) {
@@ -699,6 +696,7 @@ relay_input(struct rsession *con)
 		/* Check the client's HTTP request */
 		if (!RB_EMPTY(&rlay->rl_proto->request_tree) ||
 		    proto->lateconnect) {
+			con->se_in.toread = TOREAD_HTTP_HEADER;
 			inrd = relay_read_http;
 			if ((con->se_in.nodes = calloc(proto->request_nodes,
 			    sizeof(u_int8_t))) == NULL) {
@@ -741,10 +739,19 @@ relay_write(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
 	struct rsession		*con = cre->con;
-	if (gettimeofday(&con->se_tv_last, NULL) == -1)
-		con->se_done = 1;
+
+	getmonotime(&con->se_tv_last);
+
 	if (con->se_done)
-		relay_close(con, "last write (done)");
+		goto done;
+	if (relay_splice(cre->dst) == -1)
+		goto fail;
+	return;
+ done:
+	relay_close(con, "last write (done)");
+	return;
+ fail:
+	relay_close(con, strerror(errno));
 }
 
 void
@@ -772,8 +779,8 @@ relay_read(struct bufferevent *bev, void *arg)
 	struct rsession		*con = cre->con;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 
-	if (gettimeofday(&con->se_tv_last, NULL) == -1)
-		goto fail;
+	getmonotime(&con->se_tv_last);
+
 	if (!EVBUFFER_LENGTH(src))
 		return;
 	if (relay_bufferevent_write_buffer(cre->dst, src) == -1)
@@ -822,11 +829,31 @@ relay_splice(struct ctl_relay_event *cre)
 	    (proto->tcpflags & TCPFLAG_NSPLICE))
 		return (0);
 
-	if (cre->bev->readcb != relay_read)
+	if (cre->splicelen >= 0)
 		return (0);
+
+	/* still not connected */
+	if (cre->bev == NULL || cre->dst->bev == NULL)
+		return (0);
+
+	if (! (cre->toread == TOREAD_UNLIMITED || cre->toread > 0)) {
+		DPRINTF("%s: session %d: splice dir %d, nothing to read %lld",
+		    __func__, con->se_id, cre->dir, cre->toread);
+		return (0);
+	}
+
+	/* do not splice before buffers have not been completely flushed */
+	if (EVBUFFER_LENGTH(cre->bev->input) ||
+	    EVBUFFER_LENGTH(cre->dst->bev->output)) {
+		DPRINTF("%s: session %d: splice dir %d, dirty buffer",
+		    __func__, con->se_id, cre->dir);
+		bufferevent_disable(cre->bev, EV_READ);
+		return (0);
+	}
 
 	bzero(&sp, sizeof(sp));
 	sp.sp_fd = cre->dst->s;
+	sp.sp_max = cre->toread > 0 ? cre->toread : 0;
 	sp.sp_idle = rlay->rl_conf.timeout;
 	if (setsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &sp, sizeof(sp)) == -1) {
 		log_debug("%s: session %d: splice dir %d failed: %s",
@@ -834,9 +861,12 @@ relay_splice(struct ctl_relay_event *cre)
 		return (-1);
 	}
 	cre->splicelen = 0;
-	DPRINTF("%s: session %d: splice dir %d successful",
-	    __func__, con->se_id, cre->dir);
-	return (1);
+	bufferevent_enable(cre->bev, EV_READ);
+
+	DPRINTF("%s: session %d: splice dir %d, maximum %lld, successful",
+	    __func__, con->se_id, cre->dir, cre->toread);
+
+	return (0);
 }
 
 int
@@ -846,16 +876,40 @@ relay_splicelen(struct ctl_relay_event *cre)
 	off_t			 len;
 	socklen_t		 optlen;
 
+	if (cre->splicelen < 0)
+		return (0);
+
 	optlen = sizeof(len);
 	if (getsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &len, &optlen) == -1) {
 		log_debug("%s: session %d: splice dir %d get length failed: %s",
 		    __func__, con->se_id, cre->dir, strerror(errno));
 		return (-1);
 	}
+
+	DPRINTF("%s: session %d: splice dir %d, length %lld",
+	    __func__, con->se_id, cre->dir, len);
+
 	if (len > cre->splicelen) {
+		getmonotime(&con->se_tv_last);
+
 		cre->splicelen = len;
 		return (1);
 	}
+
+	return (0);
+}
+
+int
+relay_spliceadjust(struct ctl_relay_event *cre)
+{
+	if (cre->splicelen < 0)
+		return (0);
+	if (relay_splicelen(cre) == -1)
+		return (-1);
+	if (cre->splicelen > 0 && cre->toread > 0)
+		cre->toread -= cre->splicelen;
+	cre->splicelen = -1;
+
 	return (0);
 }
 
@@ -898,8 +952,16 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				break;
 			}
 		}
+		if (relay_spliceadjust(cre) == -1)
+			goto fail;
 		if (relay_splice(cre) == -1)
 			goto fail;
+		return;
+	}
+	if (error & EVBUFFER_ERROR && errno == EFBIG) {
+		if (relay_spliceadjust(cre) == -1)
+			goto fail;
+		bufferevent_enable(cre->bev, EV_READ);
 		return;
 	}
 	if (error & (EVBUFFER_READ|EVBUFFER_WRITE|EVBUFFER_EOF)) {
@@ -974,6 +1036,8 @@ relay_accept(int fd, short event, void *arg)
 	con->se_out.con = con;
 	con->se_in.splicelen = -1;
 	con->se_out.splicelen = -1;
+	con->se_in.toread = TOREAD_UNLIMITED;
+	con->se_out.toread = TOREAD_UNLIMITED;
 	con->se_relay = rlay;
 	con->se_id = ++relay_conid;
 	con->se_relayid = rlay->rl_conf.id;
@@ -984,10 +1048,6 @@ relay_accept(int fd, short event, void *arg)
 	con->se_out.dir = RELAY_DIR_RESPONSE;
 	con->se_retry = rlay->rl_conf.dstretry;
 	con->se_bnds = -1;
-	if (gettimeofday(&con->se_tv_start, NULL) == -1)
-		goto err;
-	bcopy(&con->se_tv_start, &con->se_tv_last, sizeof(con->se_tv_last));
-	bcopy(&ss, &con->se_in.ss, sizeof(con->se_in.ss));
 	con->se_out.port = rlay->rl_conf.dstport;
 	switch (ss.ss_family) {
 	case AF_INET:
@@ -997,6 +1057,10 @@ relay_accept(int fd, short event, void *arg)
 		con->se_in.port = ((struct sockaddr_in6 *)&ss)->sin6_port;
 		break;
 	}
+	bcopy(&ss, &con->se_in.ss, sizeof(con->se_in.ss));
+
+	getmonotime(&con->se_tv_start);
+	bcopy(&con->se_tv_start, &con->se_tv_last, sizeof(con->se_tv_last));
 
 	relay_sessions++;
 	SPLAY_INSERT(session_tree, &rlay->rl_sessions, con);
@@ -1412,8 +1476,7 @@ relay_connect(struct rsession *con)
 	if (relay_inflight < 1)
 		fatalx("relay_connect: no connection in flight");
 
-	if (gettimeofday(&con->se_tv_start, NULL) == -1)
-		return (-1);
+	getmonotime(&con->se_tv_start);
 
 	if (!TAILQ_EMPTY(&rlay->rl_tables)) {
 		if (relay_from_table(con) != 0)
@@ -1786,7 +1849,8 @@ relay_ssl_ctx_create(struct relay *rlay)
 		goto err;
 
 	/* Modify session timeout and cache size*/
-	SSL_CTX_set_timeout(ctx, rlay->rl_conf.timeout.tv_sec);
+	SSL_CTX_set_timeout(ctx,
+	    (long)MIN(rlay->rl_conf.timeout.tv_sec, LONG_MAX));
 	if (proto->cache < -1) {
 		SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 	} else if (proto->cache >= -1) {
