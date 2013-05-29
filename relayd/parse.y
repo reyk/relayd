@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.168 2012/10/19 16:49:50 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.170 2013/04/27 16:39:30 benno Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -51,6 +51,7 @@
 #include <netdb.h>
 #include <string.h>
 #include <ifaddrs.h>
+#include <syslog.h>
 
 #include <openssl/ssl.h>
 
@@ -531,7 +532,11 @@ rdroptsl	: forwardmode TO tablespec interface	{
 		}
 		| SESSION TIMEOUT NUMBER		{
 			if ((rdr->conf.timeout.tv_sec = $3) < 0) {
-				yyerror("invalid timeout: %d", $3);
+				yyerror("invalid timeout: %lld", $3);
+				YYERROR;
+			}
+			if (rdr->conf.timeout.tv_sec > INT_MAX) {
+				yyerror("timeout too large: %lld", $3);
 				YYERROR;
 			}
 		}
@@ -1366,7 +1371,11 @@ relayoptsl	: LISTEN ON STRING port optssl {
 		}
 		| SESSION TIMEOUT NUMBER		{
 			if ((rlay->rl_conf.timeout.tv_sec = $3) < 0) {
-				yyerror("invalid timeout: %d", $3);
+				yyerror("invalid timeout: %lld", $3);
+				YYERROR;
+			}
+			if (rlay->rl_conf.timeout.tv_sec > INT_MAX) {
+				yyerror("timeout too large: %lld", $3);
 				YYERROR;
 			}
 		}
@@ -1760,13 +1769,15 @@ int
 yyerror(const char *fmt, ...)
 {
 	va_list		 ap;
+	char		*nfmt;
 
 	file->errors++;
 	va_start(ap, fmt);
-	fprintf(stderr, "%s:%d: ", file->name, yylval.lineno);
-	vfprintf(stderr, fmt, ap);
-	fprintf(stderr, "\n");
+	if (asprintf(&nfmt, "%s:%d: %s", file->name, yylval.lineno, fmt) == -1)
+		fatalx("yyerror asprintf");
+	vlog(LOG_CRIT, nfmt, ap);
 	va_end(ap);
+	free(nfmt);
 	return (0);
 }
 
