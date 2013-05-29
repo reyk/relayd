@@ -242,9 +242,9 @@ ssl_error(const char *where, const char *what)
 void
 ssl_init(struct relayd *env)
 {
-	static int	 inited = 0;
+	static int	 initialized = 0;
 
-	if (inited)
+	if (initialized)
 		return;
 
 	SSL_library_init();
@@ -254,7 +254,7 @@ ssl_init(struct relayd *env)
 	ENGINE_load_builtin_engines();
 	ENGINE_register_all_complete();
 
-	inited = 1;
+	initialized = 1;
 }
 
 void

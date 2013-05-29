@@ -291,12 +291,12 @@ parent_configure(struct relayd *env)
 	TAILQ_FOREACH(proto, env->sc_protos, entry)
 		config_setproto(env, proto);
 	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry) {
-		/* Check for SSL Interception */
+		/* Check for SSL Inspection */
 		if ((rlay->rl_conf.flags & (F_SSL|F_SSLCLIENT)) ==
 		    (F_SSL|F_SSLCLIENT) &&
 		    rlay->rl_conf.ssl_cacert_len &&
 		    rlay->rl_conf.ssl_cakey_len)
-			rlay->rl_conf.flags |= F_SSLINTERCEPT;
+			rlay->rl_conf.flags |= F_SSLINSPECT;
 
 		config_setrelay(env, rlay);
 	}

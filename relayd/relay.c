@@ -1127,7 +1127,7 @@ relay_accept(int fd, short event, void *arg)
 		return;
 	}
 
-	if (rlay->rl_conf.flags & F_SSLINTERCEPT) {
+	if (rlay->rl_conf.flags & F_SSLINSPECT) {
 		relay_preconnect(con);
 		return;
 	}
@@ -1464,7 +1464,7 @@ relay_connect(struct rsession *con)
 	int		 bnds = -1, ret;
 
 	/* Connection is already established but session not active */
-	if ((rlay->rl_conf.flags & F_SSLINTERCEPT) && con->se_out.s != -1) {
+	if ((rlay->rl_conf.flags & F_SSLINSPECT) && con->se_out.s != -1) {
 		if (con->se_out.ssl == NULL) {
 			log_debug("%s: ssl connect failed", __func__);
 			return (-1);
@@ -1931,7 +1931,7 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 		method = SSLv23_server_method();
 		flag = EV_READ;
 
-		/* Use session-specific certificate for SSL interception. */
+		/* Use session-specific certificate for SSL inspection. */
 		if (cre->sslcert != NULL)
 			SSL_use_certificate(ssl, cre->sslcert);
 	} else {
@@ -2071,7 +2071,7 @@ relay_ssl_connect(int fd, short event, void *arg)
 	    "relay %s, ssl session %d connected (%d active)",
 	    rlay->rl_conf.name, con->se_id, relay_sessions);
 
-	if (rlay->rl_conf.flags & F_SSLINTERCEPT) {
+	if (rlay->rl_conf.flags & F_SSLINSPECT) {
 		if ((servercert =
 		    SSL_get_peer_certificate(con->se_out.ssl)) == NULL ||
 		    (con->se_in.sslcert = ssl_update_certificate(servercert,
