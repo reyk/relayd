@@ -1046,7 +1046,7 @@ relay_httpheader_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 	hdr->kv_matchptr = NULL;
 
 	if (id == HTTP_HEADER_NONE)
-		return (-1);
+		return (0);
 	else if (id < HTTP_HEADER_MAX) {
 		match = desc->http_header[id];
 		DPRINTF("%s: standard header %s: %p", __func__,
@@ -1096,8 +1096,9 @@ relay_httppath_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 	struct kv		*match = &desc->http_pathquery;
 	const char		*query;
 
+	/* XXX doesn't handle server response header yet */
 	if (cre->dir == RELAY_DIR_RESPONSE)
-		return (-1);
+		return (0);
 	else if (path->kv_key == NULL)
 		return (0);
 	else if (fnmatch(path->kv_key, desc->http_path, 0) == FNM_NOMATCH)
@@ -1262,12 +1263,20 @@ relay_action(struct ctl_relay_event *cre, struct relay_rule *rule,
 #define	RELAY_GET_SKIP_STEP(i)						\
 	do {								\
 		r = r->rule_skip[i];					\
+		DPRINTF("%s:%d: skip %d rules", __func__, __LINE__, i);	\
+	} while (0)
+
+#define	RELAY_GET_NEXT_STEP						\
+	do {								\
+		r = TAILQ_NEXT(r, rule_entry);				\
+		DPRINTF("%s:%d: next rule", __func__, __LINE__);	\
 	} while (0)
 
 int
 relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 {
 	struct http_descriptor	*desc = cre->desc;
+	struct rsession		*con = cre->con;
 	struct relay_rule	*r = NULL, *rule = NULL;
 	struct kv		*hdr = NULL;
 	u_int			 cnt = 0;
@@ -1296,9 +1305,9 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 		    desc->http_method != r->rule_method))
 			RELAY_GET_SKIP_STEP(RULE_SKIP_METHOD);
 		else if (relay_httpheader_test(cre, r, &actions) != 0)
-			r = TAILQ_NEXT(r, rule_entry);
+			RELAY_GET_NEXT_STEP;
 		else if (relay_httppath_test(cre, r, &actions) != 0)
-			r = TAILQ_NEXT(r, rule_entry);
+			RELAY_GET_NEXT_STEP;
 		else {
 			/* Rule matched */
 			rule = r;
