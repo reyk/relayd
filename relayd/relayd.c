@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.115 2013/01/17 20:34:18 bluhm Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.117 2013/05/30 20:17:12 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007, 2008 Reyk Floeter <reyk@openbsd.org>
@@ -290,8 +290,16 @@ parent_configure(struct relayd *env)
 		config_setrt(env, rt);
 	TAILQ_FOREACH(proto, env->sc_protos, entry)
 		config_setproto(env, proto);
-	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry)
+	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry) {
+		/* Check for SSL Inspection */
+		if ((rlay->rl_conf.flags & (F_SSL|F_SSLCLIENT)) ==
+		    (F_SSL|F_SSLCLIENT) &&
+		    rlay->rl_conf.ssl_cacert_len &&
+		    rlay->rl_conf.ssl_cakey_len)
+			rlay->rl_conf.flags |= F_SSLINSPECT;
+
 		config_setrelay(env, rlay);
+	}
 
 	/* HCE, PFE and the preforked relays need to reload their config. */
 	env->sc_reload = 2 + env->sc_prefork_relay;
@@ -894,9 +902,7 @@ event_again(struct event *ev, int fd, short event,
 {
 	struct timeval tv_next, tv_now, tv;
 
-	if (gettimeofday(&tv_now, NULL) == -1)
-		fatal("event_again: gettimeofday");
-
+	getmonotime(&tv_now);
 	bcopy(end, &tv_next, sizeof(tv_next));
 	timersub(&tv_now, start, &tv_now);
 	timersub(&tv_next, &tv_now, &tv_next);

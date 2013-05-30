@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.168 2012/10/19 16:49:50 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.171 2013/05/30 20:17:12 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -51,6 +51,7 @@
 #include <netdb.h>
 #include <string.h>
 #include <ifaddrs.h>
+#include <syslog.h>
 
 #include <openssl/ssl.h>
 
@@ -158,7 +159,7 @@ typedef struct {
 %token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SOCKET SPLICE
 %token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
-%token	RANDOM LEASTSTATES SRCHASH
+%token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table value
@@ -533,7 +534,11 @@ rdroptsl	: forwardmode TO tablespec interface	{
 		}
 		| SESSION TIMEOUT NUMBER		{
 			if ((rdr->conf.timeout.tv_sec = $3) < 0) {
-				yyerror("invalid timeout: %d", $3);
+				yyerror("invalid timeout: %lld", $3);
+				YYERROR;
+			}
+			if (rdr->conf.timeout.tv_sec > INT_MAX) {
+				yyerror("timeout too large: %lld", $3);
 				YYERROR;
 			}
 		}
@@ -952,6 +957,34 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 			}
 			free($3);
 		}
+		| CA KEY STRING PASSWORD STRING	{
+			if (strlcpy(proto->sslcakey, $3,
+			    sizeof(proto->sslcakey)) >=
+			    sizeof(proto->sslcakey)) {
+				yyerror("sslcakey truncated");
+				free($3);
+				free($5);
+				YYERROR;
+			}
+			if ((proto->sslcapass = strdup($5)) == NULL) {
+				yyerror("sslcapass");
+				free($3);
+				free($5);
+				YYERROR;
+			}
+			free($3);
+			free($5);
+		}
+		| CA CERTIFICATE STRING		{
+			if (strlcpy(proto->sslcacert, $3,
+			    sizeof(proto->sslcacert)) >=
+			    sizeof(proto->sslcacert)) {
+				yyerror("sslcacert truncated");
+				free($3);
+				YYERROR;
+			}
+			free($3);
+		}
 		| NO flag			{ proto->sslflags &= ~($2); }
 		| flag				{ proto->sslflags |= $1; }
 		;
@@ -1261,7 +1294,11 @@ relayoptsl	: LISTEN ON STRING port optssl {
 		}
 		| SESSION TIMEOUT NUMBER		{
 			if ((rlay->rl_conf.timeout.tv_sec = $3) < 0) {
-				yyerror("invalid timeout: %d", $3);
+				yyerror("invalid timeout: %lld", $3);
+				YYERROR;
+			}
+			if (rlay->rl_conf.timeout.tv_sec > INT_MAX) {
+				yyerror("timeout too large: %lld", $3);
 				YYERROR;
 			}
 		}
@@ -1655,13 +1692,15 @@ int
 yyerror(const char *fmt, ...)
 {
 	va_list		 ap;
+	char		*nfmt;
 
 	file->errors++;
 	va_start(ap, fmt);
-	fprintf(stderr, "%s:%d: ", file->name, yylval.lineno);
-	vfprintf(stderr, fmt, ap);
-	fprintf(stderr, "\n");
+	if (asprintf(&nfmt, "%s:%d: %s", file->name, yylval.lineno, fmt) == -1)
+		fatalx("yyerror asprintf");
+	vlog(LOG_CRIT, nfmt, ap);
 	va_end(ap);
+	free(nfmt);
 	return (0);
 }
 
@@ -1684,6 +1723,7 @@ lookup(char *s)
 		{ "buffer",		BUFFER },
 		{ "ca",			CA },
 		{ "cache",		CACHE },
+		{ "cert",		CERTIFICATE },
 		{ "check",		CHECK },
 		{ "ciphers",		CIPHERS },
 		{ "code",		CODE },
@@ -1708,6 +1748,7 @@ lookup(char *s)
 		{ "interface",		INTERFACE },
 		{ "interval",		INTERVAL },
 		{ "ip",			IP },
+		{ "key",		KEY },
 		{ "label",		LABEL },
 		{ "least-states",	LEASTSTATES },
 		{ "listen",		LISTEN },
@@ -1724,6 +1765,7 @@ lookup(char *s)
 		{ "on",			ON },
 		{ "parent",		PARENT },
 		{ "pass",		PASS },
+		{ "password",		PASSWORD },
 		{ "path",		PATH },
 		{ "port",		PORT },
 		{ "prefork",		PREFORK },
