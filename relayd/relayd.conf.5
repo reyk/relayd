@@ -682,11 +682,15 @@ The maximum is 2147483647 seconds (68 years).
 .El
 .Sh SSL RELAYS
 In addition to plain TCP,
-.Xr relayd
-supports the SSL and newer TLS protocols, or simply SSL, for
-authenticated and encrypted relays.
-It can operate as an SSL client or server to offer a variety of
-options for different use cases related to SSL.
+.Xr relayd 8
+supports the Secure Sockets Layer (SSL) and Transport Layer Security
+(TLS) cryptographic protocols for authenticated and encrypted relays.
+TLS is the successor of the original SSL protocol but the term SSL can
+refer to either of the protocols in
+.Nm .
+.Xr relayd 8
+can operate as an SSL client or server to offer a variety of options
+for different use cases related to SSL.
 .Bl -tag -width Ds
 .It Ic SSL client
 When configuring the relay
@@ -694,7 +698,7 @@ When configuring the relay
 statements with the
 .Ic with ssl
 directive,
-.Xr relayd
+.Xr relayd 8
 will enable client-side SSL to connect to the remote host.
 This is commonly used for SSL tunneling and transparent encapsulation
 of plain TCP connections.
@@ -709,7 +713,7 @@ When specifying the
 keyword in the relay
 .Ic listen
 statements,
-.Xr relayd
+.Xr relayd 8
 will accept connections from clients as an SSL server.
 This mode is also known as
 .Dq SSL acceleration .
@@ -720,11 +724,11 @@ description in the
 section for more details.
 .It Ic SSL client and server
 When combining both modes, SSL server and client,
-.Xr relayd
+.Xr relayd 8
 can filter SSL connections as a man-in-the-middle.
 This combined mode is also called
 .Dq SSL inspection .
-The configuration requires additional X.509 certificate settings,
+The configuration requires additional X.509 certificate settings;
 see the
 .Ic ca key
 description in the
@@ -735,18 +739,16 @@ section for more details.
 When configured for
 .Dq SSL inspection
 mode,
-.Xr relayd
-will listen for incoming connections which eventually have been
-diverted to the local socket by PF.
+.Xr relayd 8
+will listen for incoming connections which have been diverted to the
+local socket by PF.
 Before accepting and negotiating the incoming SSL connection as a
-server, it will look up the the original destination address on the
+server, it will look up the original destination address on the
 diverted socket, and pre-connect to the target server as an SSL client
 to obtain the remote SSL certificate.
-It will update or
-.Dq patch
-the obtained SSL certificate by replacing the included public key with
-its local server key because it doesn't have the private key of the
-remote server certificate. 
+It will update or patch the obtained SSL certificate by replacing the
+included public key with its local server key because it doesn't have
+the private key of the remote server certificate.
 It also updates the X.509 issuer name to the local CA subject name and
 signs the certificate with its local CA key.
 This way it keeps all the other X.509 attributes that are already
@@ -1387,15 +1389,16 @@ section.
 To start, first generate a new local CA key and certificate:
 .Bd -literal -offset indent
 # openssl req -x509 -days 365 -newkey rsa:2048 \e
-        -keyout /etc/ssl/private/ca.key -out /etc/ssl/ca.crt
+	-keyout /etc/ssl/private/ca.key -out /etc/ssl/ca.crt
 .Ed
 .Pp
-You will also need an SSL server key and cert for 127.0.0.1, see
+An SSL server key and cert for 127.0.0.1 are also required;
+see
 .Ic listen on
 in the
 .Sx RELAYS
 section for more details about certificate locations.
-Next configure the packet filter with a matching divert rule in
+Configure the packet filter with a matching divert rule in
 .Xr pf.conf 5 :
 .Bd -literal -offset indent
 # Divert incoming HTTPS traffic to relayd
@@ -1404,7 +1407,7 @@ pass in on vlan1 inet proto tcp to port 443 \e
 .Ed
 .Pp
 And finally configure the SSL inspection in
-.Xr relayd.conf 5 :
+.Nm :
 .Bd -literal -offset indent
 http protocol httpfilter {
 	return error
