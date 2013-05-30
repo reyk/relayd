@@ -851,25 +851,6 @@ relay_splice(struct ctl_relay_event *cre)
 		return (0);
 	}
 
-	/* still not connected */
-	if (cre->bev == NULL || cre->dst->bev == NULL)
-		return (0);
-
-	if (! (cre->toread == TOREAD_UNLIMITED || cre->toread > 0)) {
-		DPRINTF("%s: session %d: splice dir %d, nothing to read %lld",
-		    __func__, con->se_id, cre->dir, cre->toread);
-		return (0);
-	}
-
-	/* do not splice before buffers have not been completely flushed */
-	if (EVBUFFER_LENGTH(cre->bev->input) ||
-	    EVBUFFER_LENGTH(cre->dst->bev->output)) {
-		DPRINTF("%s: session %d: splice dir %d, dirty buffer",
-		    __func__, con->se_id, cre->dir);
-		bufferevent_disable(cre->bev, EV_READ);
-		return (0);
-	}
-
 	bzero(&sp, sizeof(sp));
 	sp.sp_fd = cre->dst->s;
 	sp.sp_max = cre->toread > 0 ? cre->toread : 0;
