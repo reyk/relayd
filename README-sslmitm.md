@@ -1,16 +1,15 @@
 relayd SSL Inspection ("SSL-MITM")
 ==================================
 
-This branch includes experimental support for SSL inspection, an SSL
-Man-In-The-Middle attack.  relayd will intercept SSL connections and
-update the server SSL certificates on the fly by using a local RSA key
-signing them with a local CA.  The clients will accept the forged
-server certificate if they trust the local CA.  This is typically done
-by either installing the local CA cert in the clients CA chain (eg.
-the accepted CA certificates of the browser), or by using a CA
-certificate that was signed by a root CA that is already accepted by
-the client.  The latter is typically only possible for governmental
-authorities. 
+relayd supports SSL inspection, an SSL Man-In-The-Middle attack.
+relayd will intercept SSL connections and update the server SSL
+certificates on the fly by using a local RSA key signing them with a
+local CA.  The clients will accept the forged server certificate if
+they trust the local CA.  This is typically done by either installing
+the local CA cert in the clients CA chain (eg.  the accepted CA
+certificates of the browser), or by using a CA certificate that was
+signed by a root CA that is already accepted by the client.  The
+latter is typically only possible for governmental authorities.
 
 Configuration
 -------------
