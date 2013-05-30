@@ -2031,7 +2031,7 @@ relay_ssl_connect(int fd, short event, void *arg)
 	int		 retry_flag = 0;
 	int		 ssl_err = 0;
 	int		 ret;
-	X509		*servercert;
+	X509		*servercert = NULL;
 
 	if (event == EV_TIMEOUT) {
 		relay_close(con, "SSL connect timeout");
@@ -2073,16 +2073,20 @@ relay_ssl_connect(int fd, short event, void *arg)
 
 	if (rlay->rl_conf.flags & F_SSLINSPECT) {
 		if ((servercert =
-		    SSL_get_peer_certificate(con->se_out.ssl)) == NULL ||
-		    (con->se_in.sslcert = ssl_update_certificate(servercert,
-		    rlay->rl_ssl_key, rlay->rl_conf.ssl_key_len,
-		    rlay->rl_ssl_cakey, rlay->rl_conf.ssl_cakey_len,
-		    rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len))
-		    == NULL) {
+		    SSL_get_peer_certificate(con->se_out.ssl)) != NULL) {
+			con->se_in.sslcert =
+			    ssl_update_certificate(servercert,
+			    rlay->rl_ssl_key, rlay->rl_conf.ssl_key_len,
+			    rlay->rl_ssl_cakey, rlay->rl_conf.ssl_cakey_len,
+			    rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len);
+		} else
+			con->se_in.sslcert = NULL;
+		if (servercert != NULL)
+			X509_free(servercert);
+		if (con->se_in.sslcert == NULL)
 			relay_close(con, "could not create certificate");
-			return;
-		}
-		relay_session(con);
+		else
+			relay_session(con);
 		return;
 	}
 
