@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.8 2012/12/18 15:57:16 reyk Exp $	*/
+/*	$OpenBSD: config.c,v 1.9 2013/05/30 20:17:12 reyk Exp $	*/
 
 /*
  * Copyright (c) 2011 Reyk Floeter <reyk@openbsd.org>
@@ -637,6 +637,7 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 
 	proto->request_nodes = 0;
 	proto->response_nodes = 0;
+	proto->sslcapass = NULL;
 	RB_INIT(&proto->request_tree);
 	RB_INIT(&proto->response_tree);
 
