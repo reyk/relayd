@@ -172,7 +172,7 @@ typedef struct {
 %type	<v.host>	host
 %type	<v.addr>	address
 %type	<v.tv>		timeout
-%type	<v.digest>	digest
+%type	<v.digest>	digest optdigest
 %type	<v.table>	tablespec
 %type	<v.dir>		dir
 
@@ -809,6 +809,16 @@ digest		: DIGEST STRING
 		}
 		;
 
+optdigest	: digest			{
+			$$.digest = $1.digest;
+			$$.type = $1.type;
+		}
+		| STRING			{
+			$$.digest = $1;
+			$$.type = DIGEST_NONE;
+		}
+		;
+
 proto		: relay_proto PROTO STRING	{
 			struct protocol *p;
 
@@ -1102,9 +1112,10 @@ ruleopts	: METHOD STRING			{
 			rule->rule_cookie.kv_type = KEY_TYPE_QUERY;
 
 		}
-		| URL keyaction STRING value		{
+		| URL keyaction optdigest value			{
 			rule->rule_url.kv_action = $2;
-			rule->rule_url.kv_key = $3;
+			rule->rule_url.kv_key = $3.digest;
+			rule->rule_url.kv_digest = $3.type;
 			rule->rule_url.kv_value = $4;
 			rule->rule_url.kv_type = KEY_TYPE_URL;
 

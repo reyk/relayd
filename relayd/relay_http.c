@@ -609,10 +609,11 @@ _relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
 		return (RES_FAIL);
 	}
 
-	switch (type) {
+	switch (url->kv_digest) {
 	case DIGEST_SHA1:
 	case DIGEST_MD5:
-		if ((md = digeststr(type, val, strlen(val), NULL)) == NULL) {
+		if ((md = digeststr(url->kv_digest,
+		    val, strlen(val), NULL)) == NULL) {
 			relay_abort_http(con, 500,
 			    "failed to allocate digest", 0);
 			goto fail;
@@ -627,8 +628,10 @@ _relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
 	DPRINTF("%s: session %d: %s, %s: %d", __func__, con->se_id,
 	    str, url->kv_key, strcasecmp(url->kv_key, str));
 
-	if (strcasecmp(url->kv_key, str) == 0)
-		return (RES_DROP);
+	if (strcasecmp(url->kv_key, str) == 0) {
+		ret = RES_DROP;
+		goto fail;
+	}
 
 	ret = RES_PASS;
  fail:

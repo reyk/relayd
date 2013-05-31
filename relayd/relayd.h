@@ -257,12 +257,19 @@ enum keytype {
 	KEY_TYPE_URL
 };
 
+enum digest_type {
+	DIGEST_NONE		= 0,
+	DIGEST_SHA1		= 1,
+	DIGEST_MD5		= 2
+};
+
 struct kv {
 	char			*kv_key;
 	char			*kv_value;
 
 	enum keyaction		 kv_action;
 	enum keytype		 kv_type;
+	enum digest_type	 kv_digest;
 
 	/* A few pointers used by the rule actions */
 	struct kv		*kv_match;
@@ -401,12 +408,6 @@ enum host_status {
 	HOST_UP		= 1
 };
 #define HOST_ISUP(x)	(x == HOST_UP)
-
-enum digest_type {
-	DIGEST_NONE		= 0,
-	DIGEST_SHA1		= 1,
-	DIGEST_MD5		= 2
-};
 
 struct table_config {
 	objid_t			 id;
