@@ -337,11 +337,11 @@ relay_read_http(struct bufferevent *bev, void *arg)
 				bev->readcb = relay_read_httpcontent;
 
 			/* Single-pass HTTP response */
-			if (cre->toread < 0) {
+			if (cre->dir == RELAY_DIR_RESPONSE &&
+			    cre->toread < 0) {
 				cre->toread = TOREAD_UNLIMITED;
 				bev->readcb = relay_read;
 			}
-
 			break;
 		default:
 			/* HTTP handler */
