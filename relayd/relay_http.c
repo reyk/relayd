@@ -49,11 +49,12 @@
 #include "http.h"
 
 static int	_relay_lookup_url(struct ctl_relay_event *, char *, char *,
-		    char *, struct kv *, enum digest_type);
+		    char *, struct kv *);
 int		 relay_lookup_url(struct ctl_relay_event *,
-		    const char *, struct kv *, enum digest_type);
+		    const char *, struct kv *);
 int		 relay_lookup_query(struct ctl_relay_event *);
-int		 relay_lookup_cookie(struct ctl_relay_event *, const char *);
+int		 relay_lookup_cookie(struct ctl_relay_event *, const char *,
+		    struct kv *);
 void		 relay_read_httpcontent(struct bufferevent *, void *);
 void		 relay_read_httpchunks(struct bufferevent *, void *);
 char		*relay_expand_http(struct ctl_relay_event *, char *,
@@ -70,6 +71,8 @@ int		 relay_httpheader_test(struct ctl_relay_event *,
 int		 relay_httppath_test(struct ctl_relay_event *,
 		    struct relay_rule *, struct kvlist *);
 int		 relay_httpurl_test(struct ctl_relay_event *,
+		    struct relay_rule *, struct kvlist *);
+int		 relay_httpcookie_test(struct ctl_relay_event *,
 		    struct relay_rule *, struct kvlist *);
 int		 relay_action(struct ctl_relay_event *, struct relay_rule *,
 		    struct kvlist *);
@@ -594,7 +597,7 @@ relay_http_request_close(struct ctl_relay_event *cre)
 
 static int
 _relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
-    char *query, struct kv *url, enum digest_type type)
+    char *query, struct kv *kv)
 {
 	struct rsession		*con = cre->con;
 	char			*val, *md = NULL;
@@ -609,10 +612,10 @@ _relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
 		return (RES_FAIL);
 	}
 
-	switch (url->kv_digest) {
+	switch (kv->kv_digest) {
 	case DIGEST_SHA1:
 	case DIGEST_MD5:
-		if ((md = digeststr(url->kv_digest,
+		if ((md = digeststr(kv->kv_digest,
 		    val, strlen(val), NULL)) == NULL) {
 			relay_abort_http(con, 500,
 			    "failed to allocate digest", 0);
@@ -626,9 +629,9 @@ _relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
 	}
 
 	DPRINTF("%s: session %d: %s, %s: %d", __func__, con->se_id,
-	    str, url->kv_key, strcasecmp(url->kv_key, str));
+	    str, kv->kv_key, strcasecmp(kv->kv_key, str));
 
-	if (strcasecmp(url->kv_key, str) == 0) {
+	if (strcasecmp(kv->kv_key, str) == 0) {
 		ret = RES_DROP;
 		goto fail;
 	}
@@ -642,8 +645,7 @@ _relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
 }
 
 int
-relay_lookup_url(struct ctl_relay_event *cre, const char *host,
-    struct kv *url, enum digest_type type)
+relay_lookup_url(struct ctl_relay_event *cre, const char *host, struct kv *kv)
 {
 	struct rsession		*con = cre->con;
 	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
@@ -692,12 +694,12 @@ relay_lookup_url(struct ctl_relay_event *cre, const char *host,
 		/* 1. complete path with query */
 		if (desc->http_query != NULL)
 			if ((ret = _relay_lookup_url(cre, hi[i],
-			    pp, desc->http_query, url, type)) != RES_PASS)
+			    pp, desc->http_query, kv)) != RES_PASS)
 				goto done;
 
 		/* 2. complete path without query */
 		if ((ret = _relay_lookup_url(cre, hi[i],
-		    pp, NULL, url, type)) != RES_PASS)
+		    pp, NULL, kv)) != RES_PASS)
 			goto done;
 
 		/* 3. traverse path */
@@ -709,7 +711,7 @@ relay_lookup_url(struct ctl_relay_event *cre, const char *host,
 			ch = *c;
 			*c = '\0';
 			if ((ret = _relay_lookup_url(cre, hi[i],
-			    pp, NULL, url, type)) != RES_PASS)
+			    pp, NULL, kv)) != RES_PASS)
 				goto done;
 			*c = ch;
 		}
@@ -722,7 +724,8 @@ relay_lookup_url(struct ctl_relay_event *cre, const char *host,
 }
 
 int
-relay_lookup_cookie(struct ctl_relay_event *cre, const char *str)
+relay_lookup_cookie(struct ctl_relay_event *cre, const char *str,
+    struct kv *kv)
 {
 	struct rsession		*con = cre->con;
 	char			*val, *ptr, *key, *value;
@@ -755,9 +758,22 @@ relay_lookup_cookie(struct ctl_relay_event *cre, const char *str)
 			*value++ = '\0';
 		if (value[strlen(value) - 1] == '"')
 			value[strlen(value) - 1] = '\0';
+
+		DPRINTF("%s: session %d: %s, %s: %d", __func__, con->se_id,
+		    str, kv->kv_key, strcasecmp(kv->kv_key, key));
+
+		if (strcasecmp(kv->kv_key, key) == 0 &&
+		    ((kv->kv_value == NULL) ||
+		    (fnmatch(kv->kv_value, value,
+		    FNM_CASEFOLD) != FNM_NOMATCH))) {
+			ret = RES_DROP;
+			goto done;
+		}
 	}
 
 	ret = RES_PASS;
+
+ done:
 	free(val);
 	return (ret);
 }
@@ -1089,43 +1105,34 @@ relay_httpheader_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 			return (-1);
 	}
 
-	if (hdr->kv_action != KEY_ACTION_NONE) {
-		hdr->kv_match = match;
-		hdr->kv_matchlist = &desc->http_headers;
-		TAILQ_INSERT_TAIL(actions, hdr, kv_entry);
-	}
+	relay_match(actions, hdr, match, &desc->http_headers);
 
 	return (0);
 }
-
 
 int
 relay_httppath_test(struct ctl_relay_event *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
 	struct http_descriptor	*desc = cre->desc;
-	struct kv		*path = &rule->rule_path;
+	struct kv		*kv = &rule->rule_path;
 	struct kv		*match = &desc->http_pathquery;
 	const char		*query;
 
 	/* XXX doesn't handle server response header yet */
 	if (cre->dir == RELAY_DIR_RESPONSE)
 		return (0);
-	else if (path->kv_key == NULL)
+	else if (kv->kv_key == NULL)
 		return (0);
-	else if (fnmatch(path->kv_key, desc->http_path, 0) == FNM_NOMATCH)
+	else if (fnmatch(kv->kv_key, desc->http_path, 0) == FNM_NOMATCH)
 		return (-1);
-	else if (path->kv_value != NULL) {
+	else if (kv->kv_value != NULL) {
 		query = desc->http_query == NULL ? "" : desc->http_query;
-		if (fnmatch(path->kv_value, query, FNM_CASEFOLD) == FNM_NOMATCH)
+		if (fnmatch(kv->kv_value, query, FNM_CASEFOLD) == FNM_NOMATCH)
 			return (-1);
 	}
 
-	if (path->kv_action != KEY_ACTION_NONE) {
-		path->kv_match = match;
-		path->kv_matchlist = NULL;
-		TAILQ_INSERT_TAIL(actions, path, kv_entry);
-	}
+	relay_match(actions, kv, match, NULL);
 
 	return (0);
 }
@@ -1136,21 +1143,39 @@ relay_httpurl_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 {
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*host = desc->http_header[HTTP_HEADER_HOST];
-	struct kv		*url = &rule->rule_url;
+	struct kv		*kv = &rule->rule_url;
 	struct kv		*match = &desc->http_pathquery;
 
 	if (cre->dir == RELAY_DIR_RESPONSE)
 		return (0);
-	else if (url->kv_key == NULL || host == NULL || host->kv_value == NULL)
+	else if (kv->kv_key == NULL || host == NULL || host->kv_value == NULL)
 		return (0);
-	else if (relay_lookup_url(cre, host->kv_value, url, DIGEST_NONE) != 0)
+	else if (relay_lookup_url(cre, host->kv_value, kv) != 0)
 		return (-1);
 
-	if (url->kv_action != KEY_ACTION_NONE) {
-		url->kv_match = match;
-		url->kv_matchlist = NULL;
-		TAILQ_INSERT_TAIL(actions, url, kv_entry);
-	}
+	relay_match(actions, kv, match, NULL);
+
+	return (0);
+}
+
+int
+relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
+    struct kvlist *actions)
+{
+	struct http_descriptor	*desc = cre->desc;
+	struct kv		*cookie = desc->http_header[HTTP_HEADER_COOKIE];
+	struct kv		*kv = &rule->rule_cookie;
+	struct kv		*match = cookie;
+
+	if (cre->dir == RELAY_DIR_RESPONSE)
+		return (0);
+	else if (kv->kv_key == NULL || cookie == NULL ||
+	    cookie->kv_value == NULL)
+		return (0);
+	else if (relay_lookup_cookie(cre, cookie->kv_value, kv) != 0)
+		return (-1);
+
+	relay_match(actions, kv, match, NULL);
 
 	return (0);
 }
@@ -1349,6 +1374,8 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 			RELAY_GET_NEXT_STEP;
 		else if (relay_httpurl_test(cre, r, &actions) != 0)
 			RELAY_GET_NEXT_STEP;
+		else if (relay_httpcookie_test(cre, r, &actions) != 0)
+			RELAY_GET_NEXT_STEP;
 		else {
 			/* Rule matched */
 			rule = r;
@@ -1418,4 +1445,15 @@ relay_calc_skip_steps(struct relay_rules *rules)
 	}
 	for (i = 0; i < RULE_SKIP_COUNT; ++i)
 		RELAY_SET_SKIP_STEPS(i);
+}
+
+void
+relay_match(struct kvlist *actions, struct kv *kv, struct kv *match,
+    struct kvlist *matchlist)
+{
+	if (kv->kv_action != KEY_ACTION_NONE) {
+		kv->kv_match = match;
+		kv->kv_matchlist = matchlist;
+		TAILQ_INSERT_TAIL(actions, kv, kv_entry);
+	}
 }

@@ -1065,6 +1065,8 @@ int	 relay_bufferevent_write(struct ctl_relay_event *,
 	    void *, size_t);
 int	 relay_test(struct protocol *, struct ctl_relay_event *);
 void	 relay_calc_skip_steps(struct relay_rules *);
+void	 relay_match(struct kvlist *, struct kv *, struct kv *,
+	    struct kvlist *);
 
 SPLAY_PROTOTYPE(session_tree, rsession, se_nodes, relay_session_cmp);
 
