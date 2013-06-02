@@ -568,6 +568,7 @@ void
 relay_http_request_close(struct ctl_relay_event *cre)
 {
 	struct http_descriptor	*desc = cre->desc;
+	struct rsession		*con = cre->con;
 
 	if (desc->http_path != NULL) {
 		free(desc->http_path);
@@ -759,8 +760,10 @@ relay_lookup_cookie(struct ctl_relay_event *cre, const char *str,
 		if (value[strlen(value) - 1] == '"')
 			value[strlen(value) - 1] = '\0';
 
-		DPRINTF("%s: session %d: %s, %s: %d", __func__, con->se_id,
-		    str, kv->kv_key, strcasecmp(kv->kv_key, key));
+		DPRINTF("%s: session %d: %s = %s, %s = %s : %d",
+		    __func__, con->se_id,
+		    key, value, kv->kv_key, kv->kv_value,
+		    strcasecmp(kv->kv_key, key));
 
 		if (strcasecmp(kv->kv_key, key) == 0 &&
 		    ((kv->kv_value == NULL) ||
@@ -1126,7 +1129,7 @@ relay_httppath_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 		return (0);
 	else if (fnmatch(kv->kv_key, desc->http_path, 0) == FNM_NOMATCH)
 		return (-1);
-	else if (kv->kv_value != NULL) {
+	else if (kv->kv_value != NULL && kv->kv_action == KEY_ACTION_NONE) {
 		query = desc->http_query == NULL ? "" : desc->http_query;
 		if (fnmatch(kv->kv_value, query, FNM_CASEFOLD) == FNM_NOMATCH)
 			return (-1);
@@ -1246,8 +1249,7 @@ relay_action(struct ctl_relay_event *cre, struct relay_rule *rule,
 		case KEY_ACTION_SET:
 			switch (kv->kv_type) {
 			case KEY_TYPE_PATH:
-				if (kv_setkey(match, "%s%s", match->kv_key,
-				    kv->kv_key) == -1)
+				if (kv_setkey(match, "%s", kv->kv_value) == -1)
 					return (-1);
 				break;
 			default:
