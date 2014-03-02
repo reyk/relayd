@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.c,v 1.5 2013/01/17 20:34:18 bluhm Exp $	*/
+/*	$OpenBSD: proc.c,v 1.7 2014/02/14 10:21:00 benno Exp $	*/
 
 /*
  * Copyright (c) 2010,2011 Reyk Floeter <reyk@openbsd.org>
@@ -432,7 +432,7 @@ proc_dispatch(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if (msgbuf_write(&ibuf->w) == -1)
+		if (msgbuf_write(&ibuf->w) == -1 && errno != EAGAIN)
 			fatal(title);
 	}
 
@@ -586,16 +586,6 @@ proc_forward_imsg(struct privsep *ps, struct imsg *imsg,
 {
 	return (proc_compose_imsg(ps, id, n, imsg->hdr.type,
 	    imsg->fd, imsg->data, IMSG_DATA_SIZE(imsg)));
-}
-
-void
-proc_flush_imsg(struct privsep *ps, enum privsep_procid id, int n)
-{
-	int	 m;
-
-	proc_range(ps, id, &n, &m);
-	for (; n < m; n++)
-		imsg_flush(&ps->ps_ievs[id][n].ibuf);
 }
 
 struct imsgbuf *

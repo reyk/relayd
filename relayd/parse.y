@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.171 2013/05/30 20:17:12 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.175 2014/01/22 00:21:16 henning Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -159,7 +159,7 @@ typedef struct {
 %token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SOCKET SPLICE
 %token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
-%token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD
+%token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH CURVE
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table
@@ -844,6 +844,7 @@ proto		: relay_proto PROTO STRING	{
 			p->tcpbacklog = RELAY_BACKLOG;
 			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
 			    sizeof(p->sslciphers));
+			p->sslecdhcurve = SSLECDHCURVE_DEFAULT;
 			if (last_proto_id == INT_MAX) {
 				yyerror("too many protocols defined");
 				free(p);
@@ -969,6 +970,16 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 				YYERROR;
 			}
 			free($2);
+		}
+		| ECDH CURVE STRING		{
+			if (strcmp("none", $3) == 0)
+				proto->sslecdhcurve = 0;
+			else if ((proto->sslecdhcurve = OBJ_sn2nid($3)) == 0) {
+				yyerror("ECDH curve not supported");
+				free($3);
+				YYERROR;
+			}
+			free($3);
 		}
 		| CA FILENAME STRING		{
 			if (strlcpy(proto->sslca, $3,
@@ -1833,10 +1844,12 @@ lookup(char *s)
 		{ "ciphers",		CIPHERS },
 		{ "code",		CODE },
 		{ "cookie",		COOKIE },
+		{ "curve",		CURVE },
 		{ "demote",		DEMOTE },
 		{ "destination",	DESTINATION },
 		{ "digest",		DIGEST },
 		{ "disable",		DISABLE },
+		{ "ecdh",		ECDH },
 		{ "error",		ERROR },
 		{ "expect",		EXPECT },
 		{ "external",		EXTERNAL },
@@ -1928,9 +1941,9 @@ lookup(char *s)
 
 #define MAXPUSHBACK	128
 
-char	*parsebuf;
+u_char	*parsebuf;
 int	 parseindex;
-char	 pushback_buffer[MAXPUSHBACK];
+u_char	 pushback_buffer[MAXPUSHBACK];
 int	 pushback_index = 0;
 
 int
@@ -2023,8 +2036,8 @@ findeol(void)
 int
 yylex(void)
 {
-	char	 buf[8096];
-	char	*p, *val;
+	u_char	 buf[8096];
+	u_char	*p, *val;
 	int	 quotec, next, c;
 	int	 token;
 
@@ -2047,7 +2060,7 @@ top:
 				return (findeol());
 			}
 			if (isalnum(c) || c == '_') {
-				*p++ = (char)c;
+				*p++ = c;
 				continue;
 			}
 			*p = '\0';
@@ -2092,7 +2105,7 @@ top:
 				yyerror("string too long");
 				return (findeol());
 			}
-			*p++ = (char)c;
+			*p++ = c;
 		}
 		yylval.v.string = strdup(buf);
 		if (yylval.v.string == NULL)
@@ -2179,8 +2192,8 @@ check_file_secrecy(int fd, const char *fname)
 		log_warnx("%s: owner not root or current user", fname);
 		return (-1);
 	}
-	if (st.st_mode & (S_IRWXG | S_IRWXO)) {
-		log_warnx("%s: group/world readable/writeable", fname);
+	if (st.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) {
+		log_warnx("%s: group writable or world read/writable", fname);
 		return (-1);
 	}
 	return (0);
@@ -2796,6 +2809,12 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	rb->rl_conf.port = rc.port;
 	rb->rl_conf.flags =
 	    (ra->rl_conf.flags & ~F_SSL) | (rc.flags & F_SSL);
+	if (!(rb->rl_conf.flags & F_SSL)) {
+		rb->rl_ssl_cert = NULL;
+		rb->rl_conf.ssl_cert_len = 0;
+		rb->rl_ssl_key = NULL;
+		rb->rl_conf.ssl_key_len = 0;
+	}
 	TAILQ_INIT(&rb->rl_tables);
 
 	rb->rl_conf.id = ++last_relay_id;

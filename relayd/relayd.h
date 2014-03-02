@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.169 2013/05/30 20:17:12 reyk Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.172 2014/02/14 10:21:00 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2012 Reyk Floeter <reyk@openbsd.org>
@@ -568,7 +568,8 @@ enum prototype {
 #define SSLFLAG_BITS						\
 	"\10\01sslv2\02sslv3\03tlsv1\04version"
 
-#define SSLCIPHERS_DEFAULT	"HIGH:!ADH"
+#define SSLCIPHERS_DEFAULT	"HIGH:!aNULL"
+#define SSLECDHCURVE_DEFAULT	NID_X9_62_prime256v1
 
 struct protocol {
 	objid_t			 id;
@@ -580,6 +581,7 @@ struct protocol {
 	u_int8_t		 tcpipminttl;
 	u_int8_t		 sslflags;
 	char			 sslciphers[768];
+	int			 sslecdhcurve;
 	char			 sslca[MAXPATHLEN];
 	char			 sslcacert[MAXPATHLEN];
 	char			 sslcakey[MAXPATHLEN];
@@ -1162,7 +1164,6 @@ int	 proc_composev_imsg(struct privsep *, enum privsep_procid, int,
 	    u_int16_t, int, const struct iovec *, int);
 int	 proc_forward_imsg(struct privsep *, struct imsg *,
 	    enum privsep_procid, int);
-void	 proc_flush_imsg(struct privsep *, enum privsep_procid, int);
 struct imsgbuf *
 	 proc_ibuf(struct privsep *, enum privsep_procid, int);
 void	 imsg_event_add(struct imsgev *);
