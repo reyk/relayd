@@ -167,7 +167,7 @@ typedef struct {
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table optstring value
 %type	<v.number>	http_type loglevel quick trap
-%type	<v.number>	direction dstmode flag forwardmode retry
+%type	<v.number>	dstmode flag forwardmode retry
 %type	<v.number>	optssl optsslclient sslcache
 %type	<v.number>	redirect_proto relay_proto match
 %type	<v.number>	action ruleaf keyaction
