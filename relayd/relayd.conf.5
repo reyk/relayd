@@ -1,4 +1,4 @@
-.\"	$OpenBSD: relayd.conf.5,v 1.134 2013/05/30 20:17:12 reyk Exp $
+.\"	$OpenBSD: relayd.conf.5,v 1.142 2014/04/18 13:55:26 reyk Exp $
 .\"
 .\" Copyright (c) 2006, 2007 Reyk Floeter <reyk@openbsd.org>
 .\" Copyright (c) 2006, 2007 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -15,7 +15,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: May 30 2013 $
+.Dd $Mdocdate: April 18 2014 $
 .Dt RELAYD.CONF 5
 .Os
 .Sh NAME
@@ -145,17 +145,24 @@ relayed connections.
 This increases the performance and prevents delays when connecting
 to a relay.
 .Xr relayd 8
-runs 5 relay processes by default and every process will handle
+runs 3 relay processes by default and every process will handle
 all configured relays.
-.It Ic send trap
+.It Ic snmp Oo Ic trap Oc Op Qq Ar path
 Send an SNMP trap when the state of a host changes.
 .Xr relayd 8
 will try to connect to
 .Xr snmpd 8
-and request it send a trap to the registered trap receivers;
-see
+over the AgentX SNMP socket specified by
+.Ar path
+and request it send a trap to the registered trap receivers.
+If
+.Ar path
+is not specified, a default path of
+.Ar /var/run/agentx.sock
+will be used.
+See
 .Xr snmpd.conf 5
-for more information about the configuration.
+for more information about SNMP configuration.
 .It Ic timeout Ar number
 Set the global timeout in milliseconds for checks.
 This can be overridden by the timeout value in the table definitions.
@@ -1129,13 +1136,19 @@ option is specified.
 .It Ic ciphers Ar string
 Set the string defining the SSL cipher suite.
 If not specified, the default value
-.Ar HIGH:!ADH
+.Ar HIGH:!aNULL
 will be used (strong crypto cipher suites without anonymous DH).
-See the
-.Sx CIPHERS
-section of
+See the CIPHERS section of
 .Xr openssl 1
 for information about SSL cipher suites and preference lists.
+.It Ic ecdh curve Ar name
+Set a named curve to use when generating EC keys for ECDHE-based
+cipher suites with Perfect Forward Security (PFS), or
+.Ar none
+to disable ECDHE support.
+If not specified, the default curve
+.Ar prime256v1
+will be used.
 .It Ic session cache Ar value
 Set the maximum size of the SSL session cache.
 If the
@@ -1268,7 +1281,7 @@ Add the routes with the specified
 to the kernel routing table.
 .El
 .Sh FILES
-.Bl -tag -width "/etc/ssl/private/address.keyXX" -compact
+.Bl -tag -width Ds -compact
 .It Pa /etc/relayd.conf
 .Xr relayd 8
 configuration file.
@@ -1286,6 +1299,7 @@ is the configured IP address
 and
 .Ar port
 is the configured port number of the relay.
+.Pp
 .It Pa /etc/ssl/cert.pem
 Default location of the CA bundle that can be used with
 .Xr relayd 8 .
@@ -1457,9 +1471,9 @@ in
 The
 .Xr relayd 8
 program was written by
-.An Pierre-Yves Ritschard Aq pyr@openbsd.org
+.An Pierre-Yves Ritschard Aq Mt pyr@openbsd.org
 and
-.An Reyk Floeter Aq reyk@openbsd.org .
+.An Reyk Floeter Aq Mt reyk@openbsd.org .
 .Sh CAVEATS
 .Xr relayd 8
 Verification of SSL server certificates is based on a static CA bundle

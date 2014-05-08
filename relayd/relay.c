@@ -1,7 +1,7 @@
-/*	$OpenBSD: relay.c,v 1.166 2013/05/30 20:17:12 reyk Exp $	*/
+/*	$OpenBSD: relay.c,v 1.169 2014/04/22 08:04:23 reyk Exp $	*/
 
 /*
- * Copyright (c) 2006 - 2013 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -52,6 +52,8 @@ int		 relay_dispatch_parent(int, struct privsep_proc *,
 		    struct imsg *);
 int		 relay_dispatch_pfe(int, struct privsep_proc *,
 		    struct imsg *);
+int		 relay_dispatch_ca(int, struct privsep_proc *,
+		    struct imsg *);
 void		 relay_shutdown(void);
 
 void		 relay_nodedebug(const char *, struct protonode *);
@@ -96,6 +98,7 @@ int				 proc_id;
 static struct privsep_proc procs[] = {
 	{ "parent",	PROC_PARENT,	relay_dispatch_parent },
 	{ "pfe",	PROC_PFE,	relay_dispatch_pfe },
+	{ "ca",		PROC_CA,	relay_dispatch_ca }
 };
 
 pid_t
@@ -1782,6 +1785,12 @@ relay_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 }
 
 int
+relay_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	return (-1);
+}
+
+int
 relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
 	struct rsession		*con;
@@ -1841,8 +1850,9 @@ relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 SSL_CTX *
 relay_ssl_ctx_create(struct relay *rlay)
 {
-	struct protocol *proto = rlay->rl_proto;
-	SSL_CTX *ctx;
+	struct protocol	*proto = rlay->rl_proto;
+	SSL_CTX		*ctx;
+	EC_KEY		*ecdhkey;
 
 	ctx = SSL_CTX_new(SSLv23_method());
 	if (ctx == NULL)
@@ -1872,6 +1882,16 @@ relay_ssl_ctx_create(struct relay *rlay)
 	if ((proto->sslflags & SSLFLAG_TLSV1) == 0)
 		SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1);
 
+	if (proto->sslecdhcurve > 0) {
+		/* Enable ECDHE support for TLS perfect forward secrecy */
+		if ((ecdhkey =
+		    EC_KEY_new_by_curve_name(proto->sslecdhcurve)) == NULL)
+			goto err;
+		SSL_CTX_set_tmp_ecdh(ctx, ecdhkey);
+		SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
+		EC_KEY_free(ecdhkey);
+	}
+
 	if (!SSL_CTX_set_cipher_list(ctx, proto->sslciphers))
 		goto err;
 
@@ -1893,16 +1913,32 @@ relay_ssl_ctx_create(struct relay *rlay)
 		goto err;
 
 	log_debug("%s: loading private key", __func__);
-	if (!ssl_ctx_use_private_key(ctx, rlay->rl_ssl_key,
-	    rlay->rl_conf.ssl_key_len))
+	if (!ssl_ctx_fake_private_key(ctx,
+	    &rlay->rl_conf.ssl_keyid,
+	    rlay->rl_ssl_cert, rlay->rl_conf.ssl_cert_len,
+	    &rlay->rl_ssl_x509, &rlay->rl_ssl_pkey))
 		goto err;
+
 	if (!SSL_CTX_check_private_key(ctx))
 		goto err;
+
+	if (rlay->rl_conf.ssl_cacert_len) {
+		log_debug("%s: loading CA private key", __func__);
+		if (!ssl_ctx_load_pkey(ctx,
+		    &rlay->rl_conf.ssl_cakeyid, rlay->rl_ssl_cacert,
+		    rlay->rl_conf.ssl_cacert_len,
+		    &rlay->rl_ssl_cacertx509, &rlay->rl_ssl_capkey))
+			goto err;
+	}
 
 	/* Set session context to the local relay name */
 	if (!SSL_CTX_set_session_id_context(ctx, rlay->rl_conf.name,
 	    strlen(rlay->rl_conf.name)))
 		goto err;
+
+	/* The text versions of the keys/certs are not needed anymore */
+	purge_key(&rlay->rl_ssl_cert, rlay->rl_conf.ssl_cert_len);
+	purge_key(&rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len);
 
 	return (ctx);
 
@@ -2076,9 +2112,8 @@ relay_ssl_connect(int fd, short event, void *arg)
 		    SSL_get_peer_certificate(con->se_out.ssl)) != NULL) {
 			con->se_in.sslcert =
 			    ssl_update_certificate(servercert,
-			    rlay->rl_ssl_key, rlay->rl_conf.ssl_key_len,
-			    rlay->rl_ssl_cakey, rlay->rl_conf.ssl_cakey_len,
-			    rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len);
+			    rlay->rl_ssl_pkey, rlay->rl_ssl_capkey,
+			    rlay->rl_ssl_cacertx509);
 		} else
 			con->se_in.sslcert = NULL;
 		if (servercert != NULL)

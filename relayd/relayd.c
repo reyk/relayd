@@ -1,7 +1,7 @@
-/*	$OpenBSD: relayd.c,v 1.117 2013/05/30 20:17:12 reyk Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.122 2014/04/22 08:04:23 reyk Exp $	*/
 
 /*
- * Copyright (c) 2007, 2008 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -57,6 +57,8 @@ int		 parent_dispatch_pfe(int, struct privsep_proc *, struct imsg *);
 int		 parent_dispatch_hce(int, struct privsep_proc *, struct imsg *);
 int		 parent_dispatch_relay(int, struct privsep_proc *,
 		    struct imsg *);
+int		 parent_dispatch_ca(int, struct privsep_proc *,
+		    struct imsg *);
 int		 bindany(struct ctl_bindany *);
 
 struct relayd			*relayd_env;
@@ -64,7 +66,8 @@ struct relayd			*relayd_env;
 static struct privsep_proc procs[] = {
 	{ "pfe",	PROC_PFE, parent_dispatch_pfe, pfe },
 	{ "hce",	PROC_HCE, parent_dispatch_hce, hce },
-	{ "relay",	PROC_RELAY, parent_dispatch_relay, relay }
+	{ "relay",	PROC_RELAY, parent_dispatch_relay, relay },
+	{ "ca",		PROC_CA, parent_dispatch_ca, ca }
 };
 
 void
@@ -133,7 +136,6 @@ parent_sig_handler(int sig, short event, void *arg)
 	}
 }
 
-/* __dead is for lint */
 __dead void
 usage(void)
 {
@@ -223,6 +225,9 @@ main(int argc, char *argv[])
 		log_info("startup");
 
 	ps->ps_instances[PROC_RELAY] = env->sc_prefork_relay;
+	ps->ps_instances[PROC_CA] = env->sc_prefork_relay;
+	ps->ps_ninstances = env->sc_prefork_relay;
+
 	proc_init(ps, procs, nitems(procs));
 
 	setproctitle("parent");
@@ -241,7 +246,7 @@ main(int argc, char *argv[])
 	signal_add(&ps->ps_evsighup, NULL);
 	signal_add(&ps->ps_evsigpipe, NULL);
 
-	proc_config(ps, procs, nitems(procs));
+	proc_listen(ps, procs, nitems(procs));
 
 	if (load_config(env->sc_conffile, env) == -1) {
 		proc_kill(env->sc_ps);
@@ -301,8 +306,8 @@ parent_configure(struct relayd *env)
 		config_setrelay(env, rlay);
 	}
 
-	/* HCE, PFE and the preforked relays need to reload their config. */
-	env->sc_reload = 2 + env->sc_prefork_relay;
+	/* HCE, PFE, CA and the relays need to reload their config. */
+	env->sc_reload = 2 + (2 * env->sc_prefork_relay);
 
 	for (id = 0; id < PROC_MAX; id++) {
 		if (id == privsep_process)
@@ -327,7 +332,7 @@ parent_configure(struct relayd *env)
 	ret = 0;
 
  done:
-	config_purge(env, CONFIG_ALL);
+	config_purge(env, CONFIG_ALL & ~CONFIG_RELAYS);
 	return (ret);
 }
 
@@ -514,6 +519,22 @@ parent_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 	return (0);
 }
 
+int
+parent_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	struct relayd		*env = p->p_env;
+
+	switch (imsg->hdr.type) {
+	case IMSG_CFG_DONE:
+		parent_configure_done(env);
+		break;
+	default:
+		return (-1);
+	}
+
+	return (0);
+}
+
 void
 purge_tree(struct proto_tree *tree)
 {
@@ -569,6 +590,20 @@ purge_table(struct tablelist *head, struct table *table)
 }
 
 void
+purge_key(char **ptr, off_t len)
+{
+	char	*key = *ptr;
+
+	if (key == NULL || len == 0)
+		return;
+
+	explicit_bzero(key, len);
+	free(key);
+
+	*ptr = NULL;
+}
+
+void
 purge_relay(struct relayd *env, struct relay *rlay)
 {
 	struct rsession		*con;
@@ -591,14 +626,30 @@ purge_relay(struct relayd *env, struct relay *rlay)
 	if (rlay->rl_dstbev != NULL)
 		bufferevent_free(rlay->rl_dstbev);
 
+	purge_key(&rlay->rl_ssl_cert, rlay->rl_conf.ssl_cert_len);
+	purge_key(&rlay->rl_ssl_key, rlay->rl_conf.ssl_key_len);
+	purge_key(&rlay->rl_ssl_ca, rlay->rl_conf.ssl_ca_len);
+	purge_key(&rlay->rl_ssl_cakey, rlay->rl_conf.ssl_cakey_len);
+
+	if (rlay->rl_ssl_x509 != NULL) {
+		X509_free(rlay->rl_ssl_x509);
+		rlay->rl_ssl_x509 = NULL;
+	}
+	if (rlay->rl_ssl_pkey != NULL) {
+		EVP_PKEY_free(rlay->rl_ssl_pkey);
+		rlay->rl_ssl_pkey = NULL;
+	}
+	if (rlay->rl_ssl_cacertx509 != NULL) {
+		X509_free(rlay->rl_ssl_cacertx509);
+		rlay->rl_ssl_cacertx509 = NULL;
+	}
+	if (rlay->rl_ssl_capkey != NULL) {
+		EVP_PKEY_free(rlay->rl_ssl_capkey);
+		rlay->rl_ssl_capkey = NULL;
+	}
+
 	if (rlay->rl_ssl_ctx != NULL)
 		SSL_CTX_free(rlay->rl_ssl_ctx);
-	if (rlay->rl_ssl_cert != NULL)
-		free(rlay->rl_ssl_cert);
-	if (rlay->rl_ssl_key != NULL)
-		free(rlay->rl_ssl_key);
-	if (rlay->rl_ssl_ca != NULL)
-		free(rlay->rl_ssl_ca);
 
 	while ((rlt = TAILQ_FIRST(&rlay->rl_tables))) {
 		TAILQ_REMOVE(&rlay->rl_tables, rlt, rlt_entry);
@@ -788,6 +839,36 @@ relay_findbyaddr(struct relayd *env, struct relay_config *rc)
 		    rlay->rl_conf.port == rc->port)
 			return (rlay);
 	return (NULL);
+}
+
+EVP_PKEY *
+pkey_find(struct relayd *env, objid_t id)
+{
+	struct ca_pkey	*pkey;
+
+	TAILQ_FOREACH(pkey, env->sc_pkeys, pkey_entry)
+		if (pkey->pkey_id == id)
+			return (pkey->pkey);
+	return (NULL);
+}
+
+struct ca_pkey *
+pkey_add(struct relayd *env, EVP_PKEY *pkey, objid_t id)
+{
+	struct ca_pkey	*ca_pkey;
+	
+	if (env->sc_pkeys == NULL)
+		fatalx("pkeys");
+
+	if ((ca_pkey = calloc(1, sizeof(*ca_pkey))) == NULL)
+		return (NULL);
+
+	ca_pkey->pkey = pkey;
+	ca_pkey->pkey_id = id;
+
+	TAILQ_INSERT_TAIL(env->sc_pkeys, ca_pkey, pkey_entry);
+
+	return (ca_pkey);
 }
 
 void
@@ -1211,7 +1292,7 @@ get_string(u_int8_t *ptr, size_t len)
 	char	*str;
 
 	for (i = 0; i < len; i++)
-		if (!(isprint((char)ptr[i]) || isspace((char)ptr[i])))
+		if (!(isprint(ptr[i]) || isspace(ptr[i])))
 			break;
 
 	if ((str = calloc(1, i + 1)) == NULL)

@@ -1,7 +1,7 @@
-/*	$OpenBSD: proc.c,v 1.5 2013/01/17 20:34:18 bluhm Exp $	*/
+/*	$OpenBSD: proc.c,v 1.13 2014/05/06 06:40:03 jsg Exp $	*/
 
 /*
- * Copyright (c) 2010,2011 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2010 - 2014 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -38,53 +38,92 @@
 #include <pwd.h>
 #include <event.h>
 
-#include <openssl/rand.h>
 #include <openssl/ssl.h>
 
 #include "relayd.h"
 
-void	 proc_setup(struct privsep *);
+void	 proc_open(struct privsep *, struct privsep_proc *,
+	    struct privsep_proc *, size_t);
+void	 proc_close(struct privsep *);
 int	 proc_ispeer(struct privsep_proc *, u_int, enum privsep_procid);
 void	 proc_shutdown(struct privsep_proc *);
 void	 proc_sig_handler(int, short, void *);
 void	 proc_range(struct privsep *, enum privsep_procid, int *, int *);
 
 int
-proc_ispeer(struct privsep_proc *p, u_int nproc, enum privsep_procid type)
+proc_ispeer(struct privsep_proc *procs, u_int nproc, enum privsep_procid type)
 {
 	u_int	i;
 
 	for (i = 0; i < nproc; i++)
-		if (p[i].p_id == type)
+		if (procs[i].p_id == type)
 			return (1);
 	return (0);
 }
 
 void
-proc_init(struct privsep *ps, struct privsep_proc *p, u_int nproc)
+proc_init(struct privsep *ps, struct privsep_proc *procs, u_int nproc)
 {
-	u_int	 i;
+	u_int			 i, j, src, dst;
+	struct privsep_pipes	*pp;
 
 	/*
-	 * Called from parent
+	 * Allocate pipes for all process instances (incl. parent)
+	 *
+	 * - ps->ps_pipes: N:M mapping
+	 * N source processes connected to M destination processes:
+	 * [src][instances][dst][instances], for example
+	 * [PROC_RELAY][3][PROC_CA][3]
+	 *
+	 * - ps->ps_pp: per-process 1:M part of ps->ps_pipes
+	 * Each process instance has a destination array of socketpair fds:
+	 * [dst][instances], for example
+	 * [PROC_PARENT][0]
+	 */
+	for (src = 0; src < PROC_MAX; src++) {
+		/* Allocate destination array for each process */
+		if ((ps->ps_pipes[src] = calloc(ps->ps_ninstances,
+		    sizeof(struct privsep_pipes))) == NULL)
+			fatal("proc_init: calloc");
+
+		for (i = 0; i < ps->ps_ninstances; i++) {
+			pp = &ps->ps_pipes[src][i];
+
+			for (dst = 0; dst < PROC_MAX; dst++) {
+				/* Allocate maximum fd integers */
+				if ((pp->pp_pipes[dst] =
+				    calloc(ps->ps_ninstances,
+				    sizeof(int))) == NULL)
+					fatal("proc_init: calloc");
+
+				/* Mark fd as unused */
+				for (j = 0; j < ps->ps_ninstances; j++)
+					pp->pp_pipes[dst][j] = -1;
+			}
+		}
+	}
+
+	/*
+	 * Setup and run the parent and its children
 	 */
 	privsep_process = PROC_PARENT;
 	ps->ps_instances[PROC_PARENT] = 1;
 	ps->ps_title[PROC_PARENT] = "parent";
 	ps->ps_pid[PROC_PARENT] = getpid();
+	ps->ps_pp = &ps->ps_pipes[privsep_process][0];
 
 	for (i = 0; i < nproc; i++) {
 		/* Default to 1 process instance */
-		if (ps->ps_instances[p[i].p_id] < 1)
-			ps->ps_instances[p[i].p_id] = 1;
-		ps->ps_title[p[i].p_id] = p[i].p_title;
+		if (ps->ps_instances[procs[i].p_id] < 1)
+			ps->ps_instances[procs[i].p_id] = 1;
+		ps->ps_title[procs[i].p_id] = procs[i].p_title;
 	}
 
-	proc_setup(ps);
+	proc_open(ps, NULL, procs, nproc);
 
 	/* Engage! */
 	for (i = 0; i < nproc; i++)
-		ps->ps_pid[p[i].p_id] = (*p[i].p_init)(ps, &p[i]);
+		ps->ps_pid[procs[i].p_id] = (*procs[i].p_init)(ps, &procs[i]);
 }
 
 void
@@ -106,114 +145,113 @@ proc_kill(struct privsep *ps)
 		pid = waitpid(WAIT_ANY, NULL, 0);
 	} while (pid != -1 || (pid == -1 && errno == EINTR));
 
-	proc_clear(ps, 1);
+	proc_close(ps);
 }
 
 void
-proc_setup(struct privsep *ps)
+proc_open(struct privsep *ps, struct privsep_proc *p,
+    struct privsep_proc *procs, size_t nproc)
 {
-	int	 i, j, n, count, sockpair[2];
+	struct privsep_pipes	*pa, *pb;
+	int			 fds[2];
+	u_int			 i, j, src, proc;
 
-	for (i = 0; i < PROC_MAX; i++)
-		for (j = 0; j < PROC_MAX; j++) {
-			/*
-			 * find out how many instances of this peer there are.
-			 */
-			if (i >= j || ps->ps_instances[i] == 0 ||
-			    ps->ps_instances[j] == 0)
-				continue;
-
-			if (ps->ps_instances[i] > 1 &&
-			    ps->ps_instances[j] > 1)
-				fatalx("N:M peering not supported");
-
-			count = ps->ps_instances[i] * ps->ps_instances[j];
-
-			if ((ps->ps_pipes[i][j] =
-			    calloc(count, sizeof(int))) == NULL ||
-			    (ps->ps_pipes[j][i] =
-			    calloc(count, sizeof(int))) == NULL)
-				fatal(NULL);
-
-			for (n = 0; n < count; n++) {
-				if (ps->ps_noaction)
-					continue;
-				if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC,
-				    sockpair) == -1)
-					fatal("socketpair");
-				ps->ps_pipes[i][j][n] = sockpair[0];
-				ps->ps_pipes[j][i][n] = sockpair[1];
-				socket_set_blockmode(
-				    ps->ps_pipes[i][j][n],
-				    BM_NONBLOCK);
-				socket_set_blockmode(
-				    ps->ps_pipes[j][i][n],
-				    BM_NONBLOCK);
-			}
-		}
-}
-
-void
-proc_config(struct privsep *ps, struct privsep_proc *p, u_int nproc)
-{
-	u_int	i, j, src, dst, count, n, instance;
-
-	src = privsep_process;
+	if (p == NULL)
+		src = privsep_process; /* parent */
+	else
+		src = p->p_id;
 
 	/*
-	 * close unused pipes
-	 */
-	for (i = 0; i < PROC_MAX; i++) {
-		for (j = 0; j < PROC_MAX; j++) {
-			if (i == j ||
-			    ps->ps_instances[i] == 0 ||
-			    ps->ps_instances[j] == 0)
-				continue;
+	 * Open socket pairs for our peers
+	 */	
+	for (proc = 0; proc < nproc; proc++) {
+		procs[proc].p_ps = ps;
+		procs[proc].p_env = ps->ps_env;
 
-			count = ps->ps_instances[i] * ps->ps_instances[j];
+		for (i = 0; i < ps->ps_instances[src]; i++) {
+			for (j = 0; j < ps->ps_instances[procs[proc].p_id];
+			    j++) {
+				pa = &ps->ps_pipes[src][i];
+				pb = &ps->ps_pipes[procs[proc].p_id][j];
 
-			for (n = 0; n < count; n++) {
-				instance = ps->ps_instances[i] > 1 ? n : 0;
-				if (i == src &&
-				    proc_ispeer(p, nproc, j) &&
-				    ps->ps_instance == instance)
+				/* Check if fds are already set by peer */
+				if (pa->pp_pipes[procs[proc].p_id][j] != -1)
 					continue;
 
-				if (!ps->ps_noaction)
-					close(ps->ps_pipes[i][j][n]);
-				ps->ps_pipes[i][j][n] = -1;
+				if (socketpair(AF_UNIX, SOCK_STREAM,
+				    PF_UNSPEC, fds) == -1)
+					fatal("socketpair");
+
+				socket_set_blockmode(fds[0], BM_NONBLOCK);
+				socket_set_blockmode(fds[1], BM_NONBLOCK);
+
+				pa->pp_pipes[procs[proc].p_id][j] = fds[0];
+				pb->pp_pipes[src][i] = fds[1];
+			}
+		}
+	}
+}
+
+void
+proc_listen(struct privsep *ps, struct privsep_proc *procs, size_t nproc)
+{
+	u_int			 i, dst, src, n, m;
+	struct privsep_pipes	*pp;
+
+	/*
+	 * Close unused pipes
+	 */
+	for (src = 0; src < PROC_MAX; src++) {
+		for (n = 0; n < ps->ps_instances[src]; n++) {
+			/* Ingore current process */
+			if (src == (u_int)privsep_process &&
+			    n == ps->ps_instance)
+				continue;
+
+			pp = &ps->ps_pipes[src][n];
+
+			for (dst = 0; dst < PROC_MAX; dst++) {
+				if (src == dst)
+					continue;
+				for (m = 0; m < ps->ps_instances[dst]; m++) {
+					if (pp->pp_pipes[dst][m] == -1)
+						continue;
+
+					/* Close and invalidate fd */
+					close(pp->pp_pipes[dst][m]);
+					pp->pp_pipes[dst][m] = -1;
+				}
 			}
 		}
 	}
 
+	src = privsep_process;
+	ps->ps_pp = pp = &ps->ps_pipes[src][ps->ps_instance];
+
 	/*
-	 * listen on appropriate pipes
+	 * Listen on appropriate pipes
 	 */
 	for (i = 0; i < nproc; i++) {
-		dst = p[i].p_id;
-		p[i].p_ps = ps;
-		p[i].p_env = ps->ps_env;
+		dst = procs[i].p_id;
 
 		if (src == dst)
-			fatal("proc_config: cannot peer with oneself");
+			fatal("proc_listen: cannot peer with oneself");
 
-		count = ps->ps_instances[src] * ps->ps_instances[dst];
-
-		if ((ps->ps_ievs[dst] = calloc(count,
+		if ((ps->ps_ievs[dst] = calloc(ps->ps_instances[dst],
 		    sizeof(struct imsgev))) == NULL)
-			fatal("proc_config");
+			fatal("proc_open");
 
-		for (n = 0; n < count; n++) {
-			if (ps->ps_pipes[src][dst][n] == -1)
+		for (n = 0; n < ps->ps_instances[dst]; n++) {
+			if (pp->pp_pipes[dst][n] == -1)
 				continue;
 
 			imsg_init(&(ps->ps_ievs[dst][n].ibuf),
-			    ps->ps_pipes[src][dst][n]);
+			    pp->pp_pipes[dst][n]);
 			ps->ps_ievs[dst][n].handler = proc_dispatch;
 			ps->ps_ievs[dst][n].events = EV_READ;
-			ps->ps_ievs[dst][n].proc = &p[i];
+			ps->ps_ievs[dst][n].proc = &procs[i];
 			ps->ps_ievs[dst][n].data = &ps->ps_ievs[dst][n];
-			p[i].p_instance = n;
+			procs[i].p_instance = n;
 
 			event_set(&(ps->ps_ievs[dst][n].ev),
 			    ps->ps_ievs[dst][n].ibuf.fd,
@@ -226,31 +264,31 @@ proc_config(struct privsep *ps, struct privsep_proc *p, u_int nproc)
 }
 
 void
-proc_clear(struct privsep *ps, int purge)
+proc_close(struct privsep *ps)
 {
-	u_int	 src = privsep_process, dst, n, count;
+	u_int			 dst, n;
+	struct privsep_pipes	*pp;
 
 	if (ps == NULL)
 		return;
 
+	pp = ps->ps_pp;
+
 	for (dst = 0; dst < PROC_MAX; dst++) {
-		if (src == dst || ps->ps_ievs[dst] == NULL)
+		if (ps->ps_ievs[dst] == NULL)
 			continue;
 
-		count = ps->ps_instances[src] * ps->ps_instances[dst];
-
-		for (n = 0; n < count; n++) {
-			if (ps->ps_pipes[src][dst][n] == -1)
+		for (n = 0; n < ps->ps_instances[dst]; n++) {
+			if (pp->pp_pipes[dst][n] == -1)
 				continue;
-			if (purge) {
-				event_del(&(ps->ps_ievs[dst][n].ev));
-				imsg_clear(&(ps->ps_ievs[dst][n].ibuf));
-				close(ps->ps_pipes[src][dst][n]);
-			} else
-				imsg_flush(&(ps->ps_ievs[dst][n].ibuf));
+
+			/* Cancel the fd, close and invalidate the fd */
+			event_del(&(ps->ps_ievs[dst][n].ev));
+			imsg_clear(&(ps->ps_ievs[dst][n].ibuf));
+			close(pp->pp_pipes[dst][n]);
+			pp->pp_pipes[dst][n] = -1;
 		}
-		if (purge)
-			free(ps->ps_ievs[dst]);
+		free(ps->ps_ievs[dst]);
 	}
 }
 
@@ -265,7 +303,7 @@ proc_shutdown(struct privsep_proc *p)
 	if (p->p_shutdown != NULL)
 		(*p->p_shutdown)();
 
-	proc_clear(ps, 1);
+	proc_close(ps);
 
 	log_info("%s exiting, pid %d", p->p_title, getpid());
 
@@ -301,15 +339,17 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 	pid_t		 pid;
 	struct passwd	*pw;
 	const char	*root;
-	u_int32_t	 seed[256];
 	u_int		 n;
 
 	if (ps->ps_noaction)
 		return (0);
 
+	proc_open(ps, p, procs, nproc);
+
+	/* Fork child handlers */
 	switch (pid = fork()) {
 	case -1:
-		fatal("run_proc: cannot fork");
+		fatal("proc_run: cannot fork");
 	case 0:
 		/* Set the process group of the current process */
 		setpgrp(0, getpid());
@@ -320,7 +360,7 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 
 	pw = ps->ps_pw;
 
-	if (p->p_id == PROC_CONTROL) {
+	if (p->p_id == PROC_CONTROL && ps->ps_instance == 0) {
 		if (control_init(ps, &ps->ps_csock) == -1)
 			fatalx(p->p_title);
 	}
@@ -331,31 +371,19 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 	else
 		root = pw->pw_dir;
 
-#ifndef DEBUG
 	if (chroot(root) == -1)
-		fatal("run_proc: chroot");
+		fatal("proc_run: chroot");
 	if (chdir("/") == -1)
-		fatal("run_proc: chdir(\"/\")");
-#else
-#warning disabling privilege revocation and chroot in DEBUG MODE
-	if (p->p_chroot != NULL) {
-		if (chroot(root) == -1)
-			fatal("run_proc: chroot");
-		if (chdir("/") == -1)
-			fatal("run_proc: chdir(\"/\")");
-	}
-#endif
+		fatal("proc_run: chdir(\"/\")");
 
 	privsep_process = p->p_id;
 
 	setproctitle("%s", p->p_title);
 
-#ifndef DEBUG
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
 	    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
-		fatal("run_proc: cannot drop privileges");
-#endif
+		fatal("proc_run: cannot drop privileges");
 
 	/* Fork child handlers */
 	for (n = 1; n < ps->ps_instances[p->p_id]; n++) {
@@ -384,10 +412,7 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 	signal_add(&ps->ps_evsighup, NULL);
 	signal_add(&ps->ps_evsigpipe, NULL);
 
-	proc_config(ps, procs, nproc);
-
-	arc4random_buf(seed, sizeof(seed));
-	RAND_seed(seed, sizeof(seed));
+	proc_listen(ps, procs, nproc);
 
 	if (p->p_id == PROC_CONTROL && ps->ps_instance == 0) {
 		TAILQ_INIT(&ctl_conns);
@@ -432,7 +457,7 @@ proc_dispatch(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if (msgbuf_write(&ibuf->w) == -1)
+		if (msgbuf_write(&ibuf->w) == -1 && errno != EAGAIN)
 			fatal(title);
 	}
 
@@ -528,22 +553,9 @@ void
 proc_range(struct privsep *ps, enum privsep_procid id, int *n, int *m)
 {
 	if (*n == -1) {
-		/*
-		 * -1 means that the current process is
-		 * N:1 - one of many processes connected to a single peer,
-		 *       so find the right slot of the peer.
-		 * 1:N - a single process connected to many peers,
-		 *       so find the range of slots of all peers.
-		 */
-		if (ps->ps_instances[privsep_process] <=
-		    ps->ps_instances[id]) {
-			*n = 0;
-			*m = ps->ps_instances[id];
-			return;
-		}
-
-		*n = ps->ps_instance;
-		*m = ps->ps_instance + 1;
+		/* Use a range of all target instances */
+		*n = 0;
+		*m = ps->ps_instances[id];
 	} else {
 		/* Use only a single slot of the specified peer process */
 		*m = *n + 1;
@@ -557,10 +569,11 @@ proc_compose_imsg(struct privsep *ps, enum privsep_procid id, int n,
 	int	 m;
 
 	proc_range(ps, id, &n, &m);
-	for (; n < m; n++)
+	for (; n < m; n++) {
 		if (imsg_compose_event(&ps->ps_ievs[id][n],
 		    type, -1, 0, fd, data, datalen) == -1)
 			return (-1);
+	}
 
 	return (0);
 }
@@ -588,16 +601,6 @@ proc_forward_imsg(struct privsep *ps, struct imsg *imsg,
 	    imsg->fd, imsg->data, IMSG_DATA_SIZE(imsg)));
 }
 
-void
-proc_flush_imsg(struct privsep *ps, enum privsep_procid id, int n)
-{
-	int	 m;
-
-	proc_range(ps, id, &n, &m);
-	for (; n < m; n++)
-		imsg_flush(&ps->ps_ievs[id][n].ibuf);
-}
-
 struct imsgbuf *
 proc_ibuf(struct privsep *ps, enum privsep_procid id, int n)
 {
@@ -605,4 +608,13 @@ proc_ibuf(struct privsep *ps, enum privsep_procid id, int n)
 
 	proc_range(ps, id, &n, &m);
 	return (&ps->ps_ievs[id][n].ibuf);
+}
+
+struct imsgev *
+proc_iev(struct privsep *ps, enum privsep_procid id, int n)
+{
+	int	 m;
+
+	proc_range(ps, id, &n, &m);
+	return (&ps->ps_ievs[id][n]);
 }
