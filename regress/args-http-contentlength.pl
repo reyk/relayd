@@ -11,10 +11,10 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    "request header log foo",
-	    "response header log Content-Length",
+	    "match request header log foo",
+	    "match response header log Content-Length",
 	],
-	loggrep => [ map { "log 'Content-Length: $_'" } @lengths ],
+	loggrep => [ map { "Content-Length: $_" } @lengths ],
     },
     server => {
 	func => \&http_server,

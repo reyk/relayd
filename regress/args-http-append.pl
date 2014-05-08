@@ -9,8 +9,8 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    'request header append "$REMOTE_ADDR:$REMOTE_PORT" to X-Client-Append',
-	    'response header append "$SERVER_ADDR:$SERVER_PORT" to X-Server-Append',
+	    'match request header append X-Client-Append value "$REMOTE_ADDR:$REMOTE_PORT"',
+	    'match response header append X-Server-Append value "$SERVER_ADDR:$SERVER_PORT"',
 	],
     },
     server => {

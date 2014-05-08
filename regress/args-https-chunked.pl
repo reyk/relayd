@@ -12,10 +12,10 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    "request header log foo",
-	    "response header log Transfer-Encoding",
+	    "match request header log foo",
+	    "match response header log Transfer-Encoding",
 	],
-	loggrep => { "log 'Transfer-Encoding: chunked'" => 2 },
+	loggrep => { "Transfer-Encoding: chunked" => 1 },
 	forwardssl => 1,
 	listenssl => 1,
     },

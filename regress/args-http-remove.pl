@@ -8,6 +8,7 @@ my %header = (
 our %args = (
     client => {
 	func => \&http_client,
+	nocheck => 1,
 	loggrep => {
 	    "X-Header-Foo: foo" => 0,
 	    "X-Header-Bar: bar" => 1,
@@ -15,9 +16,9 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    'response header remove X-Header-Foo log',
+	    'match response header remove X-Header-Foo',
 	],
-	loggrep => { qr/done, \[X-Header-Foo: foo\s*\]/ => 1 },
+	loggrep => { qr/done/ => 1 },
     },
     server => {
 	func => \&http_server,
