@@ -4,7 +4,10 @@ use warnings;
 our %args = (
     client => {
 	func => \&http_client,
-	loggrep => qr/403 Forbidden/,
+	loggrep => {
+	    qr/403 Forbidden/ => 1,
+	    qr/Content-Type: text\/html/ => 1
+	},
 	path => "query?foo=bar&ok=yes",
 	httpnok => 1,
     },
