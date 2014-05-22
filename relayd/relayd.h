@@ -41,8 +41,10 @@
 #define CHECK_INTERVAL		10
 #define EMPTY_TABLE		UINT_MAX
 #define EMPTY_ID		UINT_MAX
+#define LABEL_NAME_SIZE		1024
+#define TAG_NAME_SIZE		64
 #define TABLE_NAME_SIZE		64
-#define	TAG_NAME_SIZE		64
+#define	RD_TAG_NAME_SIZE	64
 #define	RT_LABEL_SIZE		32
 #define SRV_NAME_SIZE		64
 #define MAX_NAME_SIZE		64
@@ -117,19 +119,6 @@ struct ctl_relaytable {
 	u_int32_t	 flags;
 };
 
-struct ctl_kvlen {
-	ssize_t		 key;
-	ssize_t		 value;
-};
-
-struct ctl_rule {
-	struct ctl_kvlen cookie;
-	struct ctl_kvlen headerXXX;
-	struct ctl_kvlen path;
-	struct ctl_kvlen query;
-	struct ctl_kvlen url;
-};
-
 struct ctl_script {
 	objid_t		 host;
 	int		 retval;
@@ -166,9 +155,10 @@ struct ctl_tcp_event {
 };
 
 enum direction {
-	RELAY_DIR_ANY		= 0,
-	RELAY_DIR_REQUEST	= 1,
-	RELAY_DIR_RESPONSE	= 2
+	RELAY_DIR_INVALID	= -1,
+	RELAY_DIR_ANY		=  0,
+	RELAY_DIR_REQUEST	=  1,
+	RELAY_DIR_RESPONSE	=  2
 };
 
 struct ctl_relay_event {
@@ -263,7 +253,17 @@ enum keytype {
 	KEY_TYPE_HEADER,
 	KEY_TYPE_PATH,
 	KEY_TYPE_QUERY,
-	KEY_TYPE_URL
+	KEY_TYPE_URL,
+	KEY_TYPE_MAX
+};
+
+struct ctl_kvlen {
+	ssize_t		 key;
+	ssize_t		 value;
+};
+
+struct ctl_rule {
+	struct ctl_kvlen kvlen[KEY_TYPE_MAX];
 };
 
 enum digest_type {
@@ -279,6 +279,7 @@ struct kv {
 	enum keyaction		 kv_action;
 	enum keytype		 kv_type;
 	enum digest_type	 kv_digest;
+	u_int			 kv_header_id;
 
 	/* A few pointers used by the rule actions */
 	struct kv		*kv_match;
@@ -467,7 +468,7 @@ struct rdr_config {
 	objid_t			 backup_id;
 	int			 mode;
 	char			 name[SRV_NAME_SIZE];
-	char			 tag[TAG_NAME_SIZE];
+	char			 tag[RD_TAG_NAME_SIZE];
 	struct timeval		 timeout;
 };
 
@@ -500,11 +501,11 @@ struct rsession {
 	int				 se_retry;
 	int				 se_retrycount;
 	int				 se_connectcount;
-	u_int16_t			 se_mark;
 	struct evbuffer			*se_log;
 	struct relay			*se_relay;
 	struct ctl_natlook		*se_cnl;
 	int				 se_bnds;
+	u_int16_t			 se_tag;
 
 	int				 se_cid;
 	pid_t				 se_pid;
@@ -571,22 +572,23 @@ struct relay_rule {
 #define RULE_FLAG_FORWARD_TABLE	0x02
 	u_int8_t		 rule_flags;
 
-	u_int			 rule_dir;
+	u_int16_t		 rule_label;
+	u_int16_t		 rule_tag;
+	u_int16_t		 rule_tagged;
+	enum direction		 rule_dir;
 	u_int			 rule_proto;
 	int			 rule_af;
 	struct rule_addr	 rule_src;
 	struct rule_addr	 rule_dst;
 
 	u_int			 rule_method;
-	u_int			 rule_header;
 	char			 rule_tablename[TABLE_NAME_SIZE];
+	char			 rule_labelname[LABEL_NAME_SIZE];
+	char			 rule_tagname[TAG_NAME_SIZE];
+	char			 rule_taggedname[TAG_NAME_SIZE];
 
 	struct ctl_rule		 rule_ctl;
-	struct kv		 rule_cookie;
-	struct kv		 rule_headerXXX;
-	struct kv		 rule_path;
-	struct kv		 rule_query;
-	struct kv		 rule_url;
+	struct kv		 rule_kv[KEY_TYPE_MAX];
 
 	TAILQ_ENTRY(relay_rule)	 rule_entry;
 };
@@ -636,7 +638,6 @@ struct protocol {
 	char			 name[MAX_NAME_SIZE];
 	int			 cache;
 	enum prototype		 type;
-	int			 lateconnect;
 	char			*style;
 
 	int			(*cmp)(struct rsession *, struct rsession *);
@@ -1078,7 +1079,6 @@ void	 hce_notify_done(struct host *, enum host_error);
 /* relay.c */
 pid_t	 relay(struct privsep *, struct privsep_proc *);
 int	 relay_privinit(struct relay *);
-int	 relay_http_descinit(struct ctl_relay_event *);
 void	 relay_notify_done(struct host *, const char *);
 int	 relay_session_cmp(struct rsession *, struct rsession *);
 int	 relay_load_certfiles(struct relay *);
@@ -1129,6 +1129,7 @@ u_int	 relay_httpmethod_byname(const char *);
 const char
 	*relay_httpmethod_byid(u_int);
 u_int	 relay_httpheader_byname(const char *);
+int	 relay_httpdesc_init(struct ctl_relay_event *);
 
 /* relay_udp.c */
 void	 relay_udp_privinit(struct relayd *, struct relay *);
@@ -1217,7 +1218,13 @@ void		 kv_delete(struct kvlist *, struct kv *);
 struct kv	*kv_extend(struct kvlist *, char *);
 void		 kv_purge(struct kvlist *);
 void		 kv_free(struct kv *);
-int		 kv_log(struct evbuffer *, const char *, struct kv *);
+struct kv	*kv_inherit(struct kv *, struct kv *);
+int		 kv_log(struct evbuffer *, struct kv *, u_int16_t);
+int		 rule_add(enum keytype, struct protocol *,
+		    struct relay_rule *, const char *);
+void		 rule_delete(struct relay_rules *, struct relay_rule *);
+void		 rule_free(struct relay_rule *);
+struct relay_rule *rule_inherit(struct relay_rule *);
 
 /* carp.c */
 int	 carp_demote_init(char *, int);
@@ -1227,10 +1234,14 @@ int	 carp_demote_set(char *, int);
 int	 carp_demote_reset(char *, int);
 
 /* name2id.c */
-u_int16_t	 pn_name2id(const char *);
-const char	*pn_id2name(u_int16_t);
-void		 pn_unref(u_int16_t);
-void		 pn_ref(u_int16_t);
+u_int16_t	 label_name2id(const char *);
+const char	*label_id2name(u_int16_t);
+void		 label_unref(u_int16_t);
+void		 label_ref(u_int16_t);
+u_int16_t	 tag_name2id(const char *);
+const char	*tag_id2name(u_int16_t);
+void		 tag_unref(u_int16_t);
+void		 tag_ref(u_int16_t);
 
 /* snmp.c */
 void	 snmp_init(struct relayd *, enum privsep_procid);
@@ -1295,6 +1306,7 @@ int	 config_getrt(struct relayd *, struct imsg *);
 int	 config_getroute(struct relayd *, struct imsg *);
 int	 config_setproto(struct relayd *, struct protocol *);
 int	 config_getproto(struct relayd *, struct imsg *);
+int	 config_setrule(struct relayd *, struct protocol *);
 int	 config_getrule(struct relayd *, struct imsg *);
 int	 config_setrelay(struct relayd *, struct relay *);
 int	 config_getrelay(struct relayd *, struct imsg *);

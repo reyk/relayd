@@ -57,6 +57,7 @@ int		 relay_dispatch_ca(int, struct privsep_proc *,
 void		 relay_shutdown(void);
 
 void		 relay_protodebug(struct relay *);
+void		 relay_ruledebug(struct relay_rule *);
 void		 relay_init(struct privsep *, struct privsep_proc *p, void *);
 void		 relay_launch(void);
 int		 relay_socket(struct sockaddr_storage *, in_port_t,
@@ -116,9 +117,112 @@ relay_shutdown(void)
 }
 
 void
+relay_ruledebug(struct relay_rule *rule)
+{
+	struct kv	*kv = NULL;
+	u_int		 i;
+
+	fprintf(stderr, "\t\t");
+
+	switch (rule->rule_type) {
+	case RULE_TYPE_MATCH:
+		fprintf(stderr, "match ");
+		break;
+	case RULE_TYPE_BLOCK:
+		fprintf(stderr, "block ");
+		break;
+	case RULE_TYPE_PASS:
+		fprintf(stderr, "pass ");
+		break;
+	}
+
+	switch (rule->rule_dir) {
+	case RELAY_DIR_ANY:
+		fprintf(stderr, "any ");
+		break;
+	case RELAY_DIR_REQUEST:
+		fprintf(stderr, "request ");
+		break;
+	case RELAY_DIR_RESPONSE:
+		fprintf(stderr, "response ");
+		break;
+	default:
+		return;
+		/* NOTREACHED */
+		break;
+	}
+
+	for (i = 1; i < KEY_TYPE_MAX; i++) {
+		kv = &rule->rule_kv[i];
+		if (kv->kv_type != i)
+			continue;
+
+		switch (kv->kv_type) {
+		case KEY_TYPE_COOKIE:
+			fprintf(stderr, "cookie ");
+			break;
+		case KEY_TYPE_HEADER:
+			fprintf(stderr, "header ");
+			break;
+		case KEY_TYPE_PATH:
+			fprintf(stderr, "path ");
+			break;
+		case KEY_TYPE_QUERY:
+			fprintf(stderr, "query ");
+			break;
+		case KEY_TYPE_URL:
+			fprintf(stderr, "url ");
+			break;
+		default:
+			continue;
+		}
+
+		switch (kv->kv_action) {
+		case KEY_ACTION_APPEND:
+			fprintf(stderr, "append ");
+			break;
+		case KEY_ACTION_SET:
+			fprintf(stderr, "set ");
+			break;
+		case KEY_ACTION_REMOVE:
+			fprintf(stderr, "remove ");
+			break;
+		case KEY_ACTION_HASH:
+			fprintf(stderr, "hash ");
+			break;
+		case KEY_ACTION_LOG:
+			fprintf(stderr, "log ");
+			break;
+		case KEY_ACTION_NONE:
+			break;
+		}
+		fprintf(stderr, "\"%s\"%s%s%s ",
+		    kv->kv_key,
+		    kv->kv_value == NULL ? "" : " value \"",
+		    kv->kv_value == NULL ? "" : kv->kv_value,
+		    kv->kv_value == NULL ? "" : "\"");
+	}
+
+	if (rule->rule_tag && rule->rule_tagname[0])
+		fprintf(stderr, "tag \"%s\" ",
+		    rule->rule_tagname);
+
+	if (rule->rule_tagged && rule->rule_taggedname[0])
+		fprintf(stderr, "tagged \"%s\" ",
+		    rule->rule_taggedname);
+
+	if (rule->rule_label && rule->rule_labelname[0])
+		fprintf(stderr, "label \"%s\" ",
+		    rule->rule_labelname);
+
+	fprintf(stderr, "\n");
+}
+
+void
 relay_protodebug(struct relay *rlay)
 {
 	struct protocol		*proto = rlay->rl_proto;
+	struct relay_rule	*rule = NULL;
 
 	fprintf(stderr, "protocol %d: name %s\n",
 	    proto->id, proto->name);
@@ -144,6 +248,12 @@ relay_protodebug(struct relay *rlay)
 	case RELAY_PROTO_DNS:
 		fprintf(stderr, "dns\n");
 		break;
+	}
+
+	rule = TAILQ_FIRST(&proto->rules);
+	while (rule != NULL) {
+		relay_ruledebug(rule);
+		rule = TAILQ_NEXT(rule, rule_entry);
 	}
 }
 
@@ -531,16 +641,17 @@ relay_connected(int fd, short sig, void *arg)
 		return;
 	}
 
-	DPRINTF("%s: session %d: %ssuccessful", __func__,
-	    con->se_id, rlay->rl_proto->lateconnect ? "late connect " : "");
+	DPRINTF("%s: session %d: successful", __func__, con->se_id);
 
 	switch (rlay->rl_proto->type) {
 	case RELAY_PROTO_HTTP:
-		/* XXX Check the servers's HTTP response */
-		if (0) {
-			con->se_out.toread = TOREAD_HTTP_HEADER;
-			outrd = relay_read_http;
+		if (relay_httpdesc_init(out) == -1) {
+			relay_close(con,
+			    "failed to allocate http descriptor");
+			return;
 		}
+		con->se_out.toread = TOREAD_HTTP_HEADER;
+		outrd = relay_read_http;
 		break;
 	case RELAY_PROTO_TCP:
 		/* Use defaults */
@@ -580,22 +691,18 @@ void
 relay_input(struct rsession *con)
 {
 	struct relay	*rlay = con->se_relay;
-	struct protocol	*proto = rlay->rl_proto;
 	evbuffercb	 inrd = relay_read;
 	evbuffercb	 inwr = relay_write;
 
 	switch (rlay->rl_proto->type) {
 	case RELAY_PROTO_HTTP:
-		/* XXX Check the client's HTTP request */
-		if (proto->lateconnect) {
-			if (relay_http_descinit(&con->se_in) == -1) {
-				relay_close(con,
-				    "failed to allocate http descriptor");
-				return;
-			}
-			con->se_in.toread = TOREAD_HTTP_HEADER;
-			inrd = relay_read_http;
+		if (relay_httpdesc_init(&con->se_in) == -1) {
+			relay_close(con,
+			    "failed to allocate http descriptor");
+			return;
 		}
+		con->se_in.toread = TOREAD_HTTP_HEADER;
+		inrd = relay_read_http;
 		break;
 	case RELAY_PROTO_TCP:
 		/* Use defaults */
@@ -726,7 +833,7 @@ relay_splice(struct ctl_relay_event *cre)
 	bzero(&sp, sizeof(sp));
 	sp.sp_fd = cre->dst->s;
 	sp.sp_max = cre->toread > 0 ? cre->toread : 0;
-	sp.sp_idle = rlay->rl_conf.timeout;
+	bcopy(&rlay->rl_conf.timeout, &sp.sp_idle, sizeof(sp.sp_idle));
 	if (setsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &sp, sizeof(sp)) == -1) {
 		log_debug("%s: session %d: splice dir %d failed: %s",
 		    __func__, con->se_id, cre->dir, strerror(errno));
@@ -1190,7 +1297,7 @@ relay_session(struct rsession *con)
 		return;
 	}
 
-	if (!rlay->rl_proto->lateconnect) {
+	if (rlay->rl_proto->type != RELAY_PROTO_HTTP) {
 		if (rlay->rl_conf.fwdmode == FWD_TRANS)
 			relay_bindanyreq(con, 0, IPPROTO_TCP);
 		else if (relay_connect(con) == -1) {
@@ -1447,10 +1554,11 @@ relay_close(struct rsession *con, const char *msg)
 		    evbuffer_add_printf(con->se_log, "\r\n") != -1)
 			ptr = evbuffer_readline(con->se_log);
 		log_info("relay %s, "
-		    "session %d (%d active), %d, %s -> %s:%d, "
+		    "session %d (%d active), %s, %s -> %s:%d, "
 		    "%s%s%s", rlay->rl_conf.name, con->se_id, relay_sessions,
-		    con->se_mark, ibuf, obuf, ntohs(con->se_out.port), msg,
-		    ptr == NULL ? "" : ",", ptr == NULL ? "" : ptr);
+		    con->se_tag != 0 ? tag_id2name(con->se_tag) : "0", ibuf,
+		    obuf, ntohs(con->se_out.port), msg, ptr == NULL ? "" : ",",
+		    ptr == NULL ? "" : ptr);
 		if (ptr != NULL)
 			free(ptr);
 	}

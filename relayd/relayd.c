@@ -296,6 +296,8 @@ parent_configure(struct relayd *env)
 		config_setrt(env, rt);
 	TAILQ_FOREACH(proto, env->sc_protos, entry)
 		config_setproto(env, proto);
+	TAILQ_FOREACH(proto, env->sc_protos, entry)
+		config_setrule(env, proto);
 	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry) {
 		/* Check for SSL Inspection */
 		if ((rlay->rl_conf.flags & (F_SSL|F_SSLCLIENT)) ==
@@ -641,7 +643,7 @@ kv_add(struct kvlist *keys, char *key, char *value)
 
 	if (key == NULL)
 		return (NULL);
-	if ((kv = malloc(sizeof(*kv))) == NULL)
+	if ((kv = calloc(1, sizeof(*kv))) == NULL)
 		return (NULL);
 	if ((kv->kv_key = strdup(key)) == NULL) {
 		free(kv);
@@ -736,22 +738,48 @@ kv_purge(struct kvlist *keys)
 void
 kv_free(struct kv *kv)
 {
-	if (kv->kv_key != NULL)
+	if (kv->kv_key != NULL) {
 		free(kv->kv_key);
-	if (kv->kv_value != NULL)
+		kv->kv_key = NULL;
+	}
+	if (kv->kv_value != NULL) {
 		free(kv->kv_value);
+		kv->kv_value = NULL;
+	}
+	kv->kv_type = KEY_TYPE_NONE;
+}
+
+struct kv *
+kv_inherit(struct kv *dst, struct kv *src)
+{
+	memcpy(dst, src, sizeof(*dst));
+
+	if (src->kv_key != NULL) {
+		if ((dst->kv_key = strdup(src->kv_key)) == NULL) {
+			kv_free(dst);
+			return (NULL);
+		}
+	}
+	if (src->kv_value != NULL) {
+		if ((dst->kv_value = strdup(src->kv_value)) == NULL) {
+			kv_free(dst);
+			return (NULL);
+		}
+	}
+
+	return (dst);
 }
 
 int
-kv_log(struct evbuffer *log, const char *label, struct kv *kv)
+kv_log(struct evbuffer *log, struct kv *kv, u_int16_t labelid)
 {
 	char	*msg;
 
 	if (log == NULL)
 		return (0);
 	if (asprintf(&msg, " [%s%s%s%s%s]",
-	    label == NULL ? "" : label,
-	    label == NULL ? "" : ", ",
+	    labelid == 0 ? "" : label_id2name(labelid),
+	    labelid == 0 ? "" : ", ",
 	    kv->kv_key,
 	    kv->kv_value == NULL ? "" : ": ",
 	    kv->kv_value == NULL ? "" : kv->kv_value) == -1)
@@ -763,6 +791,110 @@ kv_log(struct evbuffer *log, const char *label, struct kv *kv)
 	free(msg);
 
 	return (0);
+}
+
+int
+rule_add(enum keytype keytype, struct protocol *proto,
+    struct relay_rule *rule, const char *rulefile)
+{
+	struct relay_rule	*r = NULL;
+	struct kv		*kv = NULL;
+	FILE			*fp = NULL;
+	char			 buf[BUFSIZ];
+	int			 ret = -1;
+
+	if (rulefile == NULL) {
+		TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
+		return (0);
+	}
+
+	kv = &rule->rule_kv[keytype];
+	if (kv->kv_type != keytype)
+		goto fail;
+
+	if ((fp = fopen(rulefile, "r")) == NULL)
+		goto fail;
+
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		/* strip whitespace and newline characters */
+		buf[strcspn(buf, "\r\n\t ")] = '\0';
+		if (!strlen(buf) || buf[0] == '#')
+			continue;
+
+		if ((r = rule_inherit(rule)) == NULL)
+			goto fail;
+
+		kv = &r->rule_kv[keytype];
+		if (kv->kv_key != NULL)
+			free(kv->kv_key);
+		if ((kv->kv_key = strdup(buf)) == NULL) {
+			rule_free(r);
+			free(r);
+			goto fail;
+		}
+
+		TAILQ_INSERT_TAIL(&proto->rules, r, rule_entry);
+	}
+
+	ret = 0;
+	rule_free(rule);
+	free(rule);
+
+ fail:
+	if (fp != NULL)
+		fclose(fp);
+	return (ret);
+}
+
+struct relay_rule *
+rule_inherit(struct relay_rule *rule)
+{
+	struct relay_rule	*r;
+	u_int			 i;
+	struct kv		*kv;
+
+	if ((r = calloc(1, sizeof(*r))) == NULL)
+		return (NULL);
+	memcpy(r, rule, sizeof(*r));
+
+	for (i = 1; i < KEY_TYPE_MAX; i++) {
+		kv = &rule->rule_kv[i];
+		if (kv->kv_type != i)
+			continue;
+		kv_inherit(&r->rule_kv[i], kv);
+	}
+
+	if (r->rule_label != 0)
+		label_ref(r->rule_label);
+	if (r->rule_tag != 0)
+		tag_ref(r->rule_tag);
+	if (r->rule_tagged != 0)
+		tag_ref(r->rule_tagged);
+
+	return (r);
+}
+
+void
+rule_free(struct relay_rule *rule)
+{
+	u_int	i;
+
+	for (i = 0; i < KEY_TYPE_MAX; i++)
+		kv_free(&rule->rule_kv[i]);
+	if (rule->rule_label != 0)
+		label_unref(rule->rule_label);
+	if (rule->rule_tag != 0)
+		tag_unref(rule->rule_tag);
+	if (rule->rule_tagged != 0)
+		tag_unref(rule->rule_tagged);
+}
+
+void
+rule_delete(struct relay_rules *rules, struct relay_rule *rule)
+{
+	TAILQ_REMOVE(rules, rule, rule_entry);
+	rule_free(rule);
+	free(rule);
 }
 
 /*
@@ -962,7 +1094,7 @@ struct ca_pkey *
 pkey_add(struct relayd *env, EVP_PKEY *pkey, objid_t id)
 {
 	struct ca_pkey	*ca_pkey;
-	
+
 	if (env->sc_pkeys == NULL)
 		fatalx("pkeys");
 

@@ -137,7 +137,7 @@ SYNTAX
 	[proto tcp|udp]
 	[from any|address|mask]
 	[to any|address|mask]
-	[[append|change|expect]
+	[[append|set|expect]
 		header|host|url|path|cookie|query
 		[value number|mask|string]
 	]

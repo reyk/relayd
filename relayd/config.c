@@ -185,15 +185,14 @@ config_purge(struct relayd *env, u_int reset)
 	if (what & CONFIG_PROTOS && env->sc_protos != NULL) {
 		while ((proto = TAILQ_FIRST(env->sc_protos)) != NULL) {
 			TAILQ_REMOVE(env->sc_protos, proto, entry);
-			while ((rule = TAILQ_FIRST(&proto->rules)) != NULL) {
-				TAILQ_REMOVE(&proto->rules, rule, rule_entry);
-				kv_free(&rule->rule_cookie);
-				kv_free(&rule->rule_headerXXX);
-				kv_free(&rule->rule_path);
-				kv_free(&rule->rule_query);
-				kv_free(&rule->rule_url);
-				free(rule);
-			}
+			while ((rule = TAILQ_FIRST(&proto->rules)) != NULL)
+				rule_delete(&proto->rules, rule);
+			proto->rulecount = 0;
+		}
+	}
+	if (what & CONFIG_PROTOS && env->sc_protos != NULL) {
+		while ((proto = TAILQ_FIRST(env->sc_protos)) != NULL) {
+			TAILQ_REMOVE(env->sc_protos, proto, entry);
 			if (proto->style != NULL)
 				free(proto->style);
 			if (proto->sslcapass != NULL)
@@ -602,7 +601,6 @@ int
 config_setproto(struct relayd *env, struct protocol *proto)
 {
 	struct privsep		*ps = env->sc_ps;
-	struct relay_rule	*rule;
 	int			 id;
 	struct iovec		 iov[IOV_MAX];
 	size_t			 c;
@@ -624,36 +622,81 @@ config_setproto(struct relayd *env, struct protocol *proto)
 			iov[c++].iov_len = strlen(proto->style);
 		}
 
-		/* XXX struct protocol should be split */
 		proc_composev_imsg(ps, id, -1, IMSG_CFG_PROTO, -1, iov, c);
+	}
 
-		/* XXX Now send all the rules */
+	return (0);
+}
+
+int
+config_setrule(struct relayd *env, struct protocol *proto)
+{
+	struct privsep		*ps = env->sc_ps;
+	struct relay_rule	*rule;
+	struct iovec		 iov[IOV_MAX];
+	int			 id;
+	size_t			 c, i;
+
+	for (id = 0; id < PROC_MAX; id++) {
+		if ((ps->ps_what[id] & CONFIG_PROTOS) == 0 ||
+		    id == privsep_process)
+			continue;
+
+		DPRINTF("%s: sending rules %s to %s", __func__,
+		    proto->name, ps->ps_title[id]);
+
+		/* Now send all the rules */
 		TAILQ_FOREACH(rule, &proto->rules, rule_entry) {
 			rule->rule_protoid = proto->id;
 			bzero(&rule->rule_ctl, sizeof(rule->rule_ctl));
-
+			c = sizeof(rule->rule_labelname);
+			bzero(rule->rule_labelname, c);
+			if (rule->rule_label != 0) {
+				if (strlcpy(rule->rule_labelname,
+				    label_id2name(rule->rule_label), c) >= c)
+					log_warnx("%s: label truncated",
+					    __func__);
+			}
+			c = sizeof(rule->rule_tagname);
+			bzero(rule->rule_tagname, c);
+			if (rule->rule_tag != 0) {
+				if (strlcpy(rule->rule_tagname,
+				    tag_id2name(rule->rule_tag), c) >= c)
+					log_warnx("%s: tag truncated",
+					    __func__);
+			}
+			c = sizeof(rule->rule_taggedname);
+			bzero(rule->rule_taggedname, c);
+			if (rule->rule_tagged != 0) {
+				if (strlcpy(rule->rule_taggedname,
+				    tag_id2name(rule->rule_tagged), c) >= c)
+					log_warnx("%s: tag truncated",
+					    __func__);
+			}
 			c = 0;
 			iov[c].iov_base = rule;
 			iov[c++].iov_len = sizeof(*rule);
 
-#define _ADDKV(_x, _y)	{						\
-	if (rule->rule_##_x.kv_##_y != NULL) {				\
-		rule->rule_ctl._x._y = strlen(rule->rule_##_x.kv_##_y);	\
-		iov[c].iov_base = rule->rule_##_x.kv_##_y;		\
-		iov[c++].iov_len = rule->rule_ctl._x._y;		\
-	} else								\
-		rule->rule_ctl._x._y = -1;				\
-}
-#define ADDKV(_x)	{						\
-	_ADDKV(_x, key);						\
-	_ADDKV(_x, value);						\
-}
-
-			ADDKV(cookie);
-			ADDKV(headerXXX);
-			ADDKV(path);
-			ADDKV(query);
-			ADDKV(url);
+			for (i = 1; i < KEY_TYPE_MAX; i++) {
+				if (rule->rule_kv[i].kv_key != NULL) {
+					rule->rule_ctl.kvlen[i].key =
+					    strlen(rule->rule_kv[i].kv_key);
+					iov[c].iov_base =
+					    rule->rule_kv[i].kv_key;
+					iov[c++].iov_len =
+					    rule->rule_ctl.kvlen[i].key;
+				} else
+					rule->rule_ctl.kvlen[i].key = -1;
+				if (rule->rule_kv[i].kv_value != NULL) {
+					rule->rule_ctl.kvlen[i].value =
+					    strlen(rule->rule_kv[i].kv_value);
+					iov[c].iov_base =
+					    rule->rule_kv[i].kv_value;
+					iov[c++].iov_len =
+					    rule->rule_ctl.kvlen[i].value;
+				} else
+					rule->rule_ctl.kvlen[i].value = -1;
+			}
 
 			proc_composev_imsg(ps, id, -1,
 			    IMSG_CFG_RULE, -1, iov, c);
@@ -705,7 +748,7 @@ config_getrule(struct relayd *env, struct imsg *imsg)
 {
 	struct protocol		*proto;
 	struct relay_rule	*rule;
-	size_t			 s;
+	size_t			 s, i;
 	u_int8_t		*p = imsg->data;
 	ssize_t			 len;
 
@@ -722,40 +765,45 @@ config_getrule(struct relayd *env, struct imsg *imsg)
 		return (-1);
 	}
 
-#define _GETKV(_n, _f)	{						\
-	if (rule->rule_ctl._n._f >= 0) {				\
+#define GETKV(_n, _f)	{						\
+	if (rule->rule_ctl.kvlen[_n]._f >= 0) {				\
 		/* Also accept "empty" 0-length strings */		\
-		if ((len < rule->rule_ctl._n._f) ||			\
-		    (rule->rule_##_n.kv_##_f =				\
-		    get_string(p + s, rule->rule_ctl._n._f)) == NULL) {	\
+		if ((len < rule->rule_ctl.kvlen[_n]._f) ||		\
+		    (rule->rule_kv[_n].kv_##_f =			\
+		    get_string(p + s,					\
+		    rule->rule_ctl.kvlen[_n]._f)) == NULL) {		\
 			free(rule);					\
 			return (-1);					\
 		}							\
-		s += rule->rule_ctl._n._f;				\
-		len -= rule->rule_ctl._n._f;				\
+		s += rule->rule_ctl.kvlen[_n]._f;			\
+		len -= rule->rule_ctl.kvlen[_n]._f;			\
 									\
-		DPRINTF("%s: %s %s (len %d, action %d): %s", __func__,	\
-		    #_n, #_f, rule->rule_ctl._n._f,			\
-		    rule->rule_##_n.kv_action,				\
-		    rule->rule_##_n.kv_##_f);				\
+		DPRINTF("%s: %s %s (len %ld, action %d): %s", __func__,	\
+		    #_n, #_f, rule->rule_ctl.kvlen[_n]._f,		\
+		    rule->rule_kv[_n].kv_action,			\
+		    rule->rule_kv[_n].kv_##_f);				\
 	}								\
 }
-#define GETKV(_n)	{						\
-	_GETKV(_n, key);						\
-	_GETKV(_n, value);						\
-}
 
-	GETKV(cookie);
-	GETKV(headerXXX);
-	GETKV(path);
-	GETKV(query);
-	GETKV(url);
+	for (i = 1; i < KEY_TYPE_MAX; i++) {
+		GETKV(i, key);
+		GETKV(i, value);
+	}
+
+	if (rule->rule_labelname[0])
+		rule->rule_label = label_name2id(rule->rule_labelname);
+
+	if (rule->rule_tagname[0])
+		rule->rule_tag = tag_name2id(rule->rule_tagname);
+
+	if (rule->rule_taggedname[0])
+		rule->rule_tagged = tag_name2id(rule->rule_taggedname);
 
 	rule->rule_id = proto->rulecount++;
 
 	TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
 
-	DPRINTF("%s: %s %d received rule %lu for protocol %s", __func__,
+	DPRINTF("%s: %s %d received rule %u for protocol %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    rule->rule_id, proto->name);
 

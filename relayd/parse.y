@@ -110,8 +110,12 @@ struct relaylist	 relays;
 static struct protocol	*proto = NULL;
 static struct relay_rule *rule = NULL;
 static struct router	*router = NULL;
+static u_int16_t	 label = 0;
+static u_int16_t	 tag = 0;
 static in_port_t	 tableport = 0;
 static int		 dstmode;
+static enum keytype	 keytype = KEY_TYPE_NONE;
+static char		*rulefile = NULL;
 
 struct address	*host_v4(const char *);
 struct address	*host_v6(const char *);
@@ -157,10 +161,10 @@ typedef struct {
 %token	EXTERNAL FILENAME FORWARD FROM HASH HEADER HOST ICMP
 %token	INCLUDE INET INET6 INTERFACE INTERVAL IP LABEL LISTEN VALUE
 %token	LOADBALANCE LOG LOOKUP METHOD MODE NAT NO DESTINATION
-%token	NODELAY NOTHING ON PARENT PATH PORT PREFORK PRIORITY PROTO
+%token	NODELAY NOTHING ON PARENT PATH PFTAG PORT PREFORK PRIORITY PROTO
 %token	QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE RETRY QUICK
 %token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SNMP SOCKET SPLICE
-%token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
+%token	SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
 %token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH CURVE
 %token	<v.string>	STRING
@@ -543,7 +547,7 @@ rdroptsl	: forwardmode TO tablespec interface	{
 		}
 		| DISABLE		{ rdr->conf.flags |= F_DISABLE; }
 		| STICKYADDR		{ rdr->conf.flags |= F_STICKY; }
-		| match TAG STRING {
+		| match PFTAG STRING {
 			conf->sc_flags |= F_NEEDPF;
 			if (strlcpy(rdr->conf.tag, $3,
 			    sizeof(rdr->conf.tag)) >=
@@ -896,8 +900,6 @@ proto		: relay_proto PROTO STRING	{
 			p->sslflags = SSLFLAG_DEFAULT;
 			p->tcpbacklog = RELAY_BACKLOG;
 			TAILQ_INIT(&p->rules);
-			if (p->type == RELAY_PROTO_HTTP)
-				p->lateconnect = 1;
 			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
 			    sizeof(p->sslciphers));
 			p->sslecdhcurve = SSLECDHCURVE_DEFAULT;
@@ -1085,8 +1087,22 @@ filterrule	: action dir quick ruleaf rulesrc ruledst {
 			rule->rule_dir = $2;
 			rule->rule_flags |= $3;
 			rule->rule_af = $4;
-		} ruleopts_l				{
-			TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
+
+			rulefile = NULL;
+		} ruleopts_l {
+			if (rule_add(keytype, proto, rule, rulefile) == -1) {
+				if (rulefile == NULL)
+					yyerror("failed to load rule");
+				else
+					yyerror("failed to load rules from %s",
+					    rulefile);
+				rule_free(rule);
+				free(rulefile);
+				free(rule);
+				YYERROR;
+			}
+			free(rulefile);
+			rulefile = NULL;
 		}
 		;
 
@@ -1123,7 +1139,7 @@ ruleopts_t	: ruleopts ruleopts_t
 		| ruleopts
 		;
 
-ruleopts	: METHOD STRING			{
+ruleopts	: METHOD STRING					{
 			u_int	id;
 			if ((id = relay_httpmethod_byname($2)) ==
 			    HTTP_HEADER_NONE) {
@@ -1134,44 +1150,72 @@ ruleopts	: METHOD STRING			{
 			}
 			rule->rule_method = id;
 		}
-		| COOKIE keyaction STRING value		{
-			rule->rule_cookie.kv_action = $2;
-			rule->rule_cookie.kv_key = $3;
-			rule->rule_cookie.kv_value = $4;
-			rule->rule_cookie.kv_type = KEY_TYPE_COOKIE;
-
+		| COOKIE keyaction STRING value			{
+			keytype = KEY_TYPE_COOKIE;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_key = $3;
+			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| HEADER keyaction STRING value		{
-			rule->rule_header =
+		| COOKIE keyaction				{
+			keytype = KEY_TYPE_COOKIE;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_type = keytype;
+		}
+		| HEADER keyaction STRING value			{
+			keytype = KEY_TYPE_HEADER;
+			memset(&rule->rule_kv[keytype], 0,
+			    sizeof(rule->rule_kv[keytype]));
+			rule->rule_kv[keytype].kv_header_id =
 			    relay_httpheader_byname($3);
-			rule->rule_headerXXX.kv_action = $2;
-			rule->rule_headerXXX.kv_key = $3;
-			rule->rule_headerXXX.kv_value = $4;
-			rule->rule_headerXXX.kv_type = KEY_TYPE_HEADER;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_key = $3;
+			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| PATH keyaction STRING value		{
-			rule->rule_path.kv_action = $2;
-			rule->rule_path.kv_key = $3;
-			rule->rule_path.kv_value = $4;
-			rule->rule_path.kv_type = KEY_TYPE_PATH;
-
+		| HEADER keyaction				{
+			keytype = KEY_TYPE_HEADER;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_type = keytype;
+		}
+		| PATH keyaction STRING value			{
+			keytype = KEY_TYPE_PATH;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_key = $3;
+			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_type = keytype;
+		}
+		| PATH keyaction				{
+			keytype = KEY_TYPE_PATH;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_type = keytype;
 		}
 		| QUERYSTR keyaction STRING value		{
-			rule->rule_query.kv_action = $2;
-			rule->rule_query.kv_key = $3;
-			rule->rule_query.kv_value = $4;
-			rule->rule_cookie.kv_type = KEY_TYPE_QUERY;
-
+			keytype = KEY_TYPE_QUERY;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_key = $3;
+			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_type = keytype;
+		}
+		| QUERYSTR keyaction				{
+			keytype = KEY_TYPE_QUERY;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_type = keytype;
 		}
 		| URL keyaction optdigest value			{
-			rule->rule_url.kv_action = $2;
-			rule->rule_url.kv_key = $3.digest;
-			rule->rule_url.kv_digest = $3.type;
-			rule->rule_url.kv_value = $4;
-			rule->rule_url.kv_type = KEY_TYPE_URL;
-
+			keytype = KEY_TYPE_URL;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_key = $3.digest;
+			rule->rule_kv[keytype].kv_digest = $3.type;
+			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| FORWARD TO table		{
+		| URL keyaction					{
+			keytype = KEY_TYPE_URL;
+			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_type = keytype;
+		}
+		| FORWARD TO table				{
 			if (table_findbyname(conf, $3) == NULL) {
 				yyerror("undefined forward table");
 				free($3);
@@ -1186,6 +1230,87 @@ ruleopts	: METHOD STRING			{
 			}
 			rule->rule_flags |= RULE_FLAG_FORWARD_TABLE;
 			free($3);
+		}
+		| LABEL STRING					{
+			if (rule->rule_label) {
+				yyerror("label already defined");
+				free($2);
+				YYERROR;
+			}
+			label = label_name2id($2);
+			rule->rule_label = label;
+			free($2);
+			if (label == 0) {
+				yyerror("invalid label");
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+		}
+		| NO LABEL					{
+			if (rule->rule_label) {
+				yyerror("label already defined");
+				YYERROR;
+			}
+			rule->rule_label = 0;
+		}
+		| TAG STRING					{
+			if (rule->rule_tag) {
+				yyerror("tag already defined");
+				free($2);
+				YYERROR;
+			}
+			tag = tag_name2id($2);
+			rule->rule_tag = tag;
+			free($2);
+			if (tag == 0) {
+				yyerror("invalid tag");
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+		}
+		| NO TAG					{
+			if (rule->rule_tag) {
+				yyerror("tag already defined");
+				YYERROR;
+			}
+			rule->rule_tag = 0;
+		}
+		| TAGGED STRING					{
+			if (rule->rule_tagged) {
+				yyerror("tagged already defined");
+				free($2);
+				YYERROR;
+			}
+			tag = tag_name2id($2);
+			rule->rule_tagged = tag;
+			free($2);
+			if (tag == 0) {
+				yyerror("invalid tag");
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+		}
+		| NO TAGGED					{
+			if (rule->rule_tagged) {
+				yyerror("tagged already defined");
+				YYERROR;
+			}
+			rule->rule_tagged = 0;
+		}
+		| FILENAME STRING value				{
+			if (rulefile != NULL) {
+				yyerror("only one file per rule supported");
+				free($2);
+				free($3);
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+			rule->rule_kv[keytype].kv_value = $3;
+			rulefile = $2;
 		}
 		;
 
@@ -1844,6 +1969,7 @@ lookup(char *s)
 		{ "pass",		PASS },
 		{ "password",		PASSWORD },
 		{ "path",		PATH },
+		{ "pftag",		PFTAG },
 		{ "port",		PORT },
 		{ "prefork",		PREFORK },
 		{ "priority",		PRIORITY },
@@ -1878,6 +2004,7 @@ lookup(char *s)
 		{ "style",		STYLE },
 		{ "table",		TABLE },
 		{ "tag",		TAG },
+		{ "tagged",		TAGGED },
 		{ "tcp",		TCP },
 		{ "timeout",		TIMEOUT },
 		{ "to",			TO },
