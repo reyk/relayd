@@ -506,6 +506,7 @@ struct rsession {
 	struct ctl_natlook		*se_cnl;
 	int				 se_bnds;
 	u_int16_t			 se_tag;
+	u_int16_t			 se_label;
 
 	int				 se_cid;
 	pid_t				 se_pid;

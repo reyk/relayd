@@ -364,7 +364,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			relay_close(con, "filter rule failed");
 			return;
 		} else if (action != RES_PASS) {
-			relay_abort_http(con, 403, "Forbidden", 0);
+			relay_abort_http(con, 403, "Forbidden", con->se_label);
 			return;
 		}
 
@@ -1363,6 +1363,9 @@ relay_action(struct ctl_relay_event *cre, struct relay_rule *rule,
 
 	if (rule->rule_tag)
 		con->se_tag = rule->rule_tag;
+
+	if (rule->rule_label)
+		con->se_label = rule->rule_label;
 
 	TAILQ_FOREACH(kv, actions, kv_entry) {
 		match = kv->kv_match;
