@@ -15,11 +15,11 @@ our %args = (
     relayd => {
 	protocol => [ "http",
 	    'return error',
-	    'block request url log digest 0ac8ccfc03317891ae2820de10ee2167d31ebd16',
+	    'url filter digest 0ac8ccfc03317891ae2820de10ee2167d31ebd16 log',
 	],
 	loggrep => {
-	    qr/Forbidden \(403 Forbidden\)/ => 1,
-	    qr/\[0ac8ccfc03317891ae2820de10ee2167d31ebd16\]/ => 1,
+	    qr/rejecting request \(403 Forbidden\)/ => 1,
+	    qr/\[0ac8ccfc03317891ae2820de10ee2167d31ebd16:/ => 1,
 	},
     },
     server => {

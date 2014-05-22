@@ -10,11 +10,8 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    'block request',
-	    'pass request query log "foo" value "bar" ',
-	    'pass request query log "ok" value "maybe" ',
+	    'request query expect "bar" from "foo" log',
 	],
-	loggrep => { qr/\[foo: bar\]/ => 1 }
     },
     server => {
 	func => \&http_server,

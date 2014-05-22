@@ -12,10 +12,10 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    "match request header log foo",
-	    "match response header log Content-Length",
+	    "request header log foo",
+	    "response header log Content-Length",
 	],
-	loggrep => [ map { "Content-Length: $_" } @lengths ],
+	loggrep => [ map { "log 'Content-Length: $_'" } @lengths ],
 	forwardssl => 1,
 	listenssl => 1,
     },

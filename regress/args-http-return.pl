@@ -12,10 +12,13 @@ our %args = (
     relayd => {
 	protocol => [ "http",
 	    'return error',
-	    'pass',
-	    'block request query log "foo" value "bar" label "expect_foobar_return_test"',
+	    'label "expect_foobar_return_test"',
+	    'request query expect "baz" from "foo" log',
+	    'no label',
 	],
-	loggrep => { 'Forbidden \(403 Forbidden\), \[expect_foobar_return_test, foo: bar\]' => 1 },
+	loggrep => {
+	    ' \(403 Forbidden\), \[expect_foobar_return_test, foo: bar\]' => 1
+	},
     },
     server => {
 	noserver => 1,

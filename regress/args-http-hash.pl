@@ -11,10 +11,13 @@ our %args = (
     relayd => {
 	table => 1,
 	protocol => [ "http",
-	    'match request path hash "/query"',
+	    'path hash "/query" log',
 	],
 	relay => 'forward to <table-$test> port $connectport',
-	loggrep => { qr/relay_action: hashkey 0x7dc0306a/ => 1 },
+	loggrep => {
+		qr/done, \[\/query: foobar\]/ => 1,
+		qr/relay_handle_http: hash 0xfde460be/ => 1,
+	},
     },
     server => {
 	func => \&http_server,

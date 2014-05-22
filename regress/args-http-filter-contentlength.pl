@@ -13,7 +13,7 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    'block request path "/2"',
+	    'request path filter "/2"',
 	],
 	loggrep => qr/done/,
     },

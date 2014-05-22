@@ -11,13 +11,14 @@ our %args = (
     relayd => {
 	protocol => [ "http",
 	    'return error',
-	    'block',
-	    'match request query log "foo" value "bar" label "expect_foobar_label"',
+	    'label "expect_foobar_label"',
+	    'request query filter "bar" from "foo" log',
+	    'no label',
 	],
-	loggrep => qr/Forbidden.*403 Forbidden.*expect_foobar_label.*foo: bar/,
+	loggrep => qr/.*403 Forbidden.*expect_foobar_label.*foo: bar/,
     },
     server => {
-	func => \&http_server,
+	noserver => 1,
 	nocheck => 1,
     },
 );
