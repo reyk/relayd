@@ -16,6 +16,7 @@ our %args = (
     },
     server => {
 	func => \&http_server,
+	loggrep => { "foo: bar" => 1 },
     },
 );
 
