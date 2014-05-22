@@ -24,6 +24,8 @@ any authoritative use:
 * http://www.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/snmpd/snmp.h
 * http://www.openbsd.org/cgi-bin/cvsweb/src/regress/usr.sbin/relayd/
 
+The official relayd page can be found at [bsd.plumbing](http://bsd.plumbing/).
+
 See [`LICENSE.md`](https://github.com/reyk/relayd/blob/master/LICENSE.md)
 for information about copyright and licensing.
 
