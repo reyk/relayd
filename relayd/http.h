@@ -1,7 +1,7 @@
 /*	$OpenBSD$	*/
 
 /*
- * Copyright (c) 2012,2013 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2012 - 2014 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -61,7 +61,7 @@ struct http_method {
 	{ HTTP_METHOD_OPTIONS,		"OPTIONS" },	\
 	{ HTTP_METHOD_TRACE,		"TRACE" },	\
 	{ HTTP_METHOD_CONNECT,		"CONNECT" },	\
-	{ HTTP_METHOD_PROPFIND,		"PROFIND" },	\
+	{ HTTP_METHOD_PROPFIND,		"PROPFIND" },	\
 	{ HTTP_METHOD_PROPPATCH,	"PROPPATCH" },	\
 	{ HTTP_METHOD_MKCOL,		"MKCOL" },	\
 	{ HTTP_METHOD_COPY,		"COPY" },	\
@@ -215,27 +215,22 @@ struct http_header {
 	const char		*header_name;
 	int			 header_isused;
 };
-
 /* Has to be sorted alphabetically */
 #define HTTP_HEADERS		{					\
-	{ HTTP_HEADER_A_IM,			"A-IM" },		\
 	{ HTTP_HEADER_ACCEPT,			"Accept" },		\
 	{ HTTP_HEADER_ACCEPT_ADDITIONS,		"Accept-Additions" },	\
 	{ HTTP_HEADER_ACCEPT_CHARSET,		"Accept-Charset" },	\
 	{ HTTP_HEADER_ACCEPT_ENCODING,		"Accept-Encoding" },	\
 	{ HTTP_HEADER_ACCEPT_FEATURES,		"Accept-Features" },	\
 	{ HTTP_HEADER_ACCEPT_LANGUAGE,		"Accept-Language" },	\
+	{ HTTP_HEADER_ACCEPT_PATCH,		"Accept-Patch" },	\
 	{ HTTP_HEADER_ACCEPT_RANGES,		"Accept-Ranges" },	\
 	{ HTTP_HEADER_AGE,			"Age" },		\
 	{ HTTP_HEADER_ALLOW,			"Allow" },		\
 	{ HTTP_HEADER_ALTERNATES,		"Alternates" },		\
 	{ HTTP_HEADER_AUTHENTICATION_INFO,	"Authentication-Info" },\
 	{ HTTP_HEADER_AUTHORIZATION,		"Authorization" },	\
-	{ HTTP_HEADER_C_EXT,			"C-Ext" },		\
-	{ HTTP_HEADER_C_MAN,			"C-Man" },		\
-	{ HTTP_HEADER_C_OPT,			"C-Opt" },		\
-	{ HTTP_HEADER_C_PEP,			"C-PEP" },		\
-	{ HTTP_HEADER_C_PEP_INFO,		"C-PEP-Info" },		\
+	{ HTTP_HEADER_A_IM,			"A-IM" },		\
 	{ HTTP_HEADER_CACHE_CONTROL,		"Cache-Control" },	\
 	{ HTTP_HEADER_CONNECTION,		"Connection" },		\
 	{ HTTP_HEADER_CONTENT_BASE,		"Content-Base" },	\
@@ -253,8 +248,13 @@ struct http_header {
 	{ HTTP_HEADER_CONTENT_VERSION,		"Content-Version" },	\
 	{ HTTP_HEADER_COOKIE,			"Cookie" },		\
 	{ HTTP_HEADER_COOKIE2,			"Cookie2" },		\
-	{ HTTP_HEADER_DAV,			"DAV" },		\
+	{ HTTP_HEADER_C_EXT,			"C-Ext" },		\
+	{ HTTP_HEADER_C_MAN,			"C-Man" },		\
+	{ HTTP_HEADER_C_OPT,			"C-Opt" },		\
+	{ HTTP_HEADER_C_PEP,			"C-PEP" },		\
+	{ HTTP_HEADER_C_PEP_INFO,		"C-PEP-Info" },		\
 	{ HTTP_HEADER_DATE,			"Date" },		\
+	{ HTTP_HEADER_DAV,			"DAV" },		\
 	{ HTTP_HEADER_DEFAULT_STYLE,		"Default-Style" },	\
 	{ HTTP_HEADER_DELTA_BASE,		"Delta-Base" },		\
 	{ HTTP_HEADER_DEPTH,			"Depth" },		\
@@ -262,6 +262,7 @@ struct http_header {
 	{ HTTP_HEADER_DESTINATION,		"Destination" },	\
 	{ HTTP_HEADER_DIFFERENTIAL_ID,		"Differential-Id" },	\
 	{ HTTP_HEADER_DIGEST,			"Digest" },		\
+	{ HTTP_HEADER_DNT,			"DNT" },		\
 	{ HTTP_HEADER_ETAG,			"ETag" },		\
 	{ HTTP_HEADER_EXPECT,			"Expect" },		\
 	{ HTTP_HEADER_EXPIRES,			"Expires" },		\
@@ -269,31 +270,32 @@ struct http_header {
 	{ HTTP_HEADER_FROM,			"From" },		\
 	{ HTTP_HEADER_GETPROFILE,		"GetProfile" },		\
 	{ HTTP_HEADER_HOST,			"Host", 1 /* used */ },	\
-	{ HTTP_HEADER_IM,			"IM" },			\
 	{ HTTP_HEADER_IF,			"If" },			\
 	{ HTTP_HEADER_IF_MATCH,			"If-Match" },		\
 	{ HTTP_HEADER_IF_MODIFIED_SINCE,	"If-Modified-Since" },	\
 	{ HTTP_HEADER_IF_NONE_MATCH,		"If-None-Match" },	\
 	{ HTTP_HEADER_IF_RANGE,			"If-Range" },		\
 	{ HTTP_HEADER_IF_UNMODIFIED_SINCE,	"If-Unmodified-Since" },\
+	{ HTTP_HEADER_IM,			"IM" },			\
 	{ HTTP_HEADER_KEEP_ALIVE,		"Keep-Alive" },		\
 	{ HTTP_HEADER_LABEL,			"Label" },		\
 	{ HTTP_HEADER_LAST_MODIFIED,		"Last-Modified" },	\
 	{ HTTP_HEADER_LINK,			"Link" },		\
 	{ HTTP_HEADER_LOCATION,			"Location" },		\
 	{ HTTP_HEADER_LOCK_TOKEN,		"Lock-Token" },		\
-	{ HTTP_HEADER_MIME_VERSION,		"MIME-Version" },	\
 	{ HTTP_HEADER_MAN,			"Man" },		\
 	{ HTTP_HEADER_MAX_FORWARDS,		"Max-Forwards" },	\
 	{ HTTP_HEADER_METER,			"Meter" },		\
+	{ HTTP_HEADER_MIME_VERSION,		"MIME-Version" },	\
 	{ HTTP_HEADER_NEGOTIATE,		"Negotiate" },		\
 	{ HTTP_HEADER_OPT,			"Opt" },		\
 	{ HTTP_HEADER_ORDERING_TYPE,		"Ordering-Type" },	\
+	{ HTTP_HEADER_ORIGIN,			"Origin" },		\
 	{ HTTP_HEADER_OVERWRITE,		"Overwrite" },		\
 	{ HTTP_HEADER_P3P,			"P3P" },		\
 	{ HTTP_HEADER_PEP,			"PEP" },		\
-	{ HTTP_HEADER_PICS_LABEL,		"PICS-Label" },		\
 	{ HTTP_HEADER_PEP_INFO,			"Pep-Info" },		\
+	{ HTTP_HEADER_PICS_LABEL,		"PICS-Label" },		\
 	{ HTTP_HEADER_POSITION,			"Position" },		\
 	{ HTTP_HEADER_PRAGMA,			"Pragma" },		\
 	{ HTTP_HEADER_PROFILEOBJECT,		"ProfileObject" },	\
@@ -313,9 +315,9 @@ struct http_header {
 	{ HTTP_HEADER_SAFE,			"Safe" },		\
 	{ HTTP_HEADER_SECURITY_SCHEME,		"Security-Scheme" },	\
 	{ HTTP_HEADER_SERVER,			"Server" },		\
+	{ HTTP_HEADER_SETPROFILE,		"SetProfile" },		\
 	{ HTTP_HEADER_SET_COOKIE,		"Set-Cookie" },		\
 	{ HTTP_HEADER_SET_COOKIE2,		"Set-Cookie2" },	\
-	{ HTTP_HEADER_SETPROFILE,		"SetProfile" },		\
 	{ HTTP_HEADER_SOAPACTION,		"SoapAction" },		\
 	{ HTTP_HEADER_STATUS_URI,		"Status-URI" },		\
 	{ HTTP_HEADER_SURROGATE_CAPABILITY,	"Surrogate-Capability" },\
@@ -325,31 +327,33 @@ struct http_header {
 	{ HTTP_HEADER_TIMEOUT,			"Timeout" },		\
 	{ HTTP_HEADER_TRAILER,			"Trailer" },		\
 	{ HTTP_HEADER_TRANSFER_ENCODING,	"Transfer-Encoding" },	\
-	{ HTTP_HEADER_URI,			"URI" },		\
 	{ HTTP_HEADER_UPGRADE,			"Upgrade" },		\
+	{ HTTP_HEADER_URI,			"URI" },		\
 	{ HTTP_HEADER_USER_AGENT,		"User-Agent" },		\
 	{ HTTP_HEADER_VARIANT_VARY,		"Variant-Vary" },	\
 	{ HTTP_HEADER_VARY,			"Vary" },		\
 	{ HTTP_HEADER_VIA,			"Via" },		\
-	{ HTTP_HEADER_WWW_AUTHENTICATE,		"WWW-Authenticate" },	\
 	{ HTTP_HEADER_WANT_DIGEST,		"Want-Digest" },	\
 	{ HTTP_HEADER_WARNING,			"Warning" },		\
-	{ HTTP_HEADER_ACCEPT_PATCH,		"Accept-Patch" },	\
-	{ HTTP_HEADER_X_REQUESTED_WITH,		"X-Requested-With" },	\
-	{ HTTP_HEADER_X_FORWARDED_FOR,		"X-Forwarded-For" },	\
+	{ HTTP_HEADER_WWW_AUTHENTICATE,		"WWW-Authenticate" },	\
 	{ HTTP_HEADER_X_FORWARDED_BY,		"X-Forwarded-By" },	\
+	{ HTTP_HEADER_X_FORWARDED_FOR,		"X-Forwarded-For" },	\
 	{ HTTP_HEADER_X_POWERED_BY,		"X-Powered-By" },	\
+	{ HTTP_HEADER_X_REQUESTED_WITH,		"X-Requested-With" },	\
 	{ HTTP_HEADER_X_XSS_PROTECTION,		"X-XSS-Protection" },	\
-	{ HTTP_HEADER_ORIGIN,			"Origin" },		\
-	{ HTTP_HEADER_DNT,			"DNT" },		\
 	{ HTTP_HEADER_OTHER,			NULL }			\
 }
 
 /* Used during runtime */
 struct http_descriptor {
 	struct kv		 http_pathquery;
+	struct kv		 http_matchquery;
 #define http_path		 http_pathquery.kv_key
 #define http_query		 http_pathquery.kv_value
+#define http_rescode		 http_pathquery.kv_key
+#define http_resmesg		 http_pathquery.kv_value
+#define query_key		 http_matchquery.kv_key
+#define query_val		 http_matchquery.kv_value
 
 	char			*http_version;
 	enum httpmethod		 http_method;
