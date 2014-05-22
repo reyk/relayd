@@ -85,4 +85,34 @@ stamp-syntax: ${ARGS}
 .endfor
 	@date >$@
 
+run1: .PHONY
+	@[ -e .done ] || touch .done;
+.for a in ${ARGS}
+	@skip=0; \
+	grep ${a} .skip 2>&1 >/dev/null || grep ${a} .done 2>&1 >/dev/null && \
+		skip=1; \
+	if [ $${skip} -eq 0 ]; then \
+		sudo env RELAYD=${RELAYD} ${MAKE} run-regress-${a} || read; \
+	else \
+		echo "=> skipping ${a}"; \
+	fi;
+	@${MAKE} cleandir && echo ${a} >> .done;
+.endfor
+
+run2: .PHONY
+.for a in ${ARGS}
+	@skip=0; \
+	grep ${a} .skip >/dev/null 2>&1 && skip=1; \
+	if [ $${skip} -eq 0 ]; then \
+		sudo env RELAYD=${RELAYD} ${MAKE} run-regress-${a}; \
+	else \
+		echo "=> skipping ${a}"; \
+	fi;
+.endfor
+
+.PHONY: cleanrun
+cleanrun:
+	${MAKE} clean cleandir
+	rm -f .done
+
 .include <bsd.regress.mk>

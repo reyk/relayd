@@ -13,9 +13,9 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    'request path filter "/2"',
+	    'block request path "/2"',
 	],
-	loggrep => qr/rejecting request/,
+	loggrep => qr/Forbidden/,
     },
     server => {
 	func => \&http_server,

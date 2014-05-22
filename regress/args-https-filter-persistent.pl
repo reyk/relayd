@@ -14,11 +14,11 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    'request path filter "/2"',
+	    'block request path "/2"',
 	],
 	loggrep => [
 	    qr/ssl, ssl client/,
-	    qr/rejecting request/,
+	    qr/Forbidden/,
 	],
 	forwardssl => 1,
 	listenssl => 1,
