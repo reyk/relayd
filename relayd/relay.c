@@ -138,7 +138,6 @@ relay_ruledebug(struct relay_rule *rule)
 
 	switch (rule->rule_dir) {
 	case RELAY_DIR_ANY:
-		fprintf(stderr, "any ");
 		break;
 	case RELAY_DIR_REQUEST:
 		fprintf(stderr, "request ");
