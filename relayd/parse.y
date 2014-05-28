@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.175 2014/01/22 00:21:16 henning Exp $	*/
+/*	$OpenBSD: parse.y,v 1.182 2014/05/12 14:28:22 andre Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -56,6 +56,7 @@
 #include <openssl/ssl.h>
 
 #include "relayd.h"
+#include "snmp.h"
 
 TAILQ_HEAD(files, file)		 files = TAILQ_HEAD_INITIALIZER(files);
 static struct file {
@@ -98,6 +99,7 @@ objid_t			 last_relay_id = 0;
 objid_t			 last_proto_id = 0;
 objid_t			 last_rt_id = 0;
 objid_t			 last_nr_id = 0;
+objid_t			 last_key_id = 0;
 
 static struct rdr	*rdr = NULL;
 static struct table	*table = NULL;
@@ -123,6 +125,7 @@ int		 host(const char *, struct addresslist *,
 void		 host_free(struct addresslist *);
 
 struct table	*table_inherit(struct table *);
+int		 relay_id(struct relay *);
 struct relay	*relay_inherit(struct relay *, struct relay *);
 int		 getservice(char *);
 int		 is_if_in_group(const char *, const char *);
@@ -156,14 +159,14 @@ typedef struct {
 %token	LOADBALANCE LOG LOOKUP MARK MARKED MODE NAT NO DESTINATION
 %token	NODELAY NOTHING ON PARENT PATH PORT PREFORK PRIORITY PROTO
 %token	QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE RETRY
-%token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SOCKET SPLICE
+%token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SNMP SOCKET SPLICE
 %token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
 %token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH CURVE
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
-%type	<v.string>	hostname interface table
-%type	<v.number>	http_type loglevel mark
+%type	<v.string>	hostname interface table optstring
+%type	<v.number>	http_type loglevel mark trap
 %type	<v.number>	direction dstmode flag forwardmode retry
 %type	<v.number>	optssl optsslclient sslcache
 %type	<v.number>	redirect_proto relay_proto match
@@ -369,12 +372,23 @@ main		: INTERVAL NUMBER	{
 			}
 			conf->sc_prefork_relay = $2;
 		}
-		| SEND TRAP		{
+		| SNMP trap optstring	{
 			if (loadcfg)
 				break;
-			conf->sc_flags |= F_TRAP;
+			conf->sc_flags |= F_SNMP;
+			if ($2)
+				conf->sc_snmp_flags |= FSNMP_TRAPONLY;
+			if ($3)
+				conf->sc_snmp_path = $3;
+			else
+				conf->sc_snmp_path = strdup(AGENTX_SOCKET);
+			if (conf->sc_snmp_path == NULL)
+				fatal("out of memory");
 		}
 		;
+
+trap		: /* nothing */		{ $$ = 0; }
+		| TRAP			{ $$ = 1; }
 
 loglevel	: UPDATES		{ $$ = RELAYD_OPT_LOGUPDATE; }
 		| ALL			{ $$ = RELAYD_OPT_LOGALL; }
@@ -405,6 +419,7 @@ rdr		: REDIRECT STRING	{
 			    sizeof(srv->conf.name)) >=
 			    sizeof(srv->conf.name)) {
 				yyerror("redirection name truncated");
+				free($2);
 				free(srv);
 				YYERROR;
 			}
@@ -458,19 +473,28 @@ rdroptsl	: forwardmode TO tablespec interface	{
 				if ($4 == NULL)
 					break;
 				yyerror("superfluous interface");
+				free($4);
 				YYERROR;
 			case FWD_ROUTE:
 				if ($4 != NULL)
 					break;
 				yyerror("missing interface to route to");
+				free($4);
 				YYERROR;
 			case FWD_TRANS:
 				yyerror("no transparent forward here");
+				if ($4 != NULL)
+					free($4);
 				YYERROR;
 			}
 			if ($4 != NULL) {
-				strlcpy($3->conf.ifname, $4,
-				    sizeof($3->conf.ifname));
+				if (strlcpy($3->conf.ifname, $4,
+				    sizeof($3->conf.ifname)) >=
+				    sizeof($3->conf.ifname)) {
+					yyerror("interface name truncated");
+					free($4);
+					YYERROR;
+				}
 				free($4);
 			}
 
@@ -582,7 +606,12 @@ tabledef	: TABLE table		{
 			if ((tb = calloc(1, sizeof (*tb))) == NULL)
 				fatal("out of memory");
 
-			(void)strlcpy(tb->conf.name, $2, sizeof(tb->conf.name));
+			if (strlcpy(tb->conf.name, $2,
+			    sizeof(tb->conf.name)) >= sizeof(tb->conf.name)) {
+				yyerror("table name truncated");
+				free($2);
+				YYERROR;
+			}
 			free($2);
 
 			tb->conf.id = 0; /* will be set later */
@@ -626,7 +655,12 @@ tablespec	: table			{
 			struct table	*tb;
 			if ((tb = calloc(1, sizeof (*tb))) == NULL)
 				fatal("out of memory");
-			(void)strlcpy(tb->conf.name, $1, sizeof(tb->conf.name));
+			if (strlcpy(tb->conf.name, $1,
+			    sizeof(tb->conf.name)) >= sizeof(tb->conf.name)) {
+				yyerror("table name truncated");
+				free($1);
+				YYERROR;
+			}
 			free($1);
 			table = tb;
 		} tableopts_l		{
@@ -753,8 +787,13 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 			free($3);
 			if (table->sendbuf == NULL)
 				fatal("out of memory");
-			(void)strlcpy(table->conf.digest, $4.digest,
-			    sizeof(table->conf.digest));
+			if (strlcpy(table->conf.digest, $4.digest,
+			    sizeof(table->conf.digest)) >=
+			    sizeof(table->conf.digest)) {
+				yyerror("digest truncated");
+				free($4.digest);
+				YYERROR;
+			}
 			table->conf.digest_type = $4.type;
 			free($4.digest);
 		}
@@ -832,6 +871,7 @@ proto		: relay_proto PROTO STRING	{
 			if (strlcpy(p->name, $3, sizeof(p->name)) >=
 			    sizeof(p->name)) {
 				yyerror("protocol name truncated");
+				free($3);
 				free(p);
 				YYERROR;
 			}
@@ -1040,6 +1080,12 @@ flag		: STRING			{
 		;
 
 protonode	: nodetype APPEND STRING TO STRING nodeopts		{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				free($5);
+				free($3);
+				YYERROR;
+			}
 			node.action = NODE_ACTION_APPEND;
 			node.key = strdup($5);
 			node.value = strdup($3);
@@ -1051,6 +1097,12 @@ protonode	: nodetype APPEND STRING TO STRING nodeopts		{
 			free($3);
 		}
 		| nodetype CHANGE STRING TO STRING nodeopts		{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				free($5);
+				free($3);
+				YYERROR;
+			}
 			node.action = NODE_ACTION_CHANGE;
 			node.key = strdup($3);
 			node.value = strdup($5);
@@ -1062,6 +1114,11 @@ protonode	: nodetype APPEND STRING TO STRING nodeopts		{
 			free($3);
 		}
 		| nodetype REMOVE STRING nodeopts			{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				free($3);
+				YYERROR;
+			}
 			node.action = NODE_ACTION_REMOVE;
 			node.key = strdup($3);
 			node.value = NULL;
@@ -1070,6 +1127,10 @@ protonode	: nodetype APPEND STRING TO STRING nodeopts		{
 			free($3);
 		}
 		| nodetype REMOVE					{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				YYERROR;
+			}
 			node.action = NODE_ACTION_REMOVE;
 			node.key = NULL;
 			node.value = NULL;
@@ -1189,6 +1250,11 @@ protonode	: nodetype APPEND STRING TO STRING nodeopts		{
 			free($5);
 		}
 		| nodetype MARK STRING WITH mark nodeopts		{
+			if (node.mark) {
+				yyerror("either mark or marked");
+				free($3);
+				YYERROR;
+			}
 			node.action = NODE_ACTION_MARK;
 			node.key = strdup($3);
 			node.value = strdup("*");
@@ -1280,11 +1346,16 @@ relay		: RELAY STRING	{
 			    sizeof(r->rl_conf.name)) >=
 			    sizeof(r->rl_conf.name)) {
 				yyerror("relay name truncated");
+				free($2);
 				free(r);
 				YYERROR;
 			}
 			free($2);
-			r->rl_conf.id = ++last_relay_id;
+			if (relay_id(r) == -1) {
+				yyerror("too many relays defined");
+				free(r);
+				YYERROR;
+			}
 			r->rl_conf.timeout.tv_sec = RELAY_TIMEOUT;
 			r->rl_proto = NULL;
 			r->rl_conf.proto = EMPTY_ID;
@@ -1399,8 +1470,13 @@ relayoptsl	: LISTEN ON STRING port optssl {
 				YYERROR;
 			}
 			if ($5 != NULL) {
-				strlcpy(rlay->rl_conf.ifname, $5,
-				    sizeof(rlay->rl_conf.ifname));
+				if (strlcpy(rlay->rl_conf.ifname, $5,
+				    sizeof(rlay->rl_conf.ifname)) >=
+				    sizeof(rlay->rl_conf.ifname)) {
+					yyerror("interface name truncated");
+					free($5);
+					YYERROR;
+				}
 				free($5);
 			}
 			if ($2) {
@@ -1797,6 +1873,9 @@ optnl		: '\n' optnl
 nl		: '\n' optnl
 		;
 
+optstring	: STRING		{ $$ = $1; }
+		| /* nothing */		{ $$ = NULL; }
+		;
 %%
 
 struct keywords {
@@ -1909,6 +1988,7 @@ lookup(char *s)
 		{ "script",		SCRIPT },
 		{ "send",		SEND },
 		{ "session",		SESSION },
+		{ "snmp",		SNMP },
 		{ "socket",		SOCKET },
 		{ "source-hash",	SRCHASH },
 		{ "splice",		SPLICE },
@@ -2748,7 +2828,11 @@ table_inherit(struct table *tb)
 		yyerror("invalid table name");
 		goto fail;
 	}
-	(void)strlcpy(tb->conf.name, pname, sizeof(tb->conf.name));
+	if (strlcpy(tb->conf.name, pname, sizeof(tb->conf.name)) >=
+	    sizeof(tb->conf.name)) {
+		yyerror("invalid table mame");
+		goto fail;
+	}
 	if ((oldtb = table_findbyconf(conf, tb)) != NULL) {
 		purge_table(NULL, tb);
 		return (oldtb);
@@ -2796,6 +2880,19 @@ table_inherit(struct table *tb)
 	return (NULL);
 }
 
+int
+relay_id(struct relay *rl)
+{
+	rl->rl_conf.id = ++last_relay_id;
+	rl->rl_conf.ssl_keyid = ++last_key_id;
+	rl->rl_conf.ssl_cakeyid = ++last_key_id;
+
+	if (last_relay_id == INT_MAX || last_key_id == INT_MAX)
+		return (-1);
+
+	return (0);
+}
+
 struct relay *
 relay_inherit(struct relay *ra, struct relay *rb)
 {
@@ -2817,8 +2914,7 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	}
 	TAILQ_INIT(&rb->rl_tables);
 
-	rb->rl_conf.id = ++last_relay_id;
-	if (last_relay_id == INT_MAX) {
+	if (relay_id(rb) == -1) {
 		yyerror("too many relays defined");
 		goto err;
 	}
@@ -2903,7 +2999,8 @@ is_if_in_group(const char *ifname, const char *groupname)
 		err(1, "socket");
 
 	memset(&ifgr, 0, sizeof(ifgr));
-	strlcpy(ifgr.ifgr_name, ifname, IFNAMSIZ);
+	if (strlcpy(ifgr.ifgr_name, ifname, IFNAMSIZ) >= IFNAMSIZ)
+		err(1, "IFNAMSIZ");
 	if (ioctl(s, SIOCGIFGROUP, (caddr_t)&ifgr) == -1) {
 		if (errno == EINVAL || errno == ENOTTY)
 			goto end;

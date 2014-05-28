@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_http.c,v 1.16 2013/09/04 22:21:32 bluhm Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.18 2014/04/20 16:18:32 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2012 Reyk Floeter <reyk@openbsd.org>
@@ -896,7 +896,8 @@ relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf, size_t len)
 	struct relay	*rlay = con->se_relay;
 	char		 ibuf[128];
 
-	(void)strlcpy(buf, val, len);
+	if (strlcpy(buf, val, len) >= len)
+		return (NULL);
 
 	if (strstr(val, "$REMOTE_") != NULL) {
 		if (strstr(val, "$REMOTE_ADDR") != NULL) {
@@ -1103,10 +1104,11 @@ relay_handle_http(struct ctl_relay_event *cre, struct protonode *proot,
 			con->se_hashkey = HASHINIT;
 		con->se_hashkey = hash32_str(pk->value, con->se_hashkey);
 		con->se_hashkeyset = 1;
+		log_debug("%s: hash 0x%04x", __func__, con->se_hashkey);
 		ret = PN_PASS;
 		break;
 	case NODE_ACTION_LOG:
-		log_info("%s: log '%s: %s'", __func__, pn->key, pk->value);
+		log_debug("%s: log '%s: %s'", __func__, pn->key, pk->value);
 		ret = PN_PASS;
 		break;
 	case NODE_ACTION_MARK:

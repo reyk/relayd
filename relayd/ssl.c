@@ -1,7 +1,7 @@
-/*	$OpenBSD: ssl.c,v 1.19 2013/05/31 20:23:37 benno Exp $	*/
+/*	$OpenBSD: ssl.c,v 1.24 2014/05/20 17:33:36 reyk Exp $	*/
 
 /*
- * Copyright (c) 2007-2013 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -346,6 +346,8 @@ ssl_load_key(struct relayd *env, const char *name, off_t *len, char *pass)
 	memcpy(buf, data, size);
 
 	BIO_free_all(bio);
+	EVP_PKEY_free(key);
+
 	*len = (off_t)size;
 	return (buf);
 
@@ -355,17 +357,17 @@ ssl_load_key(struct relayd *env, const char *name, off_t *len, char *pass)
 	free(buf);
 	if (bio != NULL)
 		BIO_free_all(bio);
+	if (key != NULL)
+		EVP_PKEY_free(key);
 	return (NULL);
 }
 
 X509 *
-ssl_update_certificate(X509 *oldcert, char *keystr, off_t keylen,
-    char *cakeystr, off_t cakeylen, char *cacertstr, off_t cacertlen)
+ssl_update_certificate(X509 *oldcert, EVP_PKEY *pkey, EVP_PKEY *capkey,
+    X509 *cacert)
 {
 	char		 name[2][SSL_NAME_SIZE];
-	X509		*cert = NULL, *cacert = NULL;
-	EVP_PKEY	*key = NULL, *cakey = NULL;
-	BIO		*bio = NULL;
+	X509		*cert = NULL;
 
 	name[0][0] = name[1][0] = '\0';
 	if (!X509_NAME_oneline(X509_get_subject_name(oldcert),
@@ -374,38 +376,15 @@ ssl_update_certificate(X509 *oldcert, char *keystr, off_t keylen,
 	    name[1], sizeof(name[1])))
 		goto done;
 
-	/* Get SSL key */
-	if ((bio = BIO_new_mem_buf(keystr, keylen)) == NULL)
-		goto done;
-	if ((key = PEM_read_bio_PrivateKey(bio, &key,
-	    ssl_password_cb, NULL)) == NULL)
-		goto done;
-
-	/* Get CA key */
-	BIO_free_all(bio);
-	if ((bio = BIO_new_mem_buf(cakeystr, cakeylen)) == NULL)
-		goto done;
-	if ((cakey = PEM_read_bio_PrivateKey(bio, &cakey,
-	    ssl_password_cb, NULL)) == NULL)
-		goto done;
-
-	/* Get CA certificate */
-	BIO_free_all(bio);
-	if ((bio = BIO_new_mem_buf(cacertstr, cacertlen)) == NULL)
-		goto done;
-	if ((cacert = PEM_read_bio_X509(bio, &cacert,
-	    ssl_password_cb, NULL)) == NULL)
-		goto done;
-
 	if ((cert = X509_dup(oldcert)) == NULL)
 		goto done;
 
 	/* Update certificate key and use our CA as the issuer */
-	X509_set_pubkey(cert, key);
+	X509_set_pubkey(cert, pkey);
 	X509_set_issuer_name(cert, X509_get_subject_name(cacert));
 
 	/* Sign with our CA */
-	if (!X509_sign(cert, cakey, EVP_sha1())) {
+	if (!X509_sign(cert, capkey, EVP_sha1())) {
 		X509_free(cert);
 		cert = NULL;
 	}
@@ -421,14 +400,99 @@ ssl_update_certificate(X509 *oldcert, char *keystr, off_t keylen,
  done:
 	if (cert == NULL)
 		ssl_error(__func__, name[0]);
-	if (bio != NULL)
-		BIO_free_all(bio);
-	if (key != NULL)
-		EVP_PKEY_free(key);
-	if (cacert != NULL)
-		X509_free(cacert);
-	if (cakey != NULL)
-		EVP_PKEY_free(cakey);
 
 	return (cert);
 }
+
+int
+ssl_load_pkey(const void *data, size_t datalen, char *buf, off_t len,
+    X509 **x509ptr, EVP_PKEY **pkeyptr)
+{
+	BIO		*in;
+	X509		*x509 = NULL;
+	EVP_PKEY	*pkey = NULL;
+	RSA		*rsa = NULL;
+	void		*exdata = NULL;
+
+	if ((in = BIO_new_mem_buf(buf, len)) == NULL) {
+		SSLerr(SSL_F_SSL_CTX_USE_PRIVATEKEY, ERR_R_BUF_LIB);
+		return (0);
+	}
+
+	if ((x509 = PEM_read_bio_X509(in, NULL,
+	    ssl_password_cb, NULL)) == NULL) {
+		SSLerr(SSL_F_SSL_CTX_USE_PRIVATEKEY, ERR_R_PEM_LIB);
+		goto fail;
+	}
+
+	if ((pkey = X509_get_pubkey(x509)) == NULL) {
+		SSLerr(SSL_F_SSL_CTX_USE_PRIVATEKEY, ERR_R_X509_LIB);
+		goto fail;
+	}
+
+	BIO_free(in);
+
+	if (data != NULL && datalen) {
+		if ((rsa = EVP_PKEY_get1_RSA(pkey)) == NULL ||
+		    (exdata = malloc(datalen)) == NULL) {
+			SSLerr(SSL_F_SSL_CTX_USE_PRIVATEKEY, ERR_R_EVP_LIB);
+			goto fail;
+		}
+
+		memcpy(exdata, data, datalen);
+		RSA_set_ex_data(rsa, 0, exdata);
+		RSA_free(rsa); /* dereference, will be cleaned up with pkey */
+	}
+
+	*x509ptr = x509;
+	*pkeyptr = pkey;
+
+	return (1);
+
+ fail:
+	if (rsa != NULL)
+		RSA_free(rsa);
+	if (in != NULL)
+		BIO_free(in);
+	if (pkey != NULL)
+		EVP_PKEY_free(pkey);
+	if (x509 != NULL)
+		X509_free(x509);
+
+	return (0);
+}
+
+int
+ssl_ctx_fake_private_key(SSL_CTX *ctx, const void *data, size_t datalen,
+    char *buf, off_t len, X509 **x509ptr, EVP_PKEY **pkeyptr)
+{
+	int		 ret = 0;
+	EVP_PKEY	*pkey = NULL;
+	X509		*x509 = NULL;
+
+	if (!ssl_load_pkey(data, datalen, buf, len, &x509, &pkey))
+		return (0);
+
+	/*
+	 * Use the public key as the "private" key - the secret key
+	 * parameters are hidden in an extra process that will be
+	 * contacted by the RSA engine.  The SSL/TLS library needs at
+	 * least the public key parameters in the current process.
+	 */
+	ret = SSL_CTX_use_PrivateKey(ctx, pkey);
+	if (!ret)
+		SSLerr(SSL_F_SSL_CTX_USE_PRIVATEKEY, ERR_R_SSL_LIB);
+
+	if (pkeyptr != NULL)
+		*pkeyptr = pkey;
+	else if (pkey != NULL)
+		EVP_PKEY_free(pkey);
+
+	if (x509ptr != NULL)
+		*x509ptr = x509;
+	else if (x509 != NULL)
+		X509_free(x509);
+
+	return (ret);
+}
+
