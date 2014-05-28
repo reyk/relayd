@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-#	$OpenBSD: relayd.pl,v 1.8 2013/02/07 22:56:27 bluhm Exp $
+#	$OpenBSD: relayd.pl,v 1.10 2014/05/12 21:30:42 andre Exp $
 
 # Copyright (c) 2010-2013 Alexander Bluhm <bluhm@openbsd.org>
 #
@@ -63,15 +63,15 @@ my $c = Client->new(
     connectaddr         => "127.0.0.1",
     connectport         => $rport,
     %{$args{client}},
-);
+) unless $args{client}{noclient};
 
 $s->run unless $args{server}{noserver};
 $r->run;
 $r->up;
-$c->run->up;
+$c->run->up unless $args{client}{noclient};
 $s->up unless $args{server}{noserver};
 
-$c->down;
+$c->down unless $args{client}{noclient};
 $s->down unless $args{server}{noserver};
 $r->kill_child;
 $r->down;
