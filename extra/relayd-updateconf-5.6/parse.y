@@ -933,11 +933,19 @@ protoptsl	: SSL sslflags
 		| RETURN ERROR opteflags	{ proto->flags |= F_RETURN; }
 		| RETURN ERROR '{' eflags_l '}'	{ proto->flags |= F_RETURN; }
 		| LABEL STRING			{
-			node.labelname = strdup($2);
+			char	buf[256];
+			proto_print_label($2, buf, sizeof(buf));
+			if (buf[0])
+				proto->rules = opts_add(proto->rules,
+				   &proto->rulesc, buf);
 			free($2);
 		}
 		| NO LABEL			{
-			node.flags |= PNFLAG_NOLABEL;
+			char	buf[256];
+			proto_print_label(NULL, buf, sizeof(buf));
+			if (buf[0])
+				proto->rules = opts_add(proto->rules,
+				   &proto->rulesc, buf);
 		}
 		| direction			{
 			node.dir = nodedirection = $1;

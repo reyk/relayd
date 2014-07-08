@@ -461,6 +461,7 @@ void		 proto_print_node(struct protocol *, struct protonode *,
 		    char **);
 void		 proto_print_opts(struct protocol *, char *, size_t);
 void		 proto_print_flags(struct protocol *, char *, size_t);
+void		 proto_print_label(const char *, char *, size_t);
 void		 rdr_print_forward(struct rdr *, int, char *, size_t);
 void		 rdr_print_listen(struct rdr *, char *, size_t);
 void		 relay_print_forward(struct relay *, struct relay_table *,

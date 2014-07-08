@@ -822,6 +822,15 @@ proto_print_opts(struct protocol *proto, char *buf, size_t len)
 }
 
 void
+proto_print_label(const char *label, char *buf, size_t len)
+{
+	if (label == NULL)
+		(void)snprintf(buf, len, "match request no label");
+	else
+		(void)snprintf(buf, len, "match request label \"%s\"", label);
+}
+
+void
 proto_print_flags(struct protocol *proto, char *buf, size_t len)
 {
 	int 	off = 0, i = 0;
