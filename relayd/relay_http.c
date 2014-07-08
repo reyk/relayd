@@ -832,6 +832,8 @@ relay_lookup_query(struct ctl_relay_event *cre, struct kv *kv)
 	char			*val, *ptr, *tmpkey = NULL, *tmpval = NULL;
 	int			 ret = -1;
 
+	if (desc->http_query == NULL)
+		return (-1);
 	if ((val = strdup(desc->http_query)) == NULL) {
 		relay_abort_http(cre->con, 500, "failed to allocate query", 0);
 		return (-1);
@@ -866,7 +868,7 @@ relay_lookup_query(struct ctl_relay_event *cre, struct kv *kv)
 		goto done;
 	ret = 0;
 
-done:
+ done:
 	free(val);
 	return (ret);
 }

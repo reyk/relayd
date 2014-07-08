@@ -791,7 +791,7 @@ kv_log(struct evbuffer *log, struct kv *kv, u_int16_t labelid)
 	if (asprintf(&msg, " [%s%s%s%s%s]",
 	    labelid == 0 ? "" : label_id2name(labelid),
 	    labelid == 0 ? "" : ", ",
-	    kv->kv_key,
+	    kv->kv_key == NULL ? "(unknown)" : kv->kv_key,
 	    kv->kv_value == NULL ? "" : ": ",
 	    kv->kv_value == NULL ? "" : kv->kv_value) == -1)
 		return (-1);
