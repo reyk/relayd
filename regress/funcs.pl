@@ -16,7 +16,7 @@
 
 use strict;
 use warnings;
-#no warnings 'experimental::smartmatch';
+no warnings 'experimental::smartmatch';
 use feature 'switch';
 use Errno;
 use Digest::MD5;
