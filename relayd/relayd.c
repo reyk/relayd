@@ -825,7 +825,8 @@ rule_add(struct protocol *proto, struct relay_rule *rule, const char *rulefile)
 		switch (kv->kv_option) {
 		case KEY_OPTION_LOG:
 			/* log action needs a key or a file to be specified */
-			if (kv->kv_key == NULL && rulefile == NULL)
+			if (kv->kv_key == NULL && rulefile == NULL &&
+			    (kv->kv_key = strdup("*")) == NULL)
 				goto fail;
 			break;
 		default:
