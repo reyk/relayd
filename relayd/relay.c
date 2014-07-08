@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.170 2014/05/20 17:33:36 reyk Exp $	*/
+/*	$OpenBSD: relay.c,v 1.171 2014/06/27 07:49:08 andre Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -124,14 +124,14 @@ relay_ruledebug(struct relay_rule *rule)
 
 	fprintf(stderr, "\t\t");
 
-	switch (rule->rule_type) {
-	case RULE_TYPE_MATCH:
+	switch (rule->rule_action) {
+	case RULE_ACTION_MATCH:
 		fprintf(stderr, "match ");
 		break;
-	case RULE_TYPE_BLOCK:
+	case RULE_ACTION_BLOCK:
 		fprintf(stderr, "block ");
 		break;
-	case RULE_TYPE_PASS:
+	case RULE_ACTION_PASS:
 		fprintf(stderr, "pass ");
 		break;
 	}
@@ -176,33 +176,50 @@ relay_ruledebug(struct relay_rule *rule)
 			continue;
 		}
 
-		switch (kv->kv_action) {
-		case KEY_ACTION_APPEND:
+		switch (kv->kv_option) {
+		case KEY_OPTION_APPEND:
 			fprintf(stderr, "append ");
 			break;
-		case KEY_ACTION_SET:
+		case KEY_OPTION_SET:
 			fprintf(stderr, "set ");
 			break;
-		case KEY_ACTION_REMOVE:
+		case KEY_OPTION_REMOVE:
 			fprintf(stderr, "remove ");
 			break;
-		case KEY_ACTION_HASH:
+		case KEY_OPTION_HASH:
 			fprintf(stderr, "hash ");
 			break;
-		case KEY_ACTION_LOG:
+		case KEY_OPTION_LOG:
 			fprintf(stderr, "log ");
 			break;
-		case KEY_ACTION_NONE:
+		case KEY_OPTION_NONE:
 			break;
 		}
-		fprintf(stderr, "\"%s\"%s%s%s ",
-		    kv->kv_key,
+
+		switch (kv->kv_digest) {
+		case DIGEST_SHA1:
+		case DIGEST_MD5:
+			fprintf(stderr, "digest ");
+			break;
+		default:
+			break;
+		}
+
+		fprintf(stderr, "%s%s%s%s%s%s ",
+		    kv->kv_key == NULL ? "" : "\"",
+		    kv->kv_key == NULL ? "" : kv->kv_key,
+		    kv->kv_key == NULL ? "" : "\"",
 		    kv->kv_value == NULL ? "" : " value \"",
 		    kv->kv_value == NULL ? "" : kv->kv_value,
 		    kv->kv_value == NULL ? "" : "\"");
 	}
 
-	if (rule->rule_tag && rule->rule_tagname[0])
+	if (rule->rule_tablename[0])
+		fprintf(stderr, "forward to <%s> ", rule->rule_tablename);
+
+	if (rule->rule_tag == -1)
+		fprintf(stderr, "no tag ");
+	else if (rule->rule_tag && rule->rule_tagname[0])
 		fprintf(stderr, "tag \"%s\" ",
 		    rule->rule_tagname);
 
@@ -210,7 +227,9 @@ relay_ruledebug(struct relay_rule *rule)
 		fprintf(stderr, "tagged \"%s\" ",
 		    rule->rule_taggedname);
 
-	if (rule->rule_label && rule->rule_labelname[0])
+	if (rule->rule_label == -1)
+		fprintf(stderr, "no label ");
+	else if (rule->rule_label && rule->rule_labelname[0])
 		fprintf(stderr, "label \"%s\" ",
 		    rule->rule_labelname);
 
@@ -389,6 +408,13 @@ relay_launch(void)
 			fatal("relay_init: failed to create SSL context");
 
 		TAILQ_FOREACH(rlt, &rlay->rl_tables, rlt_entry) {
+			/*
+			 * set rule->rule_table in advance and save time
+			 * looking up for this later on rule/connection
+			 * evalution
+			 */
+			rule_settable(&rlay->rl_proto->rules, rlt);
+
 			switch (rlt->rlt_mode) {
 			case RELAY_DSTMODE_ROUNDROBIN:
 			case RELAY_DSTMODE_RANDOM:

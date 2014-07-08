@@ -4,19 +4,20 @@ use warnings;
 our %args = (
     client => {
 	func => \&http_client,
-	loggrep => { 
+	loggrep => {
 		qr/GET \/251 HTTP\/1\.0/ => 1,
 	},
     },
     relayd => {
 	protocol => [ "http",
-	    'match request path set "*" value "/foopath"',
+	    'match request path set "*" value "/foopath" \
+		url log "*"',
 	],
-	loggrep => { qr/\, done/ => 1 },
+	loggrep => { qr/\, done\, \[foo.bar\/foopath\]/ => 1 },
     },
     server => {
 	func => \&http_server,
-	loggrep => { 
+	loggrep => {
 		qr/GET \/foopath HTTP\/1\.0/ => 1,
 	},
     },

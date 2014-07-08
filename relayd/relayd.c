@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.124 2014/05/08 15:28:57 blambert Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.125 2014/06/27 07:49:08 andre Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -740,18 +740,22 @@ kv_free(struct kv *kv)
 {
 	if (kv->kv_key != NULL) {
 		free(kv->kv_key);
-		kv->kv_key = NULL;
 	}
+	kv->kv_key = NULL;
 	if (kv->kv_value != NULL) {
 		free(kv->kv_value);
-		kv->kv_value = NULL;
 	}
-	kv->kv_type = KEY_TYPE_NONE;
+	kv->kv_value = NULL;
+	kv->kv_matchlist = NULL;
+	kv->kv_matchptr = NULL;
+	kv->kv_match = NULL;
+	memset(kv, 0, sizeof(*kv));
 }
 
 struct kv *
 kv_inherit(struct kv *dst, struct kv *src)
 {
+	memset(dst, 0, sizeof(*dst));
 	memcpy(dst, src, sizeof(*dst));
 
 	if (src->kv_key != NULL) {
@@ -766,6 +770,13 @@ kv_inherit(struct kv *dst, struct kv *src)
 			return (NULL);
 		}
 	}
+
+	if (src->kv_match != NULL)
+		dst->kv_match = src->kv_match;
+	if (src->kv_matchptr != NULL)
+		dst->kv_matchptr = src->kv_matchptr;
+	if (src->kv_matchlist != NULL)
+		dst->kv_matchlist = src->kv_matchlist;
 
 	return (dst);
 }
@@ -794,23 +805,49 @@ kv_log(struct evbuffer *log, struct kv *kv, u_int16_t labelid)
 }
 
 int
-rule_add(enum keytype keytype, struct protocol *proto,
-    struct relay_rule *rule, const char *rulefile)
+rule_add(struct protocol *proto, struct relay_rule *rule, const char *rulefile)
 {
 	struct relay_rule	*r = NULL;
 	struct kv		*kv = NULL;
 	FILE			*fp = NULL;
 	char			 buf[BUFSIZ];
 	int			 ret = -1;
+	u_int			 i;
+
+	for (i = 0; i < KEY_TYPE_MAX; i++) {
+		kv = &rule->rule_kv[i];
+		if (kv->kv_type != i)
+			continue;
+
+		if (kv->kv_value != NULL && strchr(kv->kv_value, '$') != NULL)
+			kv->kv_flags |= KV_FLAG_MACRO;
+
+		switch (kv->kv_option) {
+		case KEY_OPTION_LOG:
+			/* log action needs a key or a file to be specified */
+			if (kv->kv_key == NULL && rulefile == NULL)
+				goto fail;
+			break;
+		default:
+			break;
+		}
+
+		switch (kv->kv_type) {
+		case KEY_TYPE_QUERY:
+		case KEY_TYPE_PATH:
+		case KEY_TYPE_URL:
+			if (rule->rule_dir != RELAY_DIR_REQUEST)
+				goto fail;
+			break;
+		default:
+			break;
+		}
+	}
 
 	if (rulefile == NULL) {
 		TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
 		return (0);
 	}
-
-	kv = &rule->rule_kv[keytype];
-	if (kv->kv_type != keytype)
-		goto fail;
 
 	if ((fp = fopen(rulefile, "r")) == NULL)
 		goto fail;
@@ -824,13 +861,17 @@ rule_add(enum keytype keytype, struct protocol *proto,
 		if ((r = rule_inherit(rule)) == NULL)
 			goto fail;
 
-		kv = &r->rule_kv[keytype];
-		if (kv->kv_key != NULL)
-			free(kv->kv_key);
-		if ((kv->kv_key = strdup(buf)) == NULL) {
-			rule_free(r);
-			free(r);
-			goto fail;
+		for (i = 0; i < KEY_TYPE_MAX; i++) {
+			kv = &r->rule_kv[i];
+			if (kv->kv_type != i)
+				continue;
+			if (kv->kv_key != NULL)
+				free(kv->kv_key);
+			if ((kv->kv_key = strdup(buf)) == NULL) {
+				rule_free(r);
+				free(r);
+				goto fail;
+			}
 		}
 
 		TAILQ_INSERT_TAIL(&proto->rules, r, rule_entry);
@@ -857,18 +898,21 @@ rule_inherit(struct relay_rule *rule)
 		return (NULL);
 	memcpy(r, rule, sizeof(*r));
 
-	for (i = 1; i < KEY_TYPE_MAX; i++) {
+	for (i = 0; i < KEY_TYPE_MAX; i++) {
 		kv = &rule->rule_kv[i];
 		if (kv->kv_type != i)
 			continue;
-		kv_inherit(&r->rule_kv[i], kv);
+		if (kv_inherit(&r->rule_kv[i], kv) == NULL) {
+			free(r);
+			return(NULL);
+		}
 	}
 
-	if (r->rule_label != 0)
+	if (r->rule_label > 0)
 		label_ref(r->rule_label);
-	if (r->rule_tag != 0)
+	if (r->rule_tag > 0)
 		tag_ref(r->rule_tag);
-	if (r->rule_tagged != 0)
+	if (r->rule_tagged > 0)
 		tag_ref(r->rule_tagged);
 
 	return (r);
@@ -881,11 +925,11 @@ rule_free(struct relay_rule *rule)
 
 	for (i = 0; i < KEY_TYPE_MAX; i++)
 		kv_free(&rule->rule_kv[i]);
-	if (rule->rule_label != 0)
+	if (rule->rule_label > 0)
 		label_unref(rule->rule_label);
-	if (rule->rule_tag != 0)
+	if (rule->rule_tag > 0)
 		tag_unref(rule->rule_tag);
-	if (rule->rule_tagged != 0)
+	if (rule->rule_tagged > 0)
 		tag_unref(rule->rule_tagged);
 }
 
@@ -895,6 +939,28 @@ rule_delete(struct relay_rules *rules, struct relay_rule *rule)
 	TAILQ_REMOVE(rules, rule, rule_entry);
 	rule_free(rule);
 	free(rule);
+}
+
+void
+rule_settable(struct relay_rules *rules, struct relay_table *rlt)
+{
+	struct relay_rule	*r;
+	char		 	 pname[TABLE_NAME_SIZE];
+
+	if (rlt->rlt_table == NULL || strlcpy(pname, rlt->rlt_table->conf.name,
+	    sizeof(pname)) >= sizeof(pname))
+		return;
+
+	pname[strcspn(pname, ":")] = '\0';
+
+	TAILQ_FOREACH(r, rules, rule_entry) {
+		if (r->rule_tablename[0] &&
+		    strcmp(pname, r->rule_tablename) == 0) {
+			r->rule_table = rlt;
+		} else {
+			r->rule_table = NULL;
+		}
+	}
 }
 
 /*

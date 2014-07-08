@@ -1,7 +1,7 @@
-/*	$OpenBSD: relay_http.c,v 1.18 2014/04/20 16:18:32 reyk Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.19 2014/06/25 11:05:15 reyk Exp $	*/
 
 /*
- * Copyright (c) 2006 - 2012 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -78,8 +78,9 @@ int		 relay_httpurl_test(struct ctl_relay_event *,
 		    struct relay_rule *, struct kvlist *);
 int		 relay_httpcookie_test(struct ctl_relay_event *,
 		    struct relay_rule *, struct kvlist *);
-int		 relay_action(struct ctl_relay_event *, struct relay_rule *,
-		    struct kvlist *);
+int		 relay_apply_actions(struct ctl_relay_event *, struct kvlist *);
+int		 relay_match_actions(struct ctl_relay_event *,
+		    struct relay_rule *, struct kvlist *, struct kvlist *);
 void		 relay_httpdesc_free(struct http_descriptor *);
 
 static struct relayd	*env = NULL;
@@ -168,7 +169,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	struct protocol		*proto = rlay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	char			*line = NULL, *key, *value;
-	int			 header = 0, action;
+	int			 action;
 	const char		*errstr;
 	size_t			 size;
 	struct kv		*hdr = NULL;
@@ -228,10 +229,8 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		if (*value == ':') {
 			*value++ = '\0';
 			value += strspn(value, " \t\r\n");
-			header = 1;
 		} else {
 			*value++ = '\0';
-			header = 0;
 		}
 
 		DPRINTF("%s: session %d: header '%s: %s'", __func__,
@@ -336,19 +335,27 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		    strcasecmp("chunked", value) == 0)
 			desc->http_chunked = 1;
 
-		if (cre->line != 1 &&
-		    (hdr = kv_add(&desc->http_headers, key, value)) == NULL) {
-			free(line);
-			goto fail;
-		}
-
-		/*
-		 * Remember the header if it is known to us for a quicker
-		 * lookup later.
-		 */
-		if ((hdrid = relay_httpheader_byname(key)) !=
-		    HTTP_HEADER_OTHER) {
-			desc->http_header[hdrid] = hdr;
+		if (cre->line != 1) {
+			if ((hdr = kv_add(&desc->http_headers, key,
+			    value)) == NULL) {
+				free(line);
+				goto fail;
+			}
+			/*
+			 * Remember the header if it is known to us for a
+			 * quicker lookup later.
+			 */
+			if ((hdrid = relay_httpheader_byname(key)) !=
+			    HTTP_HEADER_OTHER) {
+				if (desc->http_header[hdrid] != NULL) {
+					kv_delete(&desc->http_headers, hdr);
+					free(line);
+					relay_abort_http(con, 400, "repeated "
+					    "header line", 0);
+					return;
+				}
+				desc->http_header[hdrid] = hdr;
+			}
 		}
 
 		free(line);
@@ -742,7 +749,7 @@ relay_lookup_url(struct ctl_relay_event *cre, const char *host, struct kv *kv)
 		/* 3. traverse path */
 		for (j = 0, p = strchr(pp, '/');
 		    p != NULL; p = strchr(p, '/'), j++) {
-			if (j > (RELAY_MAXLOOKUPLEVELS - 2) || ++p == '\0')
+			if (j > (RELAY_MAXLOOKUPLEVELS - 2) || *(++p) == '\0')
 				break;
 			c = &pp[p - pp];
 			ch = *c;
@@ -842,7 +849,7 @@ relay_lookup_query(struct ctl_relay_event *cre, struct kv *kv)
 
 		if (fnmatch(kv->kv_key, tmpkey, 0) != FNM_NOMATCH &&
 		    (kv->kv_value == NULL || fnmatch(kv->kv_value, tmpval, 0)
-		     != FNM_NOMATCH))
+		    != FNM_NOMATCH))
 			break;
 		else
 			tmpkey = NULL;
@@ -968,7 +975,8 @@ relay_close_http(struct rsession *con)
 }
 
 char *
-relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf, size_t len)
+relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf,
+    size_t len)
 {
 	struct rsession	*con = cre->con;
 	struct relay	*rlay = con->se_relay;
@@ -1067,20 +1075,17 @@ relay_writeresponse_http(struct ctl_relay_event *dst,
 }
 
 int
-relay_writeheader_http(struct ctl_relay_event *dst, struct ctl_relay_event *cre)
+relay_writeheader_http(struct ctl_relay_event *dst, struct ctl_relay_event
+    *cre)
 {
 	struct kv		*hdr;
-	char			 buf[IBUF_READ_SIZE], *ptr;
 	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
+	char			*ptr;
 
 	TAILQ_FOREACH(hdr, &desc->http_headers, kv_entry) {
+		if (hdr->kv_flags & KV_FLAG_INVALID)
+			continue;
 		ptr = hdr->kv_value;
-		if (hdr->kv_action == KEY_ACTION_APPEND ||
-		    hdr->kv_action == KEY_ACTION_SET)
-			if ((ptr = relay_expand_http(cre, hdr->kv_value, buf,
-			    sizeof(buf))) == NULL)
-			    return (-1);
-
 		DPRINTF("%s: ptr %s", __func__, ptr);
 		if (relay_bufferevent_print(dst, hdr->kv_key) == -1 ||
 		    (ptr != NULL &&
@@ -1125,6 +1130,22 @@ relay_httpmethod_byid(u_int id)
 	for (i = 0; http_methods[i].method_name != NULL; i++) {
 		if (http_methods[i].method_id == id) {
 			name = http_methods[i].method_name;
+			break;
+		}
+	}
+
+	return (name);
+}
+
+const char *
+relay_httpheader_byid(u_int id)
+{
+	const char	*name = NULL;
+	int		 i;
+
+	for (i = 0; http_headers[i].header_name != NULL; i++) {
+		if (http_headers[i].header_id == id) {
+			name = http_headers[i].header_name;
 			break;
 		}
 	}
@@ -1213,15 +1234,17 @@ relay_httpheader_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 		DPRINTF("%s: other header %s", __func__, kv->kv_key);
 		TAILQ_FOREACH_REVERSE(match, &desc->http_headers,
 		    kvlist, kv_entry) {
-			if (strcasecmp(match->kv_key, kv->kv_key) == 0)
+			if (strcasecmp(match->kv_key, kv->kv_key) == 0 ||
+			    fnmatch(kv->kv_key, match->kv_key, FNM_CASEFOLD) !=
+			    FNM_NOMATCH)
 				goto done;
 		}
 		match = NULL;
 	}
 
  done:
-	if (kv->kv_action == KEY_ACTION_APPEND ||
-	    kv->kv_action == KEY_ACTION_SET) {
+	if (kv->kv_option == KEY_OPTION_APPEND ||
+	    kv->kv_option == KEY_OPTION_SET) {
 		/* header can be NULL and will be added later */
 	} else if (match == NULL) {
 		/* Fail if header doesn't exist */
@@ -1253,7 +1276,7 @@ relay_httppath_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 		return (0);
 	else if (fnmatch(kv->kv_key, desc->http_path, 0) == FNM_NOMATCH)
 		return (-1);
-	else if (kv->kv_value != NULL && kv->kv_action == KEY_ACTION_NONE) {
+	else if (kv->kv_value != NULL && kv->kv_option == KEY_OPTION_NONE) {
 		query = desc->http_query == NULL ? "" : desc->http_query;
 		if (fnmatch(kv->kv_value, query, FNM_CASEFOLD) == FNM_NOMATCH)
 			return (-1);
@@ -1277,7 +1300,11 @@ relay_httpurl_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 		return (0);
 	else if (kv->kv_key == NULL || host == NULL || host->kv_value == NULL)
 		return (0);
-	else if (relay_lookup_url(cre, host->kv_value, kv) != 0)
+	else if (rule->rule_action != RULE_ACTION_BLOCK &&
+	    kv->kv_option == KEY_OPTION_LOG &&
+	    fnmatch(kv->kv_key, match->kv_key, FNM_CASEFOLD) != FNM_NOMATCH) {
+		/* fnmatch url only for logging */
+	} else if (relay_lookup_url(cre, host->kv_value, kv) != 0)
 		return (-1);
 
 	relay_match(actions, kv, match, NULL);
@@ -1291,7 +1318,7 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 {
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*kv = &rule->rule_kv[KEY_TYPE_COOKIE];
-	struct kv		*cookie = NULL;
+	u_int			 id = HTTP_HEADER_NONE;
 	struct kv		*match = NULL;
 
 	if (kv->kv_type != KEY_TYPE_COOKIE)
@@ -1299,139 +1326,177 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 
 	switch (cre->dir) {
 	case RELAY_DIR_REQUEST:
-		cookie = desc->http_header[HTTP_HEADER_COOKIE];
+		id = HTTP_HEADER_COOKIE;
 		break;
 	case RELAY_DIR_RESPONSE:
-		cookie = desc->http_header[HTTP_HEADER_SET_COOKIE];
+		id = HTTP_HEADER_SET_COOKIE;
 		break;
-	case RELAY_DIR_ANY:
+	default:
 		return (0);
 		/* NOTREACHED */
-	default:
 		break;
 	}
-
-	match = cookie;
-	if (kv->kv_key == NULL || cookie == NULL ||
-	    cookie->kv_value == NULL)
-		return (0);
-	else if (relay_lookup_cookie(cre, cookie->kv_value, kv) != 0)
+	if (kv->kv_option == KEY_OPTION_APPEND ||
+	    kv->kv_option == KEY_OPTION_SET) {
+		kv->kv_header_id = id;
+		/* no cookie, can be NULL and will be added later */
+	} else if (id == HTTP_HEADER_NONE) {
+		/* Fail if cookie doesn't exist */
 		return (-1);
+	} else {
+		match = desc->http_header[id];
+		if (match == NULL)
+			return (-1);
+		kv->kv_matchptr = &desc->http_header[id];
+		if (kv->kv_key == NULL || match->kv_value == NULL)
+			return (0);
+		else if (relay_lookup_cookie(cre, match->kv_value, kv) != 0)
+			return (-1);
+	}
 
-	relay_match(actions, kv, match, NULL);
+	relay_match(actions, kv, match, &desc->http_headers);
 
 	return (0);
 }
 
 int
-relay_action(struct ctl_relay_event *cre, struct relay_rule *rule,
-    struct kvlist *actions)
+relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
+    struct kvlist *matches, struct kvlist *actions)
 {
 	struct rsession		*con = cre->con;
-	struct http_descriptor	*desc = cre->desc;
-	struct relay		*rlay = (struct relay *)con->se_relay;
-	struct relay_table	*rlt = NULL;
-	char			 pname[TABLE_NAME_SIZE];
-	const char		*value;
-	struct kv		*kv, *match;
-	int			 httpindex, addkv;
-	enum httpheader		 hdrid;
+	struct kv		*kv;
 
-	if (rule->rule_flags & RULE_FLAG_FORWARD_TABLE) {
-		con->se_table = NULL;
-		TAILQ_FOREACH(rlt, &rlay->rl_tables, rlt_entry) {
-			/*
-			 * XXX This should be replaced by a faster lookup
-			 * method.
-			 */
-			if (strlcpy(pname,
-			    rlt->rlt_table->conf.name,
-			    sizeof(pname)) >= sizeof(pname))
-				continue;
-			pname[strcspn(pname, ":")] = '\0';
-			if (strcmp(pname,
-			    rule->rule_tablename) == 0) {
-				DPRINTF("%s: session %d:"
-				    " selected table %s",
-				    __func__, con->se_id,
-				    rlt->rlt_table->conf.name);
-				con->se_table = rlt;
-				break;
-			}
+	/*
+	 * Apply the following options instantly (action per match).
+	 */
+	if (rule->rule_table != NULL)
+		con->se_table = rule->rule_table;
+
+	if (rule->rule_tag != 0)
+		con->se_tag = rule->rule_tag == -1 ? 0 : rule->rule_tag;
+
+	if (rule->rule_label != 0)
+		con->se_label = rule->rule_label == -1 ? 0 : rule->rule_label;
+
+	/*
+	 * Apply the remaining options once after evaluation.
+	 */
+	if (matches == NULL) {
+		/* 'pass' or 'block' rule */
+		TAILQ_FOREACH(kv, &rule->rule_kvlist, kv_rule_entry) {
+			TAILQ_INSERT_TAIL(actions, kv, kv_entry);
+			TAILQ_REMOVE(&rule->rule_kvlist, kv, kv_rule_entry);
+		}
+	} else {
+		/* 'match' rule */
+		TAILQ_FOREACH(kv, matches, kv_match_entry) {
+			TAILQ_INSERT_TAIL(actions, kv, kv_entry);
 		}
 	}
 
-	if (rule->rule_tag)
-		con->se_tag = rule->rule_tag;
+	return (0);
+}
 
-	if (rule->rule_label)
-		con->se_label = rule->rule_label;
+int
+relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
+{
+	struct rsession		*con = cre->con;
+	struct http_descriptor	*desc = cre->desc;
+	struct kv		*host = NULL;
+	const char		*value;
+	struct kv		*kv, *match, *kp, *mp, kvcopy, matchcopy;
+	int			 httpindex, addkv, ret;
+	char			 buf[IBUF_READ_SIZE], *ptr;
+	enum httpheader		 hdrid;
 
+	ret = -1;
+	kp = mp = NULL;
 	TAILQ_FOREACH(kv, actions, kv_entry) {
+		kp = NULL;
 		match = kv->kv_match;
 		httpindex = addkv = 0;
 
-		switch (kv->kv_action) {
-		case KEY_ACTION_APPEND:
+		/*
+		 * Although marked as deleted, give a chance to non-critical
+		 * actions, ie. log, to be performed
+		 */
+		if (match != NULL && (match->kv_flags & KV_FLAG_INVALID))
+			goto matchdel;
+
+		switch (kv->kv_option) {
+		case KEY_OPTION_APPEND:
+		case KEY_OPTION_SET:
 			switch (kv->kv_type) {
 			case KEY_TYPE_PATH:
-				if (kv_setkey(match, "%s%s", match->kv_key,
-				    kv->kv_key) == -1)
-					return (-1);
+				if (kv->kv_option == KEY_OPTION_APPEND) {
+					if (kv_setkey(match, "%s%s",
+					    match->kv_key, kv->kv_key) == -1)
+						goto fail;
+				} else {
+					if (kv_setkey(match, "%s",
+					    kv->kv_value) == -1)
+						goto fail;
+				}
 				break;
-			default:
-				if (match == NULL)
-					addkv = 1;
-				else if (match->kv_value == NULL &&
-				    kv_set(match, "%s", kv->kv_value) == -1)
-					return (-1);
-				else if (kv_set(match, "%s,%s",
-				    match->kv_value, kv->kv_value) == -1)
-					return (-1);
-				httpindex = 1;
-				break;
-			}
-			break;
-		case KEY_ACTION_SET:
-			switch (kv->kv_type) {
 			case KEY_TYPE_COOKIE:
-				if (kv_setkey(match, "%s", kv->kv_key) == -1 ||
-				    kv_set(match, "%s", kv->kv_value) == -1)
-					return (-1);
-				break;
-			case KEY_TYPE_PATH:
-				if (kv_setkey(match, "%s", kv->kv_value) == -1)
-					return (-1);
+				kp = &kvcopy;
+				if (kv_inherit(kp, kv) == NULL)
+					goto fail;
+				if (kv_set(kp, "%s=%s;", kp->kv_key,
+				    kp->kv_value) == -1)
+					goto fail;
+				if (kv->kv_header_id >= HTTP_HEADER_MAX ||
+				    kv->kv_header_id <= HTTP_HEADER_NONE)
+					goto fail;
+				if (kv_setkey(kp, "%s",
+				    relay_httpheader_byid(kp->kv_header_id)) ==
+				    -1)
+					goto fail;
+				/* FALLTHROUGH cookie is a header */
+			case KEY_TYPE_HEADER:
+				httpindex = 1;
+				if (match == NULL) {
+					addkv = 1;
+					break;
+				}
+				if (match->kv_value == NULL ||
+				    kv->kv_option == KEY_OPTION_SET) {
+					if (kv_set(match, "%s",
+					    kv->kv_value) == -1)
+						goto fail;
+				} else {
+					if (kv_setkey(match, "%s,%s",
+					    match->kv_key, kv->kv_key) == -1)
+						goto fail;
+				}
 				break;
 			default:
-				if (match == NULL)
-					addkv = 1;
-				else if (kv_set(match, "%s",
-				    kv->kv_value) == -1)
-					return (-1);
-				httpindex = 1;
+				/* query, url not supported */
 				break;
 			}
 			break;
-		case KEY_ACTION_REMOVE:
+		case KEY_OPTION_REMOVE:
 			switch (kv->kv_type) {
 			case KEY_TYPE_PATH:
 				if (kv_setkey(match, "/") == -1)
-					return (-1);
+					goto fail;
+				break;
+			case KEY_TYPE_COOKIE:
+			case KEY_TYPE_HEADER:
+				if (kv->kv_matchlist != NULL)
+					match->kv_flags |= KV_FLAG_INVALID;
+				else
+					kv_free(match);
+				if (kv->kv_matchptr)
+					*kv->kv_matchptr = NULL;
+				match = kv->kv_match = NULL;
 				break;
 			default:
-				if (kv->kv_matchlist != NULL)
-					kv_delete(kv->kv_matchlist, match);
-				else {
-					free(match->kv_value);
-					match->kv_value = NULL;
-				}
-				if (kv->kv_matchptr != NULL)
-					*kv->kv_matchptr = NULL;
+				/* query and url not supported */
 				break;
 			}
 			break;
-		case KEY_ACTION_HASH:
+		case KEY_OPTION_HASH:
 			switch (kv->kv_type) {
 			case KEY_TYPE_PATH:
 				value = match->kv_key;
@@ -1447,46 +1512,104 @@ relay_action(struct ctl_relay_event *cre, struct relay_rule *rule,
 			log_debug("%s: hashkey 0x%04x", __func__,
 			    con->se_hashkey);
 			break;
-		case KEY_ACTION_LOG:
-			switch (kv->kv_type) {
-			case KEY_TYPE_URL:
-				if (kv_setkey(match, "%s", kv->kv_key) == -1)
-					return (-1);
-				break;
-			default:
-				break;
-			}
-			kv_log(con->se_log, match, rule->rule_label);
+		case KEY_OPTION_LOG:
+			/* perform this later */
 			break;
 		default:
 			fatalx("relay_action: invalid action");
 			/* NOTREACHED */
 		}
 
+		/* from now on, reads from kp writes to kv */
+		if (kp == NULL)
+			kp = kv;
 		if (addkv && kv->kv_matchlist != NULL) {
 			/* Add new entry to the list (eg. new HTTP header) */
-			if ((match = kv_add(kv->kv_matchlist,
-			    kv->kv_key, kv->kv_value)) == NULL)
-				return (-1);
-			match->kv_action = kv->kv_action;
-			match->kv_type = kv->kv_type;
+			if ((match = kv_add(kv->kv_matchlist, kp->kv_key,
+			    kp->kv_value)) == NULL)
+				goto fail;
+			match->kv_option = kp->kv_option;
+			match->kv_type = kp->kv_type;
 			kv->kv_match = match;
 		}
-
 		if (httpindex && kv->kv_matchptr != NULL) {
 			/* Re-index the fast lookup method */
-			if ((hdrid = relay_httpheader_byname(kv->kv_key)) ==
+			if ((hdrid = relay_httpheader_byname(kp->kv_key)) !=
 			    HTTP_HEADER_OTHER) {
-				match->kv_action = kv->kv_action;
-				match->kv_type = kv->kv_type;
 				desc->http_header[hdrid] = match;
 				kv->kv_matchptr = &desc->http_header[hdrid];
 			} else
 				kv->kv_matchptr = NULL;
 		}
+		if (match != NULL && kp->kv_flags & KV_FLAG_MACRO) {
+			bzero(buf, sizeof(buf));
+			if ((ptr = relay_expand_http(cre, kp->kv_value, buf,
+			    sizeof(buf))) == NULL)
+				goto fail;
+			if (kv_set(match, ptr) == -1)
+				goto fail;
+		}
+ matchdel:
+		switch(kv->kv_option) {
+		case KEY_OPTION_LOG:
+			if (match == NULL)
+				break;
+			mp = &matchcopy;
+			if (kv_inherit(mp, match) == NULL)
+				goto fail;
+			if (mp->kv_flags & KV_FLAG_INVALID) {
+				if (kv_set(mp, "%s*removed*",
+				   mp->kv_value) == -1)
+					goto fail;
+			}
+			switch(kv->kv_type) {
+			case KEY_TYPE_URL:
+				host = desc->http_header[HTTP_HEADER_HOST];
+				switch (kv->kv_digest) {
+				case DIGEST_NONE:
+					if (host == NULL ||
+					    host->kv_value == NULL)
+						break;
+					if (kv_setkey(mp, "%s%s",
+					    host->kv_value, mp->kv_key) ==
+					    -1)
+						goto fail;
+					break;
+				default:
+					if (kv_setkey(mp, "%s", kv->kv_key)
+					    == -1)
+						goto fail;
+					break;
+				}
+				break;
+			default:
+				break;
+			}
+			if (kv_log(con->se_log, mp, con->se_label) == -1)
+				goto fail;
+			break;
+		default:
+			break;
+		}
+
+		/* actions applied, cleanup kv */
+		kv->kv_match = NULL;
+		kv->kv_matchlist = NULL;
+		TAILQ_REMOVE(actions, kv, kv_match_entry);
+
+		kv_free(&kvcopy);
+		if (mp != NULL) {
+			kv_free(mp);
+			mp = NULL;
+		}
 	}
 
-	return (0);
+	ret = 0;
+ fail:
+	kv_free(&kvcopy);
+	kv_free(&matchcopy);
+
+	return (ret);
 }
 
 #define	RELAY_GET_SKIP_STEP(i)						\
@@ -1509,68 +1632,89 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 	struct relay_rule	*r = NULL, *rule = NULL;
 	u_int			 cnt = 0;
 	u_int			 action = RES_PASS;
-	struct kvlist		 actions;
+	struct kvlist		 actions, matches;
+	struct kv		*kv;
 
 	con = cre->con;
-
-	DPRINTF("%s: session %d: start", __func__, con->se_id);
+	TAILQ_INIT(&actions);
 
 	r = TAILQ_FIRST(&proto->rules);
 	while (r != NULL) {
 		cnt++;
-		TAILQ_INIT(&actions);
+		TAILQ_INIT(&matches);
+		TAILQ_INIT(&r->rule_kvlist);
 		if (r->rule_dir && r->rule_dir != cre->dir)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_DIR);
 		else if (proto->type != r->rule_proto)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_PROTO);
 		else if (r->rule_af != AF_UNSPEC &&
-		    cre->ss.ss_family != r->rule_af)
+		    (cre->ss.ss_family != r->rule_af ||
+		     cre->dst->ss.ss_family != r->rule_af))
 			RELAY_GET_SKIP_STEP(RULE_SKIP_AF);
 		else if (RELAY_ADDR_CMP(&r->rule_src, &cre->ss) != 0)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_SRC);
-		else if (RELAY_ADDR_CMP(&r->rule_dst, &cre->ss) != 0)
+		else if (RELAY_ADDR_CMP(&r->rule_dst, &cre->dst->ss) != 0)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_DST);
 		else if (r->rule_method != HTTP_METHOD_NONE &&
-		    (cre->dir != RELAY_DIR_REQUEST ||
-		    desc->http_method != r->rule_method))
+		    (desc->http_method == HTTP_METHOD_RESPONSE ||
+		     desc->http_method != r->rule_method))
 			RELAY_GET_SKIP_STEP(RULE_SKIP_METHOD);
 		else if (r->rule_tagged && con->se_tag != r->rule_tagged)
 			RELAY_GET_NEXT_STEP;
-		else if (relay_httpheader_test(cre, r, &actions) != 0)
+		else if (relay_httpheader_test(cre, r, &matches) != 0)
 			RELAY_GET_NEXT_STEP;
-		else if (relay_httpquery_test(cre, r, &actions) != 0)
+		else if (relay_httpquery_test(cre, r, &matches) != 0)
 			RELAY_GET_NEXT_STEP;
-		else if (relay_httppath_test(cre, r, &actions) != 0)
+		else if (relay_httppath_test(cre, r, &matches) != 0)
 			RELAY_GET_NEXT_STEP;
-		else if (relay_httpurl_test(cre, r, &actions) != 0)
+		else if (relay_httpurl_test(cre, r, &matches) != 0)
 			RELAY_GET_NEXT_STEP;
-		else if (relay_httpcookie_test(cre, r, &actions) != 0)
+		else if (relay_httpcookie_test(cre, r, &matches) != 0)
 			RELAY_GET_NEXT_STEP;
 		else {
+			DPRINTF("%s: session %d: matched rule %d",
+			    __func__, con->se_id, r->rule_id);
+
+			if (r->rule_action == RULE_ACTION_MATCH) {
+				if (relay_match_actions(cre, r, &matches,
+				    &actions) != 0) {
+					/* Something bad happened, drop */
+					action = RES_DROP;
+					break;
+				}
+				RELAY_GET_NEXT_STEP;
+			} else if (r->rule_action == RULE_ACTION_BLOCK)
+				action = RES_DROP;
+			else if (r->rule_action == RULE_ACTION_PASS)
+				action = RES_PASS;
+
 			/* Rule matched */
 			rule = r;
 
-			DPRINTF("%s: session %d: matched rule %d",
-			    __func__, con->se_id, rule->rule_id);
-
-			if (relay_action(cre, r, &actions) != 0) {
-				/* Something bad happened, drop connection */
-				action = RES_DROP;
-				break;
+			/* Temporarily save actions */
+			TAILQ_FOREACH(kv, &matches, kv_match_entry) {
+				TAILQ_INSERT_TAIL(&rule->rule_kvlist,
+				    kv, kv_rule_entry);
 			}
-
-			if (r->rule_type == RULE_TYPE_BLOCK)
-				action = RES_DROP;
-			else if (r->rule_type == RULE_TYPE_PASS)
-				action = RES_PASS;
 
 			if (rule->rule_flags & RULE_FLAG_QUICK)
 				break;
 
-nextrule:
+ nextrule:
 			/* Continue to find last matching policy */
 			r = TAILQ_NEXT(r, rule_entry);
 		}
+	}
+
+	if (rule != NULL &&
+	    relay_match_actions(cre, rule, NULL, &actions) != 0) {
+		/* Something bad happened, drop */
+		action = RES_DROP;
+	}
+
+	if (relay_apply_actions(cre, &actions) != 0) {
+		/* Something bad happened, drop */
+		action = RES_DROP;
 	}
 
 	DPRINTF("%s: session %d: action %d", __func__,
@@ -1623,9 +1767,9 @@ void
 relay_match(struct kvlist *actions, struct kv *kv, struct kv *match,
     struct kvlist *matchlist)
 {
-	if (kv->kv_action != KEY_ACTION_NONE) {
+	if (kv->kv_option != KEY_OPTION_NONE) {
 		kv->kv_match = match;
 		kv->kv_matchlist = matchlist;
-		TAILQ_INSERT_TAIL(actions, kv, kv_entry);
+		TAILQ_INSERT_TAIL(actions, kv, kv_match_entry);
 	}
 }

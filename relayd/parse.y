@@ -1,7 +1,7 @@
-/*	$OpenBSD: parse.y,v 1.182 2014/05/12 14:28:22 andre Exp $	*/
+/*	$OpenBSD: parse.y,v 1.183 2014/06/25 11:05:15 reyk Exp $	*/
 
 /*
- * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
@@ -110,11 +110,13 @@ struct relaylist	 relays;
 static struct protocol	*proto = NULL;
 static struct relay_rule *rule = NULL;
 static struct router	*router = NULL;
-static u_int16_t	 label = 0;
-static u_int16_t	 tag = 0;
+static int		 label = 0;
+static int		 tagged = 0;
+static int		 tag = 0;
 static in_port_t	 tableport = 0;
 static int		 dstmode;
-static enum keytype	 keytype = KEY_TYPE_NONE;
+static enum key_type	 keytype = KEY_TYPE_NONE;
+static enum direction	 dir = RELAY_DIR_ANY;
 static char		*rulefile = NULL;
 
 struct address	*host_v4(const char *);
@@ -174,7 +176,7 @@ typedef struct {
 %type	<v.number>	dstmode flag forwardmode retry
 %type	<v.number>	optssl optsslclient sslcache
 %type	<v.number>	redirect_proto relay_proto match
-%type	<v.number>	action ruleaf keyaction
+%type	<v.number>	action ruleaf key_option
 %type	<v.port>	port
 %type	<v.host>	host
 %type	<v.addr>	address
@@ -1082,7 +1084,7 @@ filterrule	: action dir quick ruleaf rulesrc ruledst {
 			if ((rule = calloc(1, sizeof(*rule))) == NULL)
 				fatal("out of memory");
 
-			rule->rule_type = $1;
+			rule->rule_action = $1;
 			rule->rule_proto = proto->type;
 			rule->rule_dir = $2;
 			rule->rule_flags |= $3;
@@ -1090,30 +1092,40 @@ filterrule	: action dir quick ruleaf rulesrc ruledst {
 
 			rulefile = NULL;
 		} ruleopts_l {
-			if (rule_add(keytype, proto, rule, rulefile) == -1) {
-				if (rulefile == NULL)
+			if (rule_add(proto, rule, rulefile) == -1) {
+				if (rulefile == NULL) {
 					yyerror("failed to load rule");
-				else
+				} else {
 					yyerror("failed to load rules from %s",
 					    rulefile);
+					free(rulefile);
+				}
 				rule_free(rule);
-				free(rulefile);
 				free(rule);
 				YYERROR;
 			}
-			free(rulefile);
+			if (rulefile)
+				free(rulefile);
 			rulefile = NULL;
+			rule = NULL;
+			keytype = KEY_TYPE_NONE;
 		}
 		;
 
-action		: PASS				{ $$ = RULE_TYPE_PASS; }
-		| BLOCK				{ $$ = RULE_TYPE_BLOCK; }
-		| MATCH				{ $$ = RULE_TYPE_MATCH; }
+action		: PASS				{ $$ = RULE_ACTION_PASS; }
+		| BLOCK				{ $$ = RULE_ACTION_BLOCK; }
+		| MATCH				{ $$ = RULE_ACTION_MATCH; }
 		;
 
-dir		: /* empty */			{ $$ = RELAY_DIR_ANY; }
-		| REQUEST			{ $$ = RELAY_DIR_REQUEST; }
-		| RESPONSE			{ $$ = RELAY_DIR_RESPONSE; }
+dir		: /* empty */			{
+			$$ = dir = RELAY_DIR_REQUEST;
+		}
+		| REQUEST			{
+			$$ = dir = RELAY_DIR_REQUEST;
+		}
+		| RESPONSE			{
+			$$ = dir = RELAY_DIR_RESPONSE;
+		}
 		;
 
 quick		: /* empty */			{ $$ = 0; }
@@ -1149,70 +1161,147 @@ ruleopts	: METHOD STRING					{
 				YYERROR;
 			}
 			rule->rule_method = id;
+			free($2);
 		}
-		| COOKIE keyaction STRING value			{
+		| COOKIE key_option STRING value		{
 			keytype = KEY_TYPE_COOKIE;
-			rule->rule_kv[keytype].kv_action = $2;
-			rule->rule_kv[keytype].kv_key = $3;
-			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_key = strdup($3);
+			rule->rule_kv[keytype].kv_option = $2;
+			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
+			    strdup($4) : strdup("*"));
+			if (rule->rule_kv[keytype].kv_key == NULL ||
+			    rule->rule_kv[keytype].kv_value == NULL)
+				fatal("out of memory");
+			free($3);
+			if ($4)
+				free($4);
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| COOKIE keyaction				{
+		| COOKIE key_option				{
 			keytype = KEY_TYPE_COOKIE;
-			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_option = $2;
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| HEADER keyaction STRING value			{
+		| HEADER key_option STRING value		{
 			keytype = KEY_TYPE_HEADER;
 			memset(&rule->rule_kv[keytype], 0,
 			    sizeof(rule->rule_kv[keytype]));
 			rule->rule_kv[keytype].kv_header_id =
 			    relay_httpheader_byname($3);
-			rule->rule_kv[keytype].kv_action = $2;
-			rule->rule_kv[keytype].kv_key = $3;
-			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_option = $2;
+			rule->rule_kv[keytype].kv_key = strdup($3);
+			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
+			    strdup($4) : strdup("*"));
+			if (rule->rule_kv[keytype].kv_key == NULL ||
+			    rule->rule_kv[keytype].kv_value == NULL)
+				fatal("out of memory");
+			free($3);
+			if ($4)
+				free($4);
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| HEADER keyaction				{
+		| HEADER key_option				{
 			keytype = KEY_TYPE_HEADER;
-			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_option = $2;
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| PATH keyaction STRING value			{
+		| PATH key_option STRING value			{
 			keytype = KEY_TYPE_PATH;
-			rule->rule_kv[keytype].kv_action = $2;
-			rule->rule_kv[keytype].kv_key = $3;
-			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_option = $2;
+			rule->rule_kv[keytype].kv_key = strdup($3);
+			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
+			    strdup($4) : strdup("*"));
+			if (rule->rule_kv[keytype].kv_key == NULL ||
+			    rule->rule_kv[keytype].kv_value == NULL)
+				fatal("out of memory");
+			free($3);
+			if ($4)
+				free($4);
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| PATH keyaction				{
+		| PATH key_option				{
 			keytype = KEY_TYPE_PATH;
-			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_option = $2;
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| QUERYSTR keyaction STRING value		{
+		| QUERYSTR key_option STRING value		{
+			switch ($2) {
+			case KEY_OPTION_APPEND:
+			case KEY_OPTION_SET:
+			case KEY_OPTION_REMOVE:
+				yyerror("combining query type and the given "
+				    "option is not supported");
+				free($3);
+				if ($4)
+					free($4);
+				YYERROR;
+				break;
+			}
 			keytype = KEY_TYPE_QUERY;
-			rule->rule_kv[keytype].kv_action = $2;
-			rule->rule_kv[keytype].kv_key = $3;
-			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_option = $2;
+			rule->rule_kv[keytype].kv_key = strdup($3);
+			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
+			    strdup($4) : strdup("*"));
+			if (rule->rule_kv[keytype].kv_key == NULL ||
+			    rule->rule_kv[keytype].kv_value == NULL)
+				fatal("out of memory");
+			free($3);
+			if ($4)
+				free($4);
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| QUERYSTR keyaction				{
+		| QUERYSTR key_option				{
+			switch ($2) {
+			case KEY_OPTION_APPEND:
+			case KEY_OPTION_SET:
+			case KEY_OPTION_REMOVE:
+				yyerror("combining query type and the given "
+				    "option is not supported");
+				YYERROR;
+				break;
+			}
 			keytype = KEY_TYPE_QUERY;
-			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_option = $2;
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| URL keyaction optdigest value			{
+		| URL key_option optdigest value			{
+			switch ($2) {
+			case KEY_OPTION_APPEND:
+			case KEY_OPTION_SET:
+			case KEY_OPTION_REMOVE:
+				yyerror("combining url type and the given "
+				"option is not supported");
+				free($3.digest);
+				free($4);
+				YYERROR;
+				break;
+			}
 			keytype = KEY_TYPE_URL;
-			rule->rule_kv[keytype].kv_action = $2;
-			rule->rule_kv[keytype].kv_key = $3.digest;
+			rule->rule_kv[keytype].kv_option = $2;
+			rule->rule_kv[keytype].kv_key = strdup($3.digest);
 			rule->rule_kv[keytype].kv_digest = $3.type;
-			rule->rule_kv[keytype].kv_value = $4;
+			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
+			    strdup($4) : strdup("*"));
+			if (rule->rule_kv[keytype].kv_key == NULL ||
+			    rule->rule_kv[keytype].kv_value == NULL)
+				fatal("out of memory");
+			free($3.digest);
+			if ($4)
+				free($4);
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
-		| URL keyaction					{
+		| URL key_option					{
+			switch ($2) {
+			case KEY_OPTION_APPEND:
+			case KEY_OPTION_SET:
+			case KEY_OPTION_REMOVE:
+				yyerror("combining url type and the given "
+				    "option is not supported");
+				YYERROR;
+				break;
+			}
 			keytype = KEY_TYPE_URL;
-			rule->rule_kv[keytype].kv_action = $2;
+			rule->rule_kv[keytype].kv_option = $2;
 			rule->rule_kv[keytype].kv_type = keytype;
 		}
 		| FORWARD TO table				{
@@ -1228,77 +1317,109 @@ ruleopts	: METHOD STRING					{
 				free($3);
 				YYERROR;
 			}
-			rule->rule_flags |= RULE_FLAG_FORWARD_TABLE;
 			free($3);
 		}
-		| LABEL STRING					{
-			if (rule->rule_label) {
-				yyerror("label already defined");
-				free($2);
-				YYERROR;
-			}
-			label = label_name2id($2);
-			rule->rule_label = label;
-			free($2);
-			if (label == 0) {
-				yyerror("invalid label");
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-		}
-		| NO LABEL					{
-			if (rule->rule_label) {
-				yyerror("label already defined");
-				YYERROR;
-			}
-			rule->rule_label = 0;
-		}
 		| TAG STRING					{
+			tag = tag_name2id($2);
 			if (rule->rule_tag) {
 				yyerror("tag already defined");
 				free($2);
-				YYERROR;
-			}
-			tag = tag_name2id($2);
-			rule->rule_tag = tag;
-			free($2);
-			if (tag == 0) {
-				yyerror("invalid tag");
 				rule_free(rule);
 				free(rule);
 				YYERROR;
 			}
+			if (tag == 0) {
+				yyerror("invalid tag");
+				free($2);
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+			rule->rule_tag = tag;
+			if (strlcpy(rule->rule_tagname, $2,
+			    sizeof(rule->rule_tagname)) >=
+			    sizeof(rule->rule_tagname)) {
+				yyerror("tag truncated");
+				free($2);
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+			free($2);
 		}
 		| NO TAG					{
-			if (rule->rule_tag) {
-				yyerror("tag already defined");
+			if (tag == 0) {
+				yyerror("no tag defined");
 				YYERROR;
 			}
-			rule->rule_tag = 0;
+			rule->rule_tag = -1;
+			memset(rule->rule_tagname, 0,
+			    sizeof(rule->rule_tagname));
 		}
 		| TAGGED STRING					{
+			tagged = tag_name2id($2);
 			if (rule->rule_tagged) {
 				yyerror("tagged already defined");
 				free($2);
-				YYERROR;
-			}
-			tag = tag_name2id($2);
-			rule->rule_tagged = tag;
-			free($2);
-			if (tag == 0) {
-				yyerror("invalid tag");
 				rule_free(rule);
 				free(rule);
 				YYERROR;
 			}
-		}
-		| NO TAGGED					{
-			if (rule->rule_tagged) {
-				yyerror("tagged already defined");
+			if (tagged == 0) {
+				yyerror("invalid tag");
+				free($2);
+				rule_free(rule);
+				free(rule);
 				YYERROR;
 			}
-			rule->rule_tagged = 0;
+			rule->rule_tagged = tagged;
+			if (strlcpy(rule->rule_taggedname, $2,
+			    sizeof(rule->rule_taggedname)) >=
+			    sizeof(rule->rule_taggedname)) {
+				yyerror("tagged truncated");
+				free($2);
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+			free($2);
+		}
+		| LABEL STRING					{
+			label = label_name2id($2);
+			if (rule->rule_label) {
+				yyerror("label already defined");
+				free($2);
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+			if (label == 0) {
+				yyerror("invalid label");
+				free($2);
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+			rule->rule_label = label;
+			if (strlcpy(rule->rule_labelname, $2,
+			    sizeof(rule->rule_labelname)) >=
+			    sizeof(rule->rule_labelname)) {
+				yyerror("label truncated");
+				free($2);
+				rule_free(rule);
+				free(rule);
+				YYERROR;
+			}
+			free($2);
+		}
+		| NO LABEL					{
+			if (label == 0) {
+				yyerror("no label defined");
+				YYERROR;
+			}
+			rule->rule_label = -1;
+			memset(rule->rule_labelname, 0,
+			    sizeof(rule->rule_labelname));
 		}
 		| FILENAME STRING value				{
 			if (rulefile != NULL) {
@@ -1309,7 +1430,13 @@ ruleopts	: METHOD STRING					{
 				free(rule);
 				YYERROR;
 			}
-			rule->rule_kv[keytype].kv_value = $3;
+			if ($3) {
+				if ((rule->rule_kv[keytype].kv_value =
+				    strdup($3)) == NULL)
+					fatal("out of memory");
+				free($3);
+			} else
+				rule->rule_kv[keytype].kv_value = NULL;
 			rulefile = $2;
 		}
 		;
@@ -1318,12 +1445,12 @@ value		: /* empty */		{ $$ = NULL; }
 		| VALUE STRING		{ $$ = $2; }
 		;
 
-keyaction	: /* empty */		{ $$ = KEY_ACTION_NONE; }
-		| APPEND		{ $$ = KEY_ACTION_APPEND; }
-		| SET			{ $$ = KEY_ACTION_SET; }
-		| REMOVE		{ $$ = KEY_ACTION_REMOVE; }
-		| HASH			{ $$ = KEY_ACTION_HASH; }
-		| LOG			{ $$ = KEY_ACTION_LOG; }
+key_option	: /* empty */		{ $$ = KEY_OPTION_NONE; }
+		| APPEND		{ $$ = KEY_OPTION_APPEND; }
+		| SET			{ $$ = KEY_OPTION_SET; }
+		| REMOVE		{ $$ = KEY_OPTION_REMOVE; }
+		| HASH			{ $$ = KEY_OPTION_HASH; }
+		| LOG			{ $$ = KEY_OPTION_LOG; }
 		;
 
 relay		: RELAY STRING	{

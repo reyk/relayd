@@ -58,11 +58,16 @@ sub new {
 sub child {
 	my $self = shift;
 
+	if ($self->{mreqs}) {
+		print STDERR "connection per request\n";
+		return;
+	}
 	my $iosocket = $self->{ssl} ? "IO::Socket::SSL" : "IO::Socket::INET6";
 	my $as = $self->{ls}->accept()
 	    or die ref($self), " $iosocket socket accept failed: $!";
 	print STDERR "accept sock: ",$as->sockhost()," ",$as->sockport(),"\n";
 	print STDERR "accept peer: ",$as->peerhost()," ",$as->peerport(),"\n";
+	print STDERR "single connection\n";
 
 	*STDIN = *STDOUT = $self->{as} = $as;
 }

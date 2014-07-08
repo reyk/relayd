@@ -9,6 +9,7 @@ our %args = (
 	func => \&http_client,
 	lengths => \@lengths,
 	ssl => 1,
+	mreqs => 1
     },
     relayd => {
 	protocol => [ "http",
@@ -22,6 +23,7 @@ our %args = (
     server => {
 	func => \&http_server,
 	ssl => 1,
+	mreqs => scalar(@lengths),
     },
     lengths => \@lengths,
 );

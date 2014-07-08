@@ -44,6 +44,10 @@ sub new {
 sub child {
 	my $self = shift;
 
+	if ($self->{mreqs}) {
+		print STDERR "connection per request\n";
+		return;
+	}
 	$SSL_ERROR = "";
 	my $iosocket = $self->{ssl} ? "IO::Socket::SSL" : "IO::Socket::INET6";
 	my $cs = $iosocket->new(
@@ -55,6 +59,7 @@ sub child {
 	) or die ref($self), " $iosocket socket connect failed: $!,$SSL_ERROR";
 	print STDERR "connect sock: ",$cs->sockhost()," ",$cs->sockport(),"\n";
 	print STDERR "connect peer: ",$cs->peerhost()," ",$cs->peerport(),"\n";
+	print STDERR "single connection\n";
 
 	*STDIN = *STDOUT = $self->{cs} = $cs;
 }

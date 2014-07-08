@@ -9,6 +9,7 @@ our %args = (
 	func => sub { eval { http_client(@_) }; warn $@ },
 	loggrep => qr/Client missing http 3 response/,
         lengths => \@lengths,
+	mreqs => 1,
     },
     relayd => {
 	protocol => [ "http",
@@ -19,6 +20,7 @@ our %args = (
     server => {
 	func => \&http_server,
 	lengths => (1, 2, 0),
+	mreqs => 3,
     },
 );
 

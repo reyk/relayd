@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.180 2014/05/20 17:33:36 reyk Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.181 2014/06/27 07:49:08 andre Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -238,16 +238,16 @@ struct ctl_stats {
 	u_int32_t		 last_day;
 };
 
-enum keyaction {
-	KEY_ACTION_NONE		= 0,
-	KEY_ACTION_APPEND,
-	KEY_ACTION_SET,
-	KEY_ACTION_REMOVE,
-	KEY_ACTION_HASH,
-	KEY_ACTION_LOG
+enum key_option {
+	KEY_OPTION_NONE		= 0,
+	KEY_OPTION_APPEND,
+	KEY_OPTION_SET,
+	KEY_OPTION_REMOVE,
+	KEY_OPTION_HASH,
+	KEY_OPTION_LOG
 };
 
-enum keytype {
+enum key_type {
 	KEY_TYPE_NONE		= 0,
 	KEY_TYPE_COOKIE,
 	KEY_TYPE_HEADER,
@@ -276,16 +276,22 @@ struct kv {
 	char			*kv_key;
 	char			*kv_value;
 
-	enum keyaction		 kv_action;
-	enum keytype		 kv_type;
+	enum key_type		 kv_type;
+	enum key_option		 kv_option;
 	enum digest_type	 kv_digest;
 	u_int			 kv_header_id;
+
+#define KV_FLAG_MACRO		 0x01
+#define KV_FLAG_INVALID		 0x02
+	u_int8_t		 kv_flags;
 
 	/* A few pointers used by the rule actions */
 	struct kv		*kv_match;
 	struct kvlist		*kv_matchlist;
 	struct kv		**kv_matchptr;
 
+	TAILQ_ENTRY(kv)		 kv_match_entry;
+	TAILQ_ENTRY(kv)		 kv_rule_entry;
 	TAILQ_ENTRY(kv)		 kv_entry;
 };
 TAILQ_HEAD(kvlist, kv);
@@ -526,10 +532,10 @@ enum relay_result {
 	RES_FAIL		= -1
 };
 
-enum rule_type {
-	RULE_TYPE_MATCH		= 0,
-	RULE_TYPE_PASS,
-	RULE_TYPE_BLOCK
+enum rule_action {
+	RULE_ACTION_MATCH	= 0,
+	RULE_ACTION_PASS,
+	RULE_ACTION_BLOCK
 };
 
 struct rule_addr {
@@ -558,8 +564,7 @@ struct relay_rule {
 	objid_t			 rule_id;
 	objid_t			 rule_protoid;
 
-	u_int			 rule_type;
-
+	u_int			 rule_action;
 #define RULE_SKIP_PROTO		 0
 #define RULE_SKIP_DIR		 1
 #define RULE_SKIP_AF		 2
@@ -570,26 +575,27 @@ struct relay_rule {
 	struct relay_rule	*rule_skip[RULE_SKIP_COUNT];
 
 #define RULE_FLAG_QUICK		0x01
-#define RULE_FLAG_FORWARD_TABLE	0x02
 	u_int8_t		 rule_flags;
 
-	u_int16_t		 rule_label;
-	u_int16_t		 rule_tag;
-	u_int16_t		 rule_tagged;
+	int			 rule_label;
+	int			 rule_tag;
+	int			 rule_tagged;
 	enum direction		 rule_dir;
 	u_int			 rule_proto;
 	int			 rule_af;
 	struct rule_addr	 rule_src;
 	struct rule_addr	 rule_dst;
+	struct relay_table	*rule_table;
 
 	u_int			 rule_method;
-	char			 rule_tablename[TABLE_NAME_SIZE];
 	char			 rule_labelname[LABEL_NAME_SIZE];
-	char			 rule_tagname[TAG_NAME_SIZE];
+	char			 rule_tablename[TABLE_NAME_SIZE];
 	char			 rule_taggedname[TAG_NAME_SIZE];
+	char			 rule_tagname[TAG_NAME_SIZE];
 
 	struct ctl_rule		 rule_ctl;
 	struct kv		 rule_kv[KEY_TYPE_MAX];
+	struct kvlist		 rule_kvlist;
 
 	TAILQ_ENTRY(relay_rule)	 rule_entry;
 };
@@ -1130,6 +1136,8 @@ u_int	 relay_httpmethod_byname(const char *);
 const char
 	*relay_httpmethod_byid(u_int);
 u_int	 relay_httpheader_byname(const char *);
+const char
+	*relay_httpheader_byid(u_int id);
 int	 relay_httpdesc_init(struct ctl_relay_event *);
 
 /* relay_udp.c */
@@ -1210,8 +1218,8 @@ void		*get_data(u_int8_t *, size_t);
 int		 sockaddr_cmp(struct sockaddr *, struct sockaddr *, int);
 struct in6_addr *prefixlen2mask6(u_int8_t, u_int32_t *);
 u_int32_t	 prefixlen2mask(u_int8_t);
-int		 accept_reserve(int sockfd, struct sockaddr *addr,
-		    socklen_t *addrlen, int reserve, volatile int *);
+int		 accept_reserve(int, struct sockaddr *, socklen_t *, int,
+		     volatile int *);
 struct kv	*kv_add(struct kvlist *, char *, char *);
 int		 kv_set(struct kv *, char *, ...);
 int		 kv_setkey(struct kv *, char *, ...);
@@ -1221,11 +1229,13 @@ void		 kv_purge(struct kvlist *);
 void		 kv_free(struct kv *);
 struct kv	*kv_inherit(struct kv *, struct kv *);
 int		 kv_log(struct evbuffer *, struct kv *, u_int16_t);
-int		 rule_add(enum keytype, struct protocol *,
-		    struct relay_rule *, const char *);
+int		 rule_add(struct protocol *, struct relay_rule *, const char
+		     *);
 void		 rule_delete(struct relay_rules *, struct relay_rule *);
 void		 rule_free(struct relay_rule *);
-struct relay_rule *rule_inherit(struct relay_rule *);
+struct relay_rule
+		*rule_inherit(struct relay_rule *);
+void		 rule_settable(struct relay_rules *, struct relay_table *);
 
 /* carp.c */
 int	 carp_demote_init(char *, int);

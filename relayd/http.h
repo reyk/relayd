@@ -54,8 +54,8 @@ struct http_method {
 };
 #define HTTP_METHODS		{			\
 	{ HTTP_METHOD_GET,		"GET" },	\
-	{ HTTP_METHOD_POST,		"POST" },	\
 	{ HTTP_METHOD_HEAD,		"HEAD" },	\
+	{ HTTP_METHOD_POST,		"POST" },	\
 	{ HTTP_METHOD_PUT,		"PUT" },	\
 	{ HTTP_METHOD_DELETE,		"DELETE" },	\
 	{ HTTP_METHOD_OPTIONS,		"OPTIONS" },	\

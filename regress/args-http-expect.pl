@@ -11,12 +11,12 @@ our %args = (
     relayd => {
 	protocol => [ "http",
 	    'block request',
-	    'pass request query log "foo" value "bar" ',
-	    'pass request query log "ok" ',
+	    'block request query log "ok"',
+	    'pass query log "foo" value "bar"',
 	],
 	loggrep => {
 		qr/\[foo: bar\]/ => 1,
-		qr/\[ok: yes\]/ => 1,
+		qr/\[ok: yes\]/ => 0,
 	},
     },
     server => {

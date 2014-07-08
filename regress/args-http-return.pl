@@ -13,7 +13,8 @@ our %args = (
 	protocol => [ "http",
 	    'return error',
 	    'pass',
-	    'block request query log "foo" value "bar" label "expect_foobar_return_test"',
+	    'block request query log "foo" value "bar" label \
+		"expect_foobar_return_test"',
 	],
 	loggrep => { 'Forbidden \(403 Forbidden\), \[expect_foobar_return_test, foo: bar\]' => 1 },
     },

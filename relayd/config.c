@@ -649,34 +649,9 @@ config_setrule(struct relayd *env, struct protocol *proto)
 		TAILQ_FOREACH(rule, &proto->rules, rule_entry) {
 			rule->rule_protoid = proto->id;
 			bzero(&rule->rule_ctl, sizeof(rule->rule_ctl));
-			c = sizeof(rule->rule_labelname);
-			bzero(rule->rule_labelname, c);
-			if (rule->rule_label != 0) {
-				if (strlcpy(rule->rule_labelname,
-				    label_id2name(rule->rule_label), c) >= c)
-					log_warnx("%s: label truncated",
-					    __func__);
-			}
-			c = sizeof(rule->rule_tagname);
-			bzero(rule->rule_tagname, c);
-			if (rule->rule_tag != 0) {
-				if (strlcpy(rule->rule_tagname,
-				    tag_id2name(rule->rule_tag), c) >= c)
-					log_warnx("%s: tag truncated",
-					    __func__);
-			}
-			c = sizeof(rule->rule_taggedname);
-			bzero(rule->rule_taggedname, c);
-			if (rule->rule_tagged != 0) {
-				if (strlcpy(rule->rule_taggedname,
-				    tag_id2name(rule->rule_tagged), c) >= c)
-					log_warnx("%s: tag truncated",
-					    __func__);
-			}
 			c = 0;
 			iov[c].iov_base = rule;
 			iov[c++].iov_len = sizeof(*rule);
-
 			for (i = 1; i < KEY_TYPE_MAX; i++) {
 				if (rule->rule_kv[i].kv_key != NULL) {
 					rule->rule_ctl.kvlen[i].key =
