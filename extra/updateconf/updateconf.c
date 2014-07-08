@@ -487,7 +487,7 @@ getdstmode(enum dstmode m)
 		return ("mode random");
 		break;
 	case RELAY_DSTMODE_LEASTSTATES:
-		return ("mode leaststates");
+		return ("mode least-states");
 		break;
 	case RELAY_DSTMODE_DEFAULT:
 	default:
