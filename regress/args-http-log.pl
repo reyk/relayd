@@ -9,9 +9,13 @@ our %args = (
     },
     relayd => {
 	protocol => [ "http",
-	    "match request header log foo",
-	    "match response header log bar",
+	    "match request header log Host",
+	    "match response header log Server",
 	],
+	loggrep => {
+	    qr/\[Host: foo.bar\]/ => 1,
+	    qr/\[Server: Perl\/[^\s]+\s*\]/ => 1,
+	},
     },
     server => {
 	func => \&http_server,

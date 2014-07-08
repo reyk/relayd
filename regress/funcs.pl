@@ -301,7 +301,7 @@ sub server_disconnect {
 
 sub http_server {
 	my $self = shift;
-	my %header = %{$self->{header} || {}};
+	my %header = %{$self->{header} || { Server => "Perl/".$^V }};
 	my $cookie = $self->{cookie} || "";
 	my $reqsc = $self->{mreqs} || 0;
 
