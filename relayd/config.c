@@ -753,9 +753,9 @@ config_getrule(struct relayd *env, struct imsg *imsg)
 		s += rule->rule_ctl.kvlen[_n]._f;			\
 		len -= rule->rule_ctl.kvlen[_n]._f;			\
 									\
-		DPRINTF("%s: %s %s (len %ld, action %d): %s", __func__,	\
+		DPRINTF("%s: %s %s (len %ld, option %d): %s", __func__,	\
 		    #_n, #_f, rule->rule_ctl.kvlen[_n]._f,		\
-		    rule->rule_kv[_n].kv_action,			\
+		    rule->rule_kv[_n].kv_option,			\
 		    rule->rule_kv[_n].kv_##_f);				\
 	}								\
 }
