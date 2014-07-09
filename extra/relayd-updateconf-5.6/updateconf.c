@@ -890,6 +890,7 @@ void
 protonode_opts_add(struct protocol *proto, struct protonode *pn)
 {
 	char	*mark = NULL;
+	char	*quick = NULL;
 	char	*buf = NULL;
 	char	 keyaction[64];
 	char	 ruleaction[64];
@@ -957,6 +958,7 @@ protonode_opts_add(struct protocol *proto, struct protonode *pn)
 		break;
 	case NODE_ACTION_FILTER:
 		snprintf(ruleaction, sizeof(ruleaction), "block ");
+		quick = "quick ";
 		break;
 	case NODE_ACTION_MARK:
 	case NODE_ACTION_NONE:
@@ -964,9 +966,10 @@ protonode_opts_add(struct protocol *proto, struct protonode *pn)
 		break;
 	}
 
-	(void)asprintf(&buf, "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+	(void)asprintf(&buf, "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
 	    !ruleaction[0] ? "match " : ruleaction,
 	    pn->dir == RELAY_DIR_REQUEST ? "request " : "response ",
+	    quick == NULL ? "" : quick,
 	    !keytype[0] ? "" : keytype,
 	    !keyaction[0] ? "" : keyaction,
 	    pn->flags & PNFLAG_DIGEST ? "digest " : "",
