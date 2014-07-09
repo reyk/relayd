@@ -31,7 +31,7 @@ configuration file of
 .Ox 5.5
 or older to the new filter grammar in
 .Ox 5.6
-or newer.
+or newer and prints it to standard output.
 .Sh FILES
 .Bl -tag -width "/etc/relayd.conf" -compact
 .It /etc/relayd.conf
@@ -48,3 +48,7 @@ The
 .Nm
 program was written by
 .An Andre de Oliveira .
+.Sh CAVEATS
+.Nm
+is provided as a convenience, but the resulting file must be inspected
+for correctness.
