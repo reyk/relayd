@@ -151,6 +151,9 @@ relay_ruledebug(struct relay_rule *rule)
 		break;
 	}
 
+	if (rule->rule_flags & RULE_FLAG_QUICK)
+		fprintf(stderr, "quick ");
+
 	for (i = 1; i < KEY_TYPE_MAX; i++) {
 		kv = &rule->rule_kv[i];
 		if (kv->kv_type != i)
