@@ -515,8 +515,8 @@ int
 relay_socket(struct sockaddr_storage *ss, in_port_t port,
     struct protocol *proto, int fd, int reuseport)
 {
-	int s = -1, val;
-	struct linger lng;
+	struct linger	lng;
+	int		s = -1, val;
 
 	if (relay_socket_af(ss, port) == -1)
 		goto bad;
@@ -923,9 +923,9 @@ relay_spliceadjust(struct ctl_relay_event *cre)
 void
 relay_error(struct bufferevent *bev, short error, void *arg)
 {
-	struct ctl_relay_event *cre = arg;
-	struct rsession *con = cre->con;
-	struct evbuffer *dst;
+	struct ctl_relay_event	*cre = arg;
+	struct rsession		*con = cre->con;
+	struct evbuffer		*dst;
 
 	if (error & EVBUFFER_TIMEOUT) {
 		if (cre->splicelen >= 0) {
@@ -994,13 +994,13 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 void
 relay_accept(int fd, short event, void *arg)
 {
-	struct relay *rlay = arg;
-	struct rsession *con = NULL;
-	struct ctl_natlook *cnl = NULL;
-	socklen_t slen;
-	struct timeval tv;
-	struct sockaddr_storage ss;
-	int s = -1;
+	struct relay		*rlay = arg;
+	struct rsession		*con = NULL;
+	struct ctl_natlook	*cnl = NULL;
+	socklen_t		 slen;
+	struct timeval		 tv;
+	struct sockaddr_storage	 ss;
+	int			 s = -1;
 
 	event_add(&rlay->rl_ev, NULL);
 	if ((event & EV_TIMEOUT))
