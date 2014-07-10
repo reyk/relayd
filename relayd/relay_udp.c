@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_udp.c,v 1.29 2014/06/25 11:05:15 reyk Exp $	*/
+/*	$OpenBSD: relay_udp.c,v 1.30 2014/07/09 16:42:05 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>

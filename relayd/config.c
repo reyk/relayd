@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.14 2014/05/04 16:38:19 reyk Exp $	*/
+/*	$OpenBSD: config.c,v 1.16 2014/07/09 23:30:34 reyk Exp $	*/
 
 /*
  * Copyright (c) 2011 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -760,6 +760,7 @@ config_getrule(struct relayd *env, struct imsg *imsg)
 	}								\
 }
 
+	memset(&rule->rule_kv[0], 0, sizeof(struct kv));
 	for (i = 1; i < KEY_TYPE_MAX; i++) {
 		GETKV(i, key);
 		GETKV(i, value);

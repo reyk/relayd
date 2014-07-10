@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.125 2014/06/27 07:49:08 andre Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.128 2014/07/10 00:05:59 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -714,14 +714,14 @@ kv_extend(struct kvlist *keys, char *value)
 	if ((kv = TAILQ_LAST(keys, kvlist)) == NULL)
 		return (NULL);
 
-	if (kv->kv_value == NULL) {
-		if ((kv->kv_value = strdup(value)) == NULL)
+	if (kv->kv_value != NULL) {
+		if (asprintf(&newvalue, "%s%s", kv->kv_value, value) == -1)
 			return (NULL);
-	} else if (asprintf(&newvalue, "%s%s", kv->kv_value, value) == -1)
-		return (NULL);
 
-	free(kv->kv_value);
-	kv->kv_value = newvalue;
+		free(kv->kv_value);
+		kv->kv_value = newvalue;
+	} else if ((kv->kv_value = strdup(value)) == NULL)
+		return (NULL);
 
 	return (kv);
 }
@@ -738,6 +738,8 @@ kv_purge(struct kvlist *keys)
 void
 kv_free(struct kv *kv)
 {
+	if (kv->kv_type == KEY_TYPE_NONE)
+		return;
 	if (kv->kv_key != NULL) {
 		free(kv->kv_key);
 	}
@@ -1561,13 +1563,12 @@ accept_reserve(int sockfd, struct sockaddr *addr, socklen_t *addrlen,
 	if (getdtablecount() + reserve +
 	    *counter >= getdtablesize()) {
 		errno = EMFILE;
-		return -1;
+		return (-1);
 	}
 
 	if ((ret = accept(sockfd, addr, addrlen)) > -1) {
 		(*counter)++;
-		DPRINTF("%s: inflight incremented, now %d",__func__,
-		    *counter);
+		DPRINTF("%s: inflight incremented, now %d",__func__, *counter);
 	}
-	return ret;
+	return (ret);
 }

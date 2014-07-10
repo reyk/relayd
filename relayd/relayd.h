@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.181 2014/06/27 07:49:08 andre Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.182 2014/07/09 16:42:05 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
