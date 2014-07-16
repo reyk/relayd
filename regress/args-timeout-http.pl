@@ -7,6 +7,7 @@ our %args = (
     client => {
 	func => \&http_client,
 	len => 5,
+	timefile => "",
     },
     relayd => {
 	protocol => [ "http" ],
@@ -16,8 +17,8 @@ our %args = (
 	func => sub {
 	    errignore();
 	    http_server(@_);
-	    sleep 5;
-	    write_char(@_, 5);
+	    sleep 4;
+	    write_char(@_, 4);
 	},
 	sleep => 1,
 	down => "Broken pipe",

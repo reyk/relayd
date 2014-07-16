@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.16 2014/07/09 23:30:34 reyk Exp $	*/
+/*	$OpenBSD: config.c,v 1.18 2014/07/11 16:59:38 reyk Exp $	*/
 
 /*
  * Copyright (c) 2011 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -118,6 +118,7 @@ config_init(struct relayd *env)
 		    SSLCIPHERS_DEFAULT,
 		    sizeof(env->sc_proto_default.sslciphers));
 		env->sc_proto_default.sslecdhcurve = SSLECDHCURVE_DEFAULT;
+		env->sc_proto_default.ssldhparams = SSLDHPARAMS_DEFAULT;
 		env->sc_proto_default.type = RELAY_PROTO_TCP;
 		(void)strlcpy(env->sc_proto_default.name, "default",
 		    sizeof(env->sc_proto_default.name));
@@ -762,6 +763,7 @@ config_getrule(struct relayd *env, struct imsg *imsg)
 
 	memset(&rule->rule_kv[0], 0, sizeof(struct kv));
 	for (i = 1; i < KEY_TYPE_MAX; i++) {
+		TAILQ_INIT(&rule->rule_kv[i].kv_children);
 		GETKV(i, key);
 		GETKV(i, value);
 	}

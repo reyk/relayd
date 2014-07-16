@@ -1,4 +1,4 @@
-#	$OpenBSD: Proc.pm,v 1.7 2014/05/12 21:30:42 andre Exp $
+#	$OpenBSD: Proc.pm,v 1.9 2014/07/11 15:38:44 bluhm Exp $
 
 # Copyright (c) 2010-2013 Alexander Bluhm <bluhm@openbsd.org>
 #
@@ -20,9 +20,10 @@ use warnings;
 package Proc;
 use Carp;
 use Errno;
+use File::Basename;
 use IO::File;
 use POSIX;
-use Time::HiRes qw(time alarm sleep gettimeofday tv_interval);
+use Time::HiRes qw(time alarm sleep);
 
 my %CHILDREN;
 
@@ -101,25 +102,25 @@ sub run {
 	    or die ref($self), " dup STDIN failed: $!";
 	close($reader);
 
-	$self->child();
-	print STDERR $self->{up}, "\n";
-	$self->{start} = [gettimeofday()];
-	$self->{func}->($self);
-	$self->{end} = [gettimeofday()];
+	do {
+		$self->child();
+		print STDERR $self->{up}, "\n";
+		$self->{begin} = time();
+		$self->{func}->($self);
+	} while ($self->{redo});
+	$self->{end} = time();
 	print STDERR "Shutdown", "\n";
-	IO::Handle::flush(\*STDOUT);
-	IO::Handle::flush(\*STDERR);
-
-	if ($self->{measure}) {
-		my $tm = strftime("%FT%H:%M:%S%z",
-		    localtime(gettimeofday()));
-		open(my $fh, ">>", "time.log");
-		print $fh $tm." ".
-		    ($self->{testfile})." ".$self->{measure}." ".
-		    tv_interval($self->{start}, $self->{end})."\n";
-		close($fh);
+	if ($self->{timefile}) {
+		open(my $fh, '>>', $self->{timefile})
+		    or die ref($self), " open $self->{timefile} failed: $!";
+		printf $fh "time='%s' duration='%.10g' ".
+		    "forward='%s' test='%s'\n",
+		    scalar(localtime(time())), $self->{end} - $self->{begin},
+		    $self->{forward}, basename($self->{testfile});
 	}
 
+	IO::Handle::flush(\*STDOUT);
+	IO::Handle::flush(\*STDERR);
 	POSIX::_exit(0);
 }
 

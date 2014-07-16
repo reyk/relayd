@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.8 2014/06/22 14:18:01 bluhm Exp $
+#	$OpenBSD: Makefile,v 1.9 2014/07/11 20:41:20 bluhm Exp $
 
 # The following ports must be installed for the regression tests:
 # p5-IO-Socket-INET6	object interface for AF_INET and AF_INET6 domain sockets
@@ -52,6 +52,7 @@ PERLPATH =	${.CURDIR}/
 
 .for a in ${ARGS}
 run-regress-$a: $a
+	@echo '\n======== $a ========'
 .if empty (REMOTE_SSH)
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}relayd.pl copy ${PERLPATH}$a
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}relayd.pl splice ${PERLPATH}$a
@@ -97,23 +98,5 @@ stamp-syntax: ${ARGS}
 	@perl -c ${PERLPATH}$a
 .endfor
 	@date >$@
-
-run1: .PHONY
-	@[ -e .done ] || touch .done;
-.for a in ${ARGS}
-	@skip=0; \
-	grep ${a} .done 2>&1 >/dev/null && skip=1; \
-	if [ $${skip} -eq 0 ]; then \
-		sudo env RELAYD=${RELAYD} ${MAKE} run-regress-${a} || read; \
-	else \
-		echo "=> skipping ${a}"; \
-	fi;
-	@${MAKE} cleandir && echo ${a} >> .done;
-.endfor
-
-.PHONY: cleanrun
-cleanrun:
-	${MAKE} clean cleandir
-	rm -f .done
 
 .include <bsd.regress.mk>

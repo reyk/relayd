@@ -13,7 +13,7 @@ our %args = (
 	    'match request path set "*" value "/foopath" \
 		url log "*"',
 	],
-	loggrep => { qr/\, done\, \[foo.bar\/foopath\]/ => 1 },
+	loggrep => { qr/ (?:done|last write \(done\)), \[foo.bar\/foopath\]/ => 1 },
     },
     server => {
 	func => \&http_server,
@@ -21,6 +21,7 @@ our %args = (
 		qr/GET \/foopath HTTP\/1\.0/ => 1,
 	},
     },
+    len => 8,
 );
 
 1;

@@ -50,8 +50,6 @@ my $c = Client->new(
     connectdomain	=> AF_INET,
     connectaddr		=> "127.0.0.1",
     connectport		=> $s->{listenport},
-    testfile            => $test,
-    measure             => "direct"
 );
 
 $s->run;
