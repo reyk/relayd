@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.184 2014/07/09 16:42:05 reyk Exp $	*/
+/*	$OpenBSD$	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -55,9 +55,7 @@
 
 #include <openssl/ssl.h>
 
-#include "relayd.h"
-#include "http.h"
-#include "snmp.h"
+#include "updateconf.h"
 
 TAILQ_HEAD(files, file)		 files = TAILQ_HEAD_INITIALIZER(files);
 static struct file {
@@ -67,7 +65,7 @@ static struct file {
 	int			 lineno;
 	int			 errors;
 } *file, *topfile;
-struct file	*pushfile(const char *, int);
+struct file	*pushfile(const char *);
 int		 popfile(void);
 int		 check_file_secrecy(int, const char *);
 int		 yyparse(void);
@@ -92,7 +90,6 @@ char		*symget(const char *);
 
 struct relayd		*conf = NULL;
 static int		 errors = 0;
-static int		 loadcfg = 0;
 objid_t			 last_rdr_id = 0;
 objid_t			 last_table_id = 0;
 objid_t			 last_host_id = 0;
@@ -102,22 +99,18 @@ objid_t			 last_rt_id = 0;
 objid_t			 last_nr_id = 0;
 objid_t			 last_key_id = 0;
 
+static struct relay_table *rltable = NULL;
 static struct rdr	*rdr = NULL;
 static struct table	*table = NULL;
 static struct relay	*rlay = NULL;
 static struct host	*hst = NULL;
 struct relaylist	 relays;
 static struct protocol	*proto = NULL;
-static struct relay_rule *rule = NULL;
+static struct protonode	 node;
 static struct router	*router = NULL;
-static int		 label = 0;
-static int		 tagged = 0;
-static int		 tag = 0;
 static in_port_t	 tableport = 0;
+static int		 nodedirection;
 static int		 dstmode;
-static enum key_type	 keytype = KEY_TYPE_NONE;
-static enum direction	 dir = RELAY_DIR_ANY;
-static char		*rulefile = NULL;
 
 struct address	*host_v4(const char *);
 struct address	*host_v6(const char *);
@@ -134,7 +127,6 @@ int		 relay_id(struct relay *);
 struct relay	*relay_inherit(struct relay *, struct relay *);
 int		 getservice(char *);
 int		 is_if_in_group(const char *, const char *);
-
 typedef struct {
 	union {
 		int64_t			 number;
@@ -143,7 +135,6 @@ typedef struct {
 		struct timeval		 tv;
 		struct table		*table;
 		struct portrange	 port;
-		enum direction		 dir;
 		struct {
 			struct sockaddr_storage	 ss;
 			char			 name[MAXHOSTNAMELEN];
@@ -158,32 +149,30 @@ typedef struct {
 
 %}
 
-%token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK
-%token	CIPHERS CODE COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK
-%token	EXTERNAL FILENAME FORWARD FROM HASH HEADER HOST ICMP
-%token	INCLUDE INET INET6 INTERFACE INTERVAL IP LABEL LISTEN VALUE
-%token	LOADBALANCE LOG LOOKUP METHOD MODE NAT NO DESTINATION
-%token	NODELAY NOTHING ON PARENT PATH PFTAG PORT PREFORK PRIORITY PROTO
-%token	QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE RETRY QUICK
+%token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE CHANGE CHECK
+%token	CIPHERS CODE COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT
+%token	EXTERNAL FILENAME FILTER FORWARD FROM HASH HEADER HOST ICMP
+%token	INCLUDE INET INET6 INTERFACE INTERVAL IP LABEL LISTEN
+%token	LOADBALANCE LOG LOOKUP MARK MARKED MODE NAT NO DESTINATION
+%token	NODELAY NOTHING ON PARENT PATH PORT PREFORK PRIORITY PROTO
+%token	QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE RETRY
 %token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SNMP SOCKET SPLICE
-%token	SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TO ROUTER RTLABEL
+%token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
 %token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH CURVE
 %token	<v.string>	STRING
-%token  <v.number>	NUMBER
-%type	<v.string>	hostname interface table value optstring
-%type	<v.number>	http_type loglevel quick trap
-%type	<v.number>	dstmode flag forwardmode retry
+%token	<v.number>	NUMBER
+%type	<v.string>	hostname interface table optstring
+%type	<v.number>	http_type loglevel mark trap
+%type	<v.number>	direction dstmode flag forwardmode retry
 %type	<v.number>	optssl optsslclient sslcache
 %type	<v.number>	redirect_proto relay_proto match
-%type	<v.number>	action ruleaf key_option
 %type	<v.port>	port
 %type	<v.host>	host
 %type	<v.addr>	address
 %type	<v.tv>		timeout
-%type	<v.digest>	digest optdigest
+%type	<v.digest>	digest
 %type	<v.table>	tablespec
-%type	<v.dir>		dir
 
 %%
 
@@ -203,7 +192,7 @@ grammar		: /* empty */
 include		: INCLUDE STRING		{
 			struct file	*nfile;
 
-			if ((nfile = pushfile($2, 0)) == NULL) {
+			if ((nfile = pushfile($2)) == NULL) {
 				yyerror("failed to include file %s", $2);
 				free($2);
 				YYERROR;
@@ -353,45 +342,54 @@ sendbuf		: NOTHING		{
 		;
 
 main		: INTERVAL NUMBER	{
-			if (loadcfg)
-				break;
+			char	buf[256];
 			if ((conf->sc_interval.tv_sec = $2) < 0) {
 				yyerror("invalid interval: %d", $2);
 				YYERROR;
 			}
+			(void)snprintf(buf, sizeof(buf), "interval %lld", $2);
+			conf->sc_mainopts = opts_add(conf->sc_mainopts,
+			    &conf->sc_mainoptsc, buf);
 		}
 		| LOG loglevel		{
-			if (loadcfg)
-				break;
+			char	buf[256];
 			conf->sc_opts |= $2;
+			(void)snprintf(buf, sizeof(buf), "log %s",
+			    $2 == RELAYD_OPT_LOGALL ? "all" : "updates");
+			conf->sc_mainopts = opts_add(conf->sc_mainopts,
+			    &conf->sc_mainoptsc, buf);
 		}
 		| TIMEOUT timeout	{
-			if (loadcfg)
-				break;
+			char	buf[256];
 			bcopy(&$2, &conf->sc_timeout, sizeof(struct timeval));
+			(void)snprintf(buf, sizeof(buf), "timeout %lld",
+			    ($2.tv_sec * 1000));
+			conf->sc_mainopts = opts_add(conf->sc_mainopts,
+			    &conf->sc_mainoptsc, buf);
 		}
 		| PREFORK NUMBER	{
-			if (loadcfg)
-				break;
+			char	buf[256];
 			if ($2 <= 0 || $2 > RELAY_MAXPROC) {
 				yyerror("invalid number of preforked "
 				    "relays: %d", $2);
 				YYERROR;
 			}
 			conf->sc_prefork_relay = $2;
+			(void)snprintf(buf, sizeof(buf), "prefork %lld", $2);
+			conf->sc_mainopts = opts_add(conf->sc_mainopts,
+			    &conf->sc_mainoptsc, buf);
 		}
 		| SNMP trap optstring	{
-			if (loadcfg)
-				break;
-			conf->sc_flags |= F_SNMP;
-			if ($2)
-				conf->sc_snmp_flags |= FSNMP_TRAPONLY;
+			char	buf[256];
 			if ($3)
 				conf->sc_snmp_path = $3;
-			else
-				conf->sc_snmp_path = strdup(AGENTX_SOCKET);
-			if (conf->sc_snmp_path == NULL)
-				fatal("out of memory");
+			(void)snprintf(buf, sizeof(buf), "snmp %s%s%s%s",
+			    !$2 ? "" : "trap ",
+			    $3 == NULL ? "" : "\"",
+			    $3 == NULL ? "" : $3,
+			    $3 == NULL ? "" : "\"");
+			conf->sc_mainopts = opts_add(conf->sc_mainopts,
+			    &conf->sc_mainoptsc, buf);
 		}
 		;
 
@@ -404,13 +402,6 @@ loglevel	: UPDATES		{ $$ = RELAYD_OPT_LOGUPDATE; }
 
 rdr		: REDIRECT STRING	{
 			struct rdr *srv;
-
-			conf->sc_flags |= F_NEEDPF;
-
-			if (!loadcfg) {
-				free($2);
-				YYACCEPT;
-			}
 
 			TAILQ_FOREACH(srv, conf->sc_rdrs, entry)
 				if (!strcmp(srv->conf.name, $2))
@@ -463,8 +454,6 @@ rdr		: REDIRECT STRING	{
 				    rdr->conf.name);
 				YYERROR;
 			}
-			if (!(rdr->conf.flags & F_DISABLE))
-				rdr->conf.flags |= F_ADD;
 			TAILQ_INSERT_TAIL(conf->sc_rdrs, rdr, entry);
 			tableport = 0;
 			rdr = NULL;
@@ -476,6 +465,7 @@ rdropts_l	: rdropts_l rdroptsl nl
 		;
 
 rdroptsl	: forwardmode TO tablespec interface	{
+			char buf[256];
 			switch ($1) {
 			case FWD_NORMAL:
 				if ($4 == NULL)
@@ -532,8 +522,12 @@ rdroptsl	: forwardmode TO tablespec interface	{
 			$3->conf.fwdmode = $1;
 			$3->conf.rdrid = rdr->conf.id;
 			$3->conf.flags |= F_USED;
+			rdr_print_forward(rdr, (rdr->backup != NULL), buf,
+			    sizeof(buf));
+			rdr->opts = opts_add(rdr->opts, &rdr->optsc, buf);
 		}
 		| LISTEN ON STRING redirect_proto port interface {
+			char	buf[256];
 			if (host($3, &rdr->virts,
 			    SRV_MAX_VIRTS, &$5, $6, $4) <= 0) {
 				yyerror("invalid virtual ip: %s", $3);
@@ -546,11 +540,24 @@ rdroptsl	: forwardmode TO tablespec interface	{
 			if (rdr->conf.port == 0)
 				rdr->conf.port = $5.val[0];
 			tableport = rdr->conf.port;
+			rdr_print_listen(rdr, buf, sizeof(buf));
+			rdr->opts = opts_add(rdr->opts, &rdr->optsc, buf);
 		}
-		| DISABLE		{ rdr->conf.flags |= F_DISABLE; }
-		| STICKYADDR		{ rdr->conf.flags |= F_STICKY; }
-		| match PFTAG STRING {
-			conf->sc_flags |= F_NEEDPF;
+		| DISABLE		{
+			char	buf[256];
+
+			rdr->conf.flags |= F_DISABLE;
+			(void)snprintf(buf, sizeof(buf), "disable");
+			rdr->opts = opts_add(rdr->opts, &rdr->optsc, buf);
+		}
+		| STICKYADDR		{
+			char	buf[256];
+
+			(void)snprintf(buf, sizeof(buf), "sticky-address");
+			rdr->opts = opts_add(rdr->opts, &rdr->optsc, buf);
+		}
+		| match TAG STRING {
+			char	buf[256];
 			if (strlcpy(rdr->conf.tag, $3,
 			    sizeof(rdr->conf.tag)) >=
 			    sizeof(rdr->conf.tag)) {
@@ -558,11 +565,14 @@ rdroptsl	: forwardmode TO tablespec interface	{
 				free($3);
 				YYERROR;
 			}
-			if ($1)
-				rdr->conf.flags |= F_MATCH;
+			(void)snprintf(buf, sizeof(buf), "%spftag \"%s\"",
+			    !$1 ? "" : "match ", $3);
 			free($3);
+			rdr->opts = opts_add(rdr->opts, &rdr->optsc, buf);
+
 		}
 		| SESSION TIMEOUT NUMBER		{
+			char	buf[256];
 			if ((rdr->conf.timeout.tv_sec = $3) < 0) {
 				yyerror("invalid timeout: %lld", $3);
 				YYERROR;
@@ -571,6 +581,9 @@ rdroptsl	: forwardmode TO tablespec interface	{
 				yyerror("timeout too large: %lld", $3);
 				YYERROR;
 			}
+			(void)snprintf(buf, sizeof(buf), "session timeout"
+			    " %lld", $3);
+			rdr->opts = opts_add(rdr->opts, &rdr->optsc, buf);
 		}
 		| include
 		;
@@ -596,11 +609,6 @@ table		: '<' STRING '>'	{
 
 tabledef	: TABLE table		{
 			struct table *tb;
-
-			if (!loadcfg) {
-				free($2);
-				YYACCEPT;
-			}
 
 			TAILQ_FOREACH(tb, conf->sc_tables, entry)
 				if (!strcmp(tb->conf.name, $2))
@@ -629,6 +637,7 @@ tabledef	: TABLE table		{
 			table = tb;
 			dstmode = RELAY_DSTMODE_DEFAULT;
 		} tabledefopts_l	{
+			char	buf[1024];
 			if (TAILQ_EMPTY(&table->hosts)) {
 				yyerror("table %s has no hosts",
 				    table->conf.name);
@@ -636,6 +645,9 @@ tabledef	: TABLE table		{
 			}
 			conf->sc_tablecount++;
 			TAILQ_INSERT_TAIL(conf->sc_tables, table, entry);
+			table_print(table, buf, sizeof(buf));
+			conf->sc_tableopts = opts_add(conf->sc_tableopts,
+			    &conf->sc_tableoptsc, buf);
 		}
 		;
 
@@ -671,7 +683,6 @@ tablespec	: table			{
 			}
 			free($1);
 			table = tb;
-			dstmode = RELAY_DSTMODE_DEFAULT;
 		} tableopts_l		{
 			struct table	*tb;
 			if (table->conf.port == 0)
@@ -710,12 +721,6 @@ tableopts	: CHECK tablecheck
 				YYERROR;
 			}
 			free($2);
-			if (carp_demote_init(table->conf.demote_group, 1)
-			    == -1) {
-				yyerror("yyparse: error initializing group "
-				    "'%s'", table->conf.demote_group);
-				YYERROR;
-			}
 		}
 		| INTERVAL NUMBER	{
 			if ($2 < conf->sc_interval.tv_sec ||
@@ -773,9 +778,7 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 				free($3);
 				YYERROR;
 			}
-			if (asprintf(&table->sendbuf,
-			    "HEAD %s HTTP/1.%c\r\n%s\r\n",
-			    $2, strlen($3) ? '1' : '0', $3) == -1)
+			if (asprintf(&table->sendbuf, "%s", $2) == -1)
 				fatal("asprintf");
 			free($2);
 			free($3);
@@ -788,9 +791,7 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 				table->conf.flags |= F_SSL;
 			}
 			table->conf.check = CHECK_HTTP_DIGEST;
-			if (asprintf(&table->sendbuf,
-			    "GET %s HTTP/1.%c\r\n%s\r\n",
-			    $2, strlen($3) ? '1' : '0', $3) == -1)
+			if (asprintf(&table->sendbuf, "%s", $2))
 				fatal("asprintf");
 			free($2);
 			free($3);
@@ -831,7 +832,6 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 				free($2);
 				YYERROR;
 			}
-			conf->sc_flags |= F_SCRIPT;
 			free($2);
 		}
 		;
@@ -854,23 +854,8 @@ digest		: DIGEST STRING
 		}
 		;
 
-optdigest	: digest			{
-			$$.digest = $1.digest;
-			$$.type = $1.type;
-		}
-		| STRING			{
-			$$.digest = $1;
-			$$.type = DIGEST_NONE;
-		}
-		;
-
 proto		: relay_proto PROTO STRING	{
 			struct protocol *p;
-
-			if (!loadcfg) {
-				free($3);
-				YYACCEPT;
-			}
 
 			if (strcmp($3, "default") == 0) {
 				p = &conf->sc_proto_default;
@@ -901,7 +886,6 @@ proto		: relay_proto PROTO STRING	{
 			p->tcpflags = TCPFLAG_DEFAULT;
 			p->sslflags = SSLFLAG_DEFAULT;
 			p->tcpbacklog = RELAY_BACKLOG;
-			TAILQ_INIT(&p->rules);
 			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
 			    sizeof(p->sslciphers));
 			p->sslecdhcurve = SSLECDHCURVE_DEFAULT;
@@ -925,7 +909,17 @@ proto		: relay_proto PROTO STRING	{
 
 protopts_n	: /* empty */
 		| '{' '}'
-		| '{' optnl protopts_l '}'
+		| '{' optnl protopts_l '}' {
+			char	buf[256];
+			proto_print_flags(proto, buf, sizeof(buf));
+			if (buf[0])
+				proto->opts = opts_add(proto->opts,
+				    &proto->optsc, buf);
+			proto_print_opts(proto, buf, sizeof(buf));
+			if (buf[0])
+				proto->opts = opts_add(proto->opts,
+				    &proto->optsc, buf);
+		}
 		;
 
 protopts_l	: protopts_l protoptsl nl
@@ -938,8 +932,37 @@ protoptsl	: SSL sslflags
 		| TCP '{' tcpflags_l '}'
 		| RETURN ERROR opteflags	{ proto->flags |= F_RETURN; }
 		| RETURN ERROR '{' eflags_l '}'	{ proto->flags |= F_RETURN; }
-		| filterrule
+		| LABEL STRING			{
+			char	buf[256];
+			proto_print_label($2, buf, sizeof(buf));
+			if (buf[0])
+				proto->rules = opts_add(proto->rules,
+				   &proto->rulesc, buf);
+			free($2);
+		}
+		| NO LABEL			{
+			char	buf[256];
+			proto_print_label(NULL, buf, sizeof(buf));
+			if (buf[0])
+				proto->rules = opts_add(proto->rules,
+				   &proto->rulesc, buf);
+		}
+		| direction			{
+			node.dir = nodedirection = $1;
+		} protonode {
+			if (nodedirection != -1 &&
+			    protonode_add(nodedirection, proto, &node) == -1) {
+				yyerror("failed to add protocol node");
+				YYERROR;
+			}
+			bzero(&node, sizeof(node));
+		}
 		| include
+		;
+
+direction	: /* empty */		{ $$ = RELAY_DIR_REQUEST; }
+		| REQUEST		{ $$ = RELAY_DIR_REQUEST; }
+		| RESPONSE		{ $$ = RELAY_DIR_RESPONSE; }
 		;
 
 tcpflags_l	: tcpflags comma tcpflags_l
@@ -991,8 +1014,21 @@ sslflags_l	: sslflags comma sslflags_l
 		| sslflags
 		;
 
-sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
+sslflags	: SESSION CACHE sslcache	{
+			char	buf[256];
+
+			proto->cache = $3;
+
+			if ($3 == -2)
+				(void)snprintf(buf, sizeof(buf),
+				    "ssl session cache disable");
+			else if ($3 != RELAY_CACHESIZE)
+				(void)snprintf(buf, sizeof(buf),
+				"ssl session cache %lld", $3);
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
+		}
 		| CIPHERS STRING		{
+			char	*buf = NULL;
 			if (strlcpy(proto->sslciphers, $2,
 			    sizeof(proto->sslciphers)) >=
 			    sizeof(proto->sslciphers)) {
@@ -1000,19 +1036,22 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 				free($2);
 				YYERROR;
 			}
+			(void)asprintf(&buf, "ssl ciphers \"%s\"", $2);
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
 			free($2);
+			free(buf);
 		}
 		| ECDH CURVE STRING		{
+			char	*buf = NULL;
 			if (strcmp("none", $3) == 0)
 				proto->sslecdhcurve = 0;
-			else if ((proto->sslecdhcurve = OBJ_sn2nid($3)) == 0) {
-				yyerror("ECDH curve not supported");
-				free($3);
-				YYERROR;
-			}
+			(void)asprintf(&buf, "ssl ecdh curve \"%s\"", $3);
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
 			free($3);
+			free(buf);
 		}
 		| CA FILENAME STRING		{
+			char	*buf = NULL;
 			if (strlcpy(proto->sslca, $3,
 			    sizeof(proto->sslca)) >=
 			    sizeof(proto->sslca)) {
@@ -1020,9 +1059,13 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 				free($3);
 				YYERROR;
 			}
+			(void)asprintf(&buf, "ssl ca file \"%s\"", $3);
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
 			free($3);
+			free(buf);
 		}
 		| CA KEY STRING PASSWORD STRING	{
+			char	*buf = NULL;
 			if (strlcpy(proto->sslcakey, $3,
 			    sizeof(proto->sslcakey)) >=
 			    sizeof(proto->sslcakey)) {
@@ -1037,10 +1080,15 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 				free($5);
 				YYERROR;
 			}
+			(void)asprintf(&buf,
+			    "ssl ca key \"%s\" password \"%s\"", $3, $5);
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
 			free($3);
 			free($5);
+			free(buf);
 		}
 		| CA CERTIFICATE STRING		{
+			char	*buf;
 			if (strlcpy(proto->sslcacert, $3,
 			    sizeof(proto->sslcacert)) >=
 			    sizeof(proto->sslcacert)) {
@@ -1048,10 +1096,25 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 				free($3);
 				YYERROR;
 			}
+			(void)asprintf(&buf, "ssl ca cert \"%s\"", $3);
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
 			free($3);
+			free(buf);
 		}
-		| NO flag			{ proto->sslflags &= ~($2); }
-		| flag				{ proto->sslflags |= $1; }
+		| NO flag			{
+			char	*buf;
+			proto->sslflags &= ~($2);
+			(void)asprintf(&buf, "ssl no %s", getsslflag($2));
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
+			free(buf);
+		}
+		| flag				{
+			char	*buf;
+			proto->sslflags |= $1;
+			(void)asprintf(&buf, "ssl %s", getsslflag($1));
+			proto->opts = opts_add(proto->opts, &proto->optsc, buf);
+			free(buf);
+		}
 		;
 
 flag		: STRING			{
@@ -1070,6 +1133,226 @@ flag		: STRING			{
 		}
 		;
 
+protonode	: nodetype APPEND STRING TO STRING nodeopts		{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				free($5);
+				free($3);
+				YYERROR;
+			}
+			node.action = NODE_ACTION_APPEND;
+			node.key = strdup($5);
+			node.value = strdup($3);
+			if (node.key == NULL || node.value == NULL)
+				fatal("out of memory");
+			if (strchr(node.value, '$') != NULL)
+				node.flags |= PNFLAG_MACRO;
+			free($5);
+			free($3);
+		}
+		| nodetype CHANGE STRING TO STRING nodeopts		{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				free($5);
+				free($3);
+				YYERROR;
+			}
+			node.action = NODE_ACTION_CHANGE;
+			node.key = strdup($3);
+			node.value = strdup($5);
+			if (node.key == NULL || node.value == NULL)
+				fatal("out of memory");
+			if (strchr(node.value, '$') != NULL)
+				node.flags |= PNFLAG_MACRO;
+			free($5);
+			free($3);
+		}
+		| nodetype REMOVE STRING nodeopts			{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				free($3);
+				YYERROR;
+			}
+			node.action = NODE_ACTION_REMOVE;
+			node.key = strdup($3);
+			node.value = NULL;
+			if (node.key == NULL)
+				fatal("out of memory");
+			free($3);
+		}
+		| nodetype REMOVE					{
+			if (node.type != NODE_TYPE_HEADER) {
+				yyerror("action only supported for headers");
+				YYERROR;
+			}
+			node.action = NODE_ACTION_REMOVE;
+			node.key = NULL;
+			node.value = NULL;
+		} nodefile
+		| nodetype EXPECT STRING FROM STRING nodeopts		{
+			node.action = NODE_ACTION_EXPECT;
+			node.key = strdup($5);
+			node.value = strdup($3);
+			if (node.key == NULL || node.value == NULL)
+				fatal("out of memory");
+			free($5);
+			free($3);
+		}
+		| nodetype EXPECT STRING nodeopts			{
+			node.action = NODE_ACTION_EXPECT;
+			node.key = strdup($3);
+			node.value = strdup("*");
+			if (node.key == NULL || node.value == NULL)
+				fatal("expect: out of memory");
+			free($3);
+		}
+		| nodetype EXPECT					{
+			node.action = NODE_ACTION_EXPECT;
+			node.key = NULL;
+			node.value = strdup("*");
+		} nodefile
+		| nodetype EXPECT digest nodeopts			{
+			if (node.type != NODE_TYPE_URL) {
+				yyerror("digest not supported for this type");
+				free($3.digest);
+				YYERROR;
+			}
+			node.action = NODE_ACTION_EXPECT;
+			node.key = strdup($3.digest);
+			node.flags |= PNFLAG_DIGEST;
+			if (node.key == NULL)
+				fatal("expect: out of memory");
+			free($3.digest);
+		}
+		| nodetype FILTER STRING FROM STRING nodeopts		{
+			node.action = NODE_ACTION_FILTER;
+			node.key = strdup($5);
+			node.value = strdup($3);
+			if (node.key == NULL || node.value == NULL)
+				fatal("filter: out of memory");
+			free($5);
+			free($3);
+		}
+		| nodetype FILTER STRING nodeopts			{
+			node.action = NODE_ACTION_FILTER;
+			node.key = strdup($3);
+			node.value = strdup("*");
+			if (node.key == NULL || node.value == NULL)
+				fatal("filter: out of memory");
+			free($3);
+		}
+		| nodetype FILTER					{
+			node.action = NODE_ACTION_FILTER;
+			node.key = NULL;
+			node.value = strdup("*");
+		} nodefile
+		| nodetype FILTER digest nodeopts			{
+			if (node.type != NODE_TYPE_URL) {
+				yyerror("digest not supported for this type");
+				free($3.digest);
+				YYERROR;
+			}
+			node.action = NODE_ACTION_FILTER;
+			node.key = strdup($3.digest);
+			node.flags |= PNFLAG_DIGEST;
+			if (node.key == NULL)
+				fatal("filter: out of memory");
+			free($3.digest);
+		}
+		| nodetype HASH STRING nodeopts				{
+			node.action = NODE_ACTION_HASH;
+			node.key = strdup($3);
+			node.value = NULL;
+			if (node.key == NULL)
+				fatal("hash: out of memory");
+			free($3);
+		}
+		| nodetype LOG STRING nodeopts				{
+			node.action = NODE_ACTION_LOG;
+			node.key = strdup($3);
+			node.value = NULL;
+			node.flags |= PNFLAG_LOG;
+			if (node.key == NULL)
+				fatal("out of memory");
+			free($3);
+		}
+		| nodetype LOG						{
+			node.action = NODE_ACTION_LOG;
+			node.key = NULL;
+			node.value = NULL;
+			node.flags |= PNFLAG_LOG;
+		} nodefile
+		| nodetype MARK STRING FROM STRING WITH mark log	{
+			node.action = NODE_ACTION_MARK;
+			node.key = strdup($5);
+			node.value = strdup($3);
+			node.mark = $7;
+			if (node.key == NULL || node.value == NULL)
+				fatal("out of memory");
+			free($3);
+			free($5);
+		}
+		| nodetype MARK STRING WITH mark nodeopts		{
+			if (node.mark) {
+				yyerror("either mark or marked");
+				free($3);
+				YYERROR;
+			}
+			node.action = NODE_ACTION_MARK;
+			node.key = strdup($3);
+			node.value = strdup("*");
+			node.mark = $5;	/* overwrite */
+			if (node.key == NULL || node.value == NULL)
+				fatal("out of memory");
+			free($3);
+		}
+		;
+
+nodefile	: FILENAME STRING nodeopts			{
+			if (protonode_load(nodedirection,
+			    proto, &node, $2) == -1) {
+				yyerror("failed to load from file: %s", $2);
+				free($2);
+				YYERROR;
+			}
+			free($2);
+			nodedirection = -1;	/* don't add template node */
+		}
+		;
+
+nodeopts	: marked log
+		;
+
+marked		: /* empty */
+		| MARKED mark			{ node.mark = $2; }
+		;
+
+log		: /* empty */
+		| LOG				{ node.flags |= PNFLAG_LOG; }
+		;
+
+mark		: NUMBER					{
+			if ($1 <= 0 || $1 >= (int)USHRT_MAX) {
+				yyerror("invalid mark: %d", $1);
+				YYERROR;
+			}
+			$$ = $1;
+		}
+		;
+
+nodetype	: HEADER			{
+			node.type = NODE_TYPE_HEADER;
+		}
+		| QUERYSTR			{ node.type = NODE_TYPE_QUERY; }
+		| COOKIE			{
+			node.type = NODE_TYPE_COOKIE;
+		}
+		| PATH				{
+			node.type = NODE_TYPE_PATH;
+		}
+		| URL				{ node.type = NODE_TYPE_URL; }
+		;
+
 sslcache	: NUMBER			{
 			if ($1 < 0) {
 				yyerror("invalid sslcache value: %d", $1);
@@ -1080,386 +1363,8 @@ sslcache	: NUMBER			{
 		| DISABLE			{ $$ = -2; }
 		;
 
-filterrule	: action dir quick ruleaf rulesrc ruledst {
-			if ((rule = calloc(1, sizeof(*rule))) == NULL)
-				fatal("out of memory");
-
-			rule->rule_action = $1;
-			rule->rule_proto = proto->type;
-			rule->rule_dir = $2;
-			rule->rule_flags |= $3;
-			rule->rule_af = $4;
-
-			rulefile = NULL;
-		} ruleopts_l {
-			if (rule_add(proto, rule, rulefile) == -1) {
-				if (rulefile == NULL) {
-					yyerror("failed to load rule");
-				} else {
-					yyerror("failed to load rules from %s",
-					    rulefile);
-					free(rulefile);
-				}
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			if (rulefile)
-				free(rulefile);
-			rulefile = NULL;
-			rule = NULL;
-			keytype = KEY_TYPE_NONE;
-		}
-		;
-
-action		: PASS				{ $$ = RULE_ACTION_PASS; }
-		| BLOCK				{ $$ = RULE_ACTION_BLOCK; }
-		| MATCH				{ $$ = RULE_ACTION_MATCH; }
-		;
-
-dir		: /* empty */			{
-			$$ = dir = RELAY_DIR_REQUEST;
-		}
-		| REQUEST			{
-			$$ = dir = RELAY_DIR_REQUEST;
-		}
-		| RESPONSE			{
-			$$ = dir = RELAY_DIR_RESPONSE;
-		}
-		;
-
-quick		: /* empty */			{ $$ = 0; }
-		| QUICK				{ $$ = RULE_FLAG_QUICK; }
-		;
-
-ruleaf		: /* empty */			{ $$ = AF_UNSPEC; }
-		| INET6				{ $$ = AF_INET6; }
-		| INET				{ $$ = AF_INET; }
-		;
-
-rulesrc		: /* XXX */
-		;
-
-ruledst		: /* XXX */
-		;
-
-ruleopts_l	: /* empty */
-		| ruleopts_t
-		;
-
-ruleopts_t	: ruleopts ruleopts_t
-		| ruleopts
-		;
-
-ruleopts	: METHOD STRING					{
-			u_int	id;
-			if ((id = relay_httpmethod_byname($2)) ==
-			    HTTP_HEADER_NONE) {
-				yyerror("unknown HTTP method currently not "
-				    "supported");
-				free($2);
-				YYERROR;
-			}
-			rule->rule_method = id;
-			free($2);
-		}
-		| COOKIE key_option STRING value		{
-			keytype = KEY_TYPE_COOKIE;
-			rule->rule_kv[keytype].kv_key = strdup($3);
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
-			    strdup($4) : strdup("*"));
-			if (rule->rule_kv[keytype].kv_key == NULL ||
-			    rule->rule_kv[keytype].kv_value == NULL)
-				fatal("out of memory");
-			free($3);
-			if ($4)
-				free($4);
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| COOKIE key_option				{
-			keytype = KEY_TYPE_COOKIE;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| HEADER key_option STRING value		{
-			keytype = KEY_TYPE_HEADER;
-			memset(&rule->rule_kv[keytype], 0,
-			    sizeof(rule->rule_kv[keytype]));
-			rule->rule_kv[keytype].kv_header_id =
-			    relay_httpheader_byname($3);
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_key = strdup($3);
-			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
-			    strdup($4) : strdup("*"));
-			if (rule->rule_kv[keytype].kv_key == NULL ||
-			    rule->rule_kv[keytype].kv_value == NULL)
-				fatal("out of memory");
-			free($3);
-			if ($4)
-				free($4);
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| HEADER key_option				{
-			keytype = KEY_TYPE_HEADER;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| PATH key_option STRING value			{
-			keytype = KEY_TYPE_PATH;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_key = strdup($3);
-			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
-			    strdup($4) : strdup("*"));
-			if (rule->rule_kv[keytype].kv_key == NULL ||
-			    rule->rule_kv[keytype].kv_value == NULL)
-				fatal("out of memory");
-			free($3);
-			if ($4)
-				free($4);
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| PATH key_option				{
-			keytype = KEY_TYPE_PATH;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| QUERYSTR key_option STRING value		{
-			switch ($2) {
-			case KEY_OPTION_APPEND:
-			case KEY_OPTION_SET:
-			case KEY_OPTION_REMOVE:
-				yyerror("combining query type and the given "
-				    "option is not supported");
-				free($3);
-				if ($4)
-					free($4);
-				YYERROR;
-				break;
-			}
-			keytype = KEY_TYPE_QUERY;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_key = strdup($3);
-			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
-			    strdup($4) : strdup("*"));
-			if (rule->rule_kv[keytype].kv_key == NULL ||
-			    rule->rule_kv[keytype].kv_value == NULL)
-				fatal("out of memory");
-			free($3);
-			if ($4)
-				free($4);
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| QUERYSTR key_option				{
-			switch ($2) {
-			case KEY_OPTION_APPEND:
-			case KEY_OPTION_SET:
-			case KEY_OPTION_REMOVE:
-				yyerror("combining query type and the given "
-				    "option is not supported");
-				YYERROR;
-				break;
-			}
-			keytype = KEY_TYPE_QUERY;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| URL key_option optdigest value			{
-			switch ($2) {
-			case KEY_OPTION_APPEND:
-			case KEY_OPTION_SET:
-			case KEY_OPTION_REMOVE:
-				yyerror("combining url type and the given "
-				"option is not supported");
-				free($3.digest);
-				free($4);
-				YYERROR;
-				break;
-			}
-			keytype = KEY_TYPE_URL;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_key = strdup($3.digest);
-			rule->rule_kv[keytype].kv_digest = $3.type;
-			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
-			    strdup($4) : strdup("*"));
-			if (rule->rule_kv[keytype].kv_key == NULL ||
-			    rule->rule_kv[keytype].kv_value == NULL)
-				fatal("out of memory");
-			free($3.digest);
-			if ($4)
-				free($4);
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| URL key_option					{
-			switch ($2) {
-			case KEY_OPTION_APPEND:
-			case KEY_OPTION_SET:
-			case KEY_OPTION_REMOVE:
-				yyerror("combining url type and the given "
-				    "option is not supported");
-				YYERROR;
-				break;
-			}
-			keytype = KEY_TYPE_URL;
-			rule->rule_kv[keytype].kv_option = $2;
-			rule->rule_kv[keytype].kv_type = keytype;
-		}
-		| FORWARD TO table				{
-			if (table_findbyname(conf, $3) == NULL) {
-				yyerror("undefined forward table");
-				free($3);
-				YYERROR;
-			}
-			if (strlcpy(rule->rule_tablename, $3,
-			    sizeof(rule->rule_tablename)) >=
-			    sizeof(rule->rule_tablename)) {
-				yyerror("invalid forward table name");
-				free($3);
-				YYERROR;
-			}
-			free($3);
-		}
-		| TAG STRING					{
-			tag = tag_name2id($2);
-			if (rule->rule_tag) {
-				yyerror("tag already defined");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			if (tag == 0) {
-				yyerror("invalid tag");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			rule->rule_tag = tag;
-			if (strlcpy(rule->rule_tagname, $2,
-			    sizeof(rule->rule_tagname)) >=
-			    sizeof(rule->rule_tagname)) {
-				yyerror("tag truncated");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			free($2);
-		}
-		| NO TAG					{
-			if (tag == 0) {
-				yyerror("no tag defined");
-				YYERROR;
-			}
-			rule->rule_tag = -1;
-			memset(rule->rule_tagname, 0,
-			    sizeof(rule->rule_tagname));
-		}
-		| TAGGED STRING					{
-			tagged = tag_name2id($2);
-			if (rule->rule_tagged) {
-				yyerror("tagged already defined");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			if (tagged == 0) {
-				yyerror("invalid tag");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			rule->rule_tagged = tagged;
-			if (strlcpy(rule->rule_taggedname, $2,
-			    sizeof(rule->rule_taggedname)) >=
-			    sizeof(rule->rule_taggedname)) {
-				yyerror("tagged truncated");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			free($2);
-		}
-		| LABEL STRING					{
-			label = label_name2id($2);
-			if (rule->rule_label) {
-				yyerror("label already defined");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			if (label == 0) {
-				yyerror("invalid label");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			rule->rule_label = label;
-			if (strlcpy(rule->rule_labelname, $2,
-			    sizeof(rule->rule_labelname)) >=
-			    sizeof(rule->rule_labelname)) {
-				yyerror("label truncated");
-				free($2);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			free($2);
-		}
-		| NO LABEL					{
-			if (label == 0) {
-				yyerror("no label defined");
-				YYERROR;
-			}
-			rule->rule_label = -1;
-			memset(rule->rule_labelname, 0,
-			    sizeof(rule->rule_labelname));
-		}
-		| FILENAME STRING value				{
-			if (rulefile != NULL) {
-				yyerror("only one file per rule supported");
-				free($2);
-				free($3);
-				rule_free(rule);
-				free(rule);
-				YYERROR;
-			}
-			if ($3) {
-				if ((rule->rule_kv[keytype].kv_value =
-				    strdup($3)) == NULL)
-					fatal("out of memory");
-				free($3);
-			} else
-				rule->rule_kv[keytype].kv_value = NULL;
-			rulefile = $2;
-		}
-		;
-
-value		: /* empty */		{ $$ = NULL; }
-		| VALUE STRING		{ $$ = $2; }
-		;
-
-key_option	: /* empty */		{ $$ = KEY_OPTION_NONE; }
-		| APPEND		{ $$ = KEY_OPTION_APPEND; }
-		| SET			{ $$ = KEY_OPTION_SET; }
-		| REMOVE		{ $$ = KEY_OPTION_REMOVE; }
-		| HASH			{ $$ = KEY_OPTION_HASH; }
-		| LOG			{ $$ = KEY_OPTION_LOG; }
-		;
-
 relay		: RELAY STRING	{
 			struct relay *r;
-
-			if (!loadcfg) {
-				free($2);
-				YYACCEPT;
-			}
 
 			TAILQ_FOREACH(r, conf->sc_relays, rl_entry)
 				if (!strcmp(r->rl_conf.name, $2))
@@ -1525,13 +1430,7 @@ relay		: RELAY STRING	{
 				rlay->rl_proto = &conf->sc_proto_default;
 				rlay->rl_conf.proto = conf->sc_proto_default.id;
 			}
-			if (relay_load_certfiles(rlay) == -1) {
-				yyerror("cannot load certificates for relay %s",
-				    rlay->rl_conf.name);
-				YYERROR;
-			}
 			conf->sc_relaycount++;
-			SPLAY_INIT(&rlay->rl_sessions);
 			TAILQ_INSERT_TAIL(conf->sc_relays, rlay, rl_entry);
 
 			tableport = 0;
@@ -1554,6 +1453,7 @@ relayoptsl	: LISTEN ON STRING port optssl {
 			struct addresslist	 al;
 			struct address		*h;
 			struct relay		*r;
+			char			 buf[256];
 
 			if (rlay->rl_conf.ss.ss_family != AF_UNSPEC) {
 				if ((r = calloc(1, sizeof (*r))) == NULL)
@@ -1566,7 +1466,6 @@ relayoptsl	: LISTEN ON STRING port optssl {
 				free($3);
 				YYERROR;
 			}
-
 			TAILQ_INIT(&al);
 			if (host($3, &al, 1, &$4, NULL, -1) <= 0) {
 				yyerror("invalid listen ip: %s", $3);
@@ -1583,8 +1482,11 @@ relayoptsl	: LISTEN ON STRING port optssl {
 			}
 			tableport = h->port.val[0];
 			host_free(&al);
+			relay_print_listen(r, buf, sizeof(buf));
+			r->rl_opts = opts_add(r->rl_opts, &r->rl_optsc, buf);
 		}
 		| forwardmode optsslclient TO forwardspec interface dstaf {
+			char			buf[256];
 			rlay->rl_conf.fwdmode = $1;
 			switch ($1) {
 			case FWD_NORMAL:
@@ -1615,8 +1517,14 @@ relayoptsl	: LISTEN ON STRING port optssl {
 				rlay->rl_conf.flags |= F_SSLCLIENT;
 				conf->sc_flags |= F_SSLCLIENT;
 			}
+
+			relay_print_forward(rlay, rltable, buf, sizeof(buf));
+			rlay->rl_opts = opts_add(rlay->rl_opts,
+			    &rlay->rl_optsc, buf);
+			rltable = NULL;
 		}
 		| SESSION TIMEOUT NUMBER		{
+			char buf[256];
 			if ((rlay->rl_conf.timeout.tv_sec = $3) < 0) {
 				yyerror("invalid timeout: %lld", $3);
 				YYERROR;
@@ -1625,9 +1533,14 @@ relayoptsl	: LISTEN ON STRING port optssl {
 				yyerror("timeout too large: %lld", $3);
 				YYERROR;
 			}
+			(void)snprintf(buf, sizeof(buf), "session timeout"
+			    " %lld", rlay->rl_conf.timeout.tv_sec);
+			rlay->rl_opts = opts_add(rlay->rl_opts,
+			    &rlay->rl_optsc, buf);
 		}
 		| PROTO STRING			{
 			struct protocol *p;
+			char		 buf[256];
 
 			TAILQ_FOREACH(p, conf->sc_protos, entry)
 				if (!strcmp(p->name, $2))
@@ -1640,9 +1553,19 @@ relayoptsl	: LISTEN ON STRING port optssl {
 			p->flags |= F_USED;
 			rlay->rl_conf.proto = p->id;
 			rlay->rl_proto = p;
+			(void)snprintf(buf, sizeof(buf), "protocol \"%s\"", $2);
+			rlay->rl_opts = opts_add(rlay->rl_opts,
+			    &rlay->rl_optsc, buf);
 			free($2);
 		}
-		| DISABLE		{ rlay->rl_conf.flags |= F_DISABLE; }
+		| DISABLE		{
+			char		 buf[256];
+
+			rlay->rl_conf.flags |= F_DISABLE;
+			(void)snprintf(buf, sizeof(buf), "disable");
+			rlay->rl_opts = opts_add(rlay->rl_opts,
+			    &rlay->rl_optsc, buf);
+		}
 		| include
 		;
 
@@ -1677,12 +1600,10 @@ forwardspec	: STRING port retry	{
 			host_free(&al);
 		}
 		| NAT LOOKUP retry	{
-			conf->sc_flags |= F_NEEDPF;
 			rlay->rl_conf.flags |= F_NATLOOK;
 			rlay->rl_conf.dstretry = $3;
 		}
 		| DESTINATION retry		{
-			conf->sc_flags |= F_NEEDPF;
 			rlay->rl_conf.flags |= F_DIVERT;
 			rlay->rl_conf.dstretry = $2;
 		}
@@ -1702,6 +1623,7 @@ forwardspec	: STRING port retry	{
 				rlt->rlt_flags |= F_BACKUP;
 
 			TAILQ_INSERT_TAIL(&rlay->rl_tables, rlt, rlt_entry);
+			rltable = rlt;
 		}
 		;
 
@@ -1716,11 +1638,6 @@ dstmode		: /* empty */		{ $$ = RELAY_DSTMODE_DEFAULT; }
 
 router		: ROUTER STRING		{
 			struct router *rt = NULL;
-
-			if (!loadcfg) {
-				free($2);
-				YYACCEPT;
-			}
 
 			conf->sc_flags |= F_NEEDRT;
 			TAILQ_FOREACH(rt, conf->sc_rts, rt_entry)
@@ -1872,7 +1789,7 @@ dstaf		: /* empty */		{
 		}
 		;
 
-interface	: /* empty */		{ $$ = NULL; }
+interface	: /*empty*/		{ $$ = NULL; }
 		| INTERFACE STRING	{ $$ = $2; }
 		;
 
@@ -2024,8 +1941,7 @@ yyerror(const char *fmt, ...)
 	file->errors++;
 	va_start(ap, fmt);
 	if (asprintf(&nfmt, "%s:%d: %s", file->name, yylval.lineno, fmt) == -1)
-		fatalx("yyerror asprintf");
-	vlog(LOG_CRIT, nfmt, ap);
+		fatal("yyerror asprintf");
 	va_end(ap);
 	free(nfmt);
 	return (0);
@@ -2046,11 +1962,11 @@ lookup(char *s)
 		{ "append",		APPEND },
 		{ "backlog",		BACKLOG },
 		{ "backup",		BACKUP },
-		{ "block",		BLOCK },
 		{ "buffer",		BUFFER },
 		{ "ca",			CA },
 		{ "cache",		CACHE },
 		{ "cert",		CERTIFICATE },
+		{ "change",		CHANGE },
 		{ "check",		CHECK },
 		{ "ciphers",		CIPHERS },
 		{ "code",		CODE },
@@ -2065,6 +1981,7 @@ lookup(char *s)
 		{ "expect",		EXPECT },
 		{ "external",		EXTERNAL },
 		{ "file",		FILENAME },
+		{ "filter",		FILTER },
 		{ "forward",		FORWARD },
 		{ "from",		FROM },
 		{ "hash",		HASH },
@@ -2084,8 +2001,9 @@ lookup(char *s)
 		{ "loadbalance",	LOADBALANCE },
 		{ "log",		LOG },
 		{ "lookup",		LOOKUP },
+		{ "mark",		MARK },
+		{ "marked",		MARKED },
 		{ "match",		MATCH },
-		{ "method",		METHOD },
 		{ "mode",		MODE },
 		{ "nat",		NAT },
 		{ "no",			NO },
@@ -2093,16 +2011,13 @@ lookup(char *s)
 		{ "nothing",		NOTHING },
 		{ "on",			ON },
 		{ "parent",		PARENT },
-		{ "pass",		PASS },
 		{ "password",		PASSWORD },
 		{ "path",		PATH },
-		{ "pftag",		PFTAG },
 		{ "port",		PORT },
 		{ "prefork",		PREFORK },
 		{ "priority",		PRIORITY },
 		{ "protocol",		PROTO },
 		{ "query",		QUERYSTR },
-		{ "quick",		QUICK },
 		{ "random",		RANDOM },
 		{ "real",		REAL },
 		{ "redirect",		REDIRECT },
@@ -2121,7 +2036,6 @@ lookup(char *s)
 		{ "script",		SCRIPT },
 		{ "send",		SEND },
 		{ "session",		SESSION },
-		{ "set",		SET },
 		{ "snmp",		SNMP },
 		{ "socket",		SOCKET },
 		{ "source-hash",	SRCHASH },
@@ -2131,7 +2045,6 @@ lookup(char *s)
 		{ "style",		STYLE },
 		{ "table",		TABLE },
 		{ "tag",		TAG },
-		{ "tagged",		TAGGED },
 		{ "tcp",		TCP },
 		{ "timeout",		TIMEOUT },
 		{ "to",			TO },
@@ -2140,7 +2053,6 @@ lookup(char *s)
 		{ "ttl",		TTL },
 		{ "updates",		UPDATES },
 		{ "url",		URL },
-		{ "value",		VALUE },
 		{ "virtual",		VIRTUAL },
 		{ "with",		WITH }
 	};
@@ -2395,48 +2307,22 @@ nodigits:
 	return (c);
 }
 
-int
-check_file_secrecy(int fd, const char *fname)
-{
-	struct stat	st;
-
-	if (fstat(fd, &st)) {
-		log_warn("cannot stat %s", fname);
-		return (-1);
-	}
-	if (st.st_uid != 0 && st.st_uid != getuid()) {
-		log_warnx("%s: owner not root or current user", fname);
-		return (-1);
-	}
-	if (st.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) {
-		log_warnx("%s: group writable or world read/writable", fname);
-		return (-1);
-	}
-	return (0);
-}
-
 struct file *
-pushfile(const char *name, int secret)
+pushfile(const char *name)
 {
 	struct file	*nfile;
 
 	if ((nfile = calloc(1, sizeof(struct file))) == NULL) {
-		log_warn("%s: malloc", __func__);
+		warn("%s: malloc", __func__);
 		return (NULL);
 	}
 	if ((nfile->name = strdup(name)) == NULL) {
-		log_warn("%s: malloc", __func__);
+		warn("%s: malloc", __func__);
 		free(nfile);
 		return (NULL);
 	}
 	if ((nfile->stream = fopen(nfile->name, "r")) == NULL) {
-		log_warn("%s: %s", __func__, nfile->name);
-		free(nfile->name);
-		free(nfile);
-		return (NULL);
-	} else if (secret &&
-	    check_file_secrecy(fileno(nfile->stream), nfile->name)) {
-		fclose(nfile->stream);
+		warn("%s: %s", __func__, nfile->name);
 		free(nfile->name);
 		free(nfile);
 		return (NULL);
@@ -2463,46 +2349,6 @@ popfile(void)
 }
 
 int
-parse_config(const char *filename, struct relayd *x_conf)
-{
-	struct sym	*sym, *next;
-
-	conf = x_conf;
-	if (config_init(conf) == -1) {
-		log_warn("%s: cannot initialize configuration", __func__);
-		return (-1);
-	}
-
-	errors = 0;
-
-	if ((file = pushfile(filename, 0)) == NULL)
-		return (-1);
-
-	topfile = file;
-	setservent(1);
-
-	yyparse();
-	errors = file->errors;
-	popfile();
-
-	endservent();
-	endprotoent();
-
-	/* Free macros */
-	for (sym = TAILQ_FIRST(&symhead); sym != NULL; sym = next) {
-		next = TAILQ_NEXT(sym, entry);
-		if (!sym->persist) {
-			free(sym->nam);
-			free(sym->val);
-			TAILQ_REMOVE(&symhead, sym, entry);
-			free(sym);
-		}
-	}
-
-	return (errors ? -1 : 0);
-}
-
-int
 load_config(const char *filename, struct relayd *x_conf)
 {
 	struct sym		*sym, *next;
@@ -2513,7 +2359,6 @@ load_config(const char *filename, struct relayd *x_conf)
 	conf = x_conf;
 	conf->sc_flags = 0;
 
-	loadcfg = 1;
 	errors = 0;
 	last_host_id = last_table_id = last_rdr_id = last_proto_id =
 	    last_relay_id = last_rt_id = last_nr_id = 0;
@@ -2524,7 +2369,7 @@ load_config(const char *filename, struct relayd *x_conf)
 	proto = NULL;
 	router = NULL;
 
-	if ((file = pushfile(filename, 0)) == NULL)
+	if ((file = pushfile(filename)) == NULL)
 		return (-1);
 
 	topfile = file;
@@ -2554,7 +2399,7 @@ load_config(const char *filename, struct relayd *x_conf)
 	if (TAILQ_EMPTY(conf->sc_rdrs) &&
 	    TAILQ_EMPTY(conf->sc_relays) &&
 	    TAILQ_EMPTY(conf->sc_rts)) {
-		log_warnx("no actions, nothing to do");
+		warnx("no actions, nothing to do");
 		errors++;
 	}
 
@@ -2569,7 +2414,7 @@ load_config(const char *filename, struct relayd *x_conf)
 	}
 
 	if (timercmp(&conf->sc_timeout, &conf->sc_interval, >=)) {
-		log_warnx("global timeout exceeds interval");
+		warnx("global timeout exceeds interval");
 		errors++;
 	}
 
@@ -2599,7 +2444,7 @@ load_config(const char *filename, struct relayd *x_conf)
 					ph = NULL;
 
 				if (ph == NULL) {
-					log_warnx("host parent id %d invalid",
+					warnx("host parent id %d invalid",
 					    h->conf.parentid);
 					errors++;
 				} else
@@ -2609,11 +2454,11 @@ load_config(const char *filename, struct relayd *x_conf)
 		}
 
 		if (!(table->conf.flags & F_USED)) {
-			log_warnx("unused table: %s", table->conf.name);
+			warnx("unused table: %s", table->conf.name);
 			errors++;
 		}
 		if (timercmp(&table->conf.timeout, &conf->sc_interval, >=)) {
-			log_warnx("table timeout exceeds interval: %s",
+			warnx("table timeout exceeds interval: %s",
 			    table->conf.name);
 			errors++;
 		}
@@ -2622,13 +2467,12 @@ load_config(const char *filename, struct relayd *x_conf)
 	/* Verify that every non-default protocol is used */
 	TAILQ_FOREACH(proto, conf->sc_protos, entry) {
 		if (!(proto->flags & F_USED)) {
-			log_warnx("unused protocol: %s", proto->name);
+			warnx("unused protocol: %s", proto->name);
 		}
 	}
 
 	return (errors ? -1 : 0);
 }
-
 int
 symset(const char *nam, const char *val, int persist)
 {
@@ -2773,7 +2617,7 @@ host_dns(const char *s, struct addresslist *al, int max,
 	if (error == EAI_AGAIN || error == EAI_NODATA || error == EAI_NONAME)
 		return (0);
 	if (error) {
-		log_warnx("%s: could not parse \"%s\": %s", __func__, s,
+		warnx("%s: could not parse \"%s\": %s", __func__, s,
 		    gai_strerror(error));
 		return (-1);
 	}
@@ -2790,7 +2634,7 @@ host_dns(const char *s, struct addresslist *al, int max,
 		if (ifname != NULL) {
 			if (strlcpy(h->ifname, ifname, sizeof(h->ifname)) >=
 			    sizeof(h->ifname))
-				log_warnx("%s: interface name truncated",
+				warnx("%s: interface name truncated",
 				    __func__);
 			freeaddrinfo(res0);
 			free(h);
@@ -2816,7 +2660,7 @@ host_dns(const char *s, struct addresslist *al, int max,
 		cnt++;
 	}
 	if (cnt == max && res) {
-		log_warnx("%s: %s resolves to more than %d hosts", __func__,
+		warnx("%s: %s resolves to more than %d hosts", __func__,
 		    s, max);
 	}
 	freeaddrinfo(res0);
@@ -2853,7 +2697,7 @@ host_if(const char *s, struct addresslist *al, int max,
 		if (ifname != NULL) {
 			if (strlcpy(h->ifname, ifname, sizeof(h->ifname)) >=
 			    sizeof(h->ifname))
-				log_warnx("%s: interface name truncated",
+				warnx("%s: interface name truncated",
 				    __func__);
 			freeifaddrs(ifap);
 			return (-1);
@@ -2886,7 +2730,7 @@ host_if(const char *s, struct addresslist *al, int max,
 	}
 
 	if (cnt > max) {
-		log_warnx("%s: %s resolves to more than %d hosts", __func__,
+		warnx("%s: %s resolves to more than %d hosts", __func__,
 		    s, max);
 	}
 	freeifaddrs(ifap);
@@ -2911,7 +2755,7 @@ host(const char *s, struct addresslist *al, int max,
 		if (ifname != NULL) {
 			if (strlcpy(h->ifname, ifname, sizeof(h->ifname)) >=
 			    sizeof(h->ifname)) {
-				log_warnx("%s: interface name truncated",
+				warnx("%s: interface name truncated",
 				    __func__);
 				free(h);
 				return (-1);
@@ -3042,12 +2886,6 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	rb->rl_conf.port = rc.port;
 	rb->rl_conf.flags =
 	    (ra->rl_conf.flags & ~F_SSL) | (rc.flags & F_SSL);
-	if (!(rb->rl_conf.flags & F_SSL)) {
-		rb->rl_ssl_cert = NULL;
-		rb->rl_conf.ssl_cert_len = 0;
-		rb->rl_ssl_key = NULL;
-		rb->rl_conf.ssl_key_len = 0;
-	}
 	TAILQ_INIT(&rb->rl_tables);
 
 	if (relay_id(rb) == -1) {
@@ -3067,11 +2905,6 @@ relay_inherit(struct relay *ra, struct relay *rb)
 		yyerror("relay %s defined twice", rb->rl_conf.name);
 		goto err;
 	}
-	if (relay_load_certfiles(rb) == -1) {
-		yyerror("cannot load certificates for relay %s",
-		    rb->rl_conf.name);
-		goto err;
-	}
 
 	TAILQ_FOREACH(rta, &ra->rl_tables, rlt_entry) {
 		if ((rtb = calloc(1, sizeof(*rtb))) == NULL) {
@@ -3086,7 +2919,6 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	}
 
 	conf->sc_relaycount++;
-	SPLAY_INIT(&rlay->rl_sessions);
 	TAILQ_INSERT_TAIL(conf->sc_relays, rb, rl_entry);
 
 	return (rb);

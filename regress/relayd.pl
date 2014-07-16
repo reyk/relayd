@@ -62,6 +62,8 @@ my $c = Client->new(
     connectdomain       => AF_INET,
     connectaddr         => "127.0.0.1",
     connectport         => $rport,
+    testfile            => $test,
+    measure             => $ARGV[0],
     %{$args{client}},
 ) unless $args{client}{noclient};
 

@@ -18,3 +18,5 @@ parse.c
 regress/relayd.conf
 stamp-*
 y.tab.h
+*/patches/
+*.diff

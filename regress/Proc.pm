@@ -22,7 +22,7 @@ use Carp;
 use Errno;
 use IO::File;
 use POSIX;
-use Time::HiRes qw(time alarm sleep);
+use Time::HiRes qw(time alarm sleep gettimeofday tv_interval);
 
 my %CHILDREN;
 
@@ -103,10 +103,22 @@ sub run {
 
 	$self->child();
 	print STDERR $self->{up}, "\n";
+	$self->{start} = [gettimeofday()];
 	$self->{func}->($self);
+	$self->{end} = [gettimeofday()];
 	print STDERR "Shutdown", "\n";
 	IO::Handle::flush(\*STDOUT);
 	IO::Handle::flush(\*STDERR);
+
+	if ($self->{measure}) {
+		my $tm = strftime("%FT%H:%M:%S%z",
+		    localtime(gettimeofday()));
+		open(my $fh, ">>", "time.log");
+		print $fh $tm." ".
+		    ($self->{testfile})." ".$self->{measure}." ".
+		    tv_interval($self->{start}, $self->{end})."\n";
+		close($fh);
+	}
 
 	POSIX::_exit(0);
 }
