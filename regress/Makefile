@@ -52,7 +52,7 @@ PERLPATH =	${.CURDIR}/
 
 .for a in ${ARGS}
 run-regress-$a: $a
-	@echo '\n======== $a ========'
+	@echo '\n======== $@ ========'
 .if empty (REMOTE_SSH)
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}relayd.pl copy ${PERLPATH}$a
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}relayd.pl splice ${PERLPATH}$a
