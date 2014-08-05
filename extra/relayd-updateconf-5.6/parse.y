@@ -1559,10 +1559,9 @@ relayoptsl	: LISTEN ON STRING port optssl {
 			free($2);
 		}
 		| DISABLE		{
-			char		 buf[256];
+			char		 *buf = "disable";
 
 			rlay->rl_conf.flags |= F_DISABLE;
-			(void)snprintf(buf, sizeof(buf), "disable");
 			rlay->rl_opts = opts_add(rlay->rl_opts,
 			    &rlay->rl_optsc, buf);
 		}
@@ -1693,6 +1692,7 @@ routeopts_l	: routeopts_l routeoptsl nl
 
 routeoptsl	: ROUTE address '/' NUMBER {
 			struct netroute	*nr;
+			char		 buf[256];
 
 			if (router->rt_conf.af == AF_UNSPEC)
 				router->rt_conf.af = $2.ss.ss_family;
@@ -1728,8 +1728,13 @@ routeoptsl	: ROUTE address '/' NUMBER {
 			conf->sc_routecount++;
 			TAILQ_INSERT_TAIL(&router->rt_netroutes, nr, nr_entry);
 			TAILQ_INSERT_TAIL(conf->sc_routes, nr, nr_route);
+			rts_print_route(nr, buf, sizeof(buf));
+			router->opts = opts_add(router->opts, &router->optsc,
+			    buf);
 		}
 		| FORWARD TO tablespec {
+			char	buf[256];
+
 			if (router->rt_gwtable) {
 				yyerror("router %s table already specified",
 				    router->rt_conf.name);
@@ -1740,8 +1745,14 @@ routeoptsl	: ROUTE address '/' NUMBER {
 			router->rt_gwtable->conf.flags |= F_USED;
 			router->rt_conf.gwtable = $3->conf.id;
 			router->rt_conf.gwport = $3->conf.port;
+
+			rts_print_forward(router, buf, sizeof(buf));
+			router->opts = opts_add(router->opts, &router->optsc,
+			    buf);
 		}
 		| RTABLE NUMBER {
+			char buf[RT_LABEL_SIZE * 2];
+
 			if (router->rt_conf.rtable) {
 				yyerror("router %s rtable already specified",
 				    router->rt_conf.name);
@@ -1752,8 +1763,14 @@ routeoptsl	: ROUTE address '/' NUMBER {
 				YYERROR;
 			}
 			router->rt_conf.rtable = $2;
+
+			(void)snprintf(buf, sizeof(buf), "rtable %lld", $2);
+			router->opts = opts_add(router->opts, &router->optsc,
+			    buf);
 		}
 		| RTLABEL STRING {
+			char buf[RT_LABEL_SIZE * 2];
+
 			if (strlcpy(router->rt_conf.label, $2,
 			    sizeof(router->rt_conf.label)) >=
 			    sizeof(router->rt_conf.label)) {
@@ -1761,9 +1778,18 @@ routeoptsl	: ROUTE address '/' NUMBER {
 				free($2);
 				YYERROR;
 			}
+			(void)snprintf(buf, sizeof(buf), "rtlabel \"%s\"", $2);
+			router->opts = opts_add(router->opts, &router->optsc,
+			    buf);
 			free($2);
 		}
-		| DISABLE		{ rlay->rl_conf.flags |= F_DISABLE; }
+		| DISABLE		{
+			char	buf[256];
+
+			router->rt_conf.flags |= F_DISABLE;
+			(void)snprintf(buf, sizeof(buf), "disable");
+			router->opts = opts_add(router->opts, &router->optsc, buf);
+		}
 		| include
 		;
 

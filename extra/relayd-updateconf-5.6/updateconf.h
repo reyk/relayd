@@ -385,8 +385,8 @@ struct router {
 
 	struct table		*rt_gwtable;
 	struct netroutelist	 rt_netroutes;
-	char			**rt_opts;
-	size_t			  rt_optsc;
+	char			**opts;
+	size_t			  optsc;
 
 	TAILQ_ENTRY(router)	 rt_entry;
 };
@@ -468,6 +468,8 @@ void		 relay_print_forward(struct relay *, struct relay_table *,
 		     char *, size_t);
 void		 relay_print_listen(struct relay *, char *, size_t);
 void		 relay_print_session(struct relay *, char *, size_t);
+void		 rts_print_forward(struct router *, char *, size_t);
+void		 rts_print_route(struct netroute *, char *, size_t);
 void		 table_print(struct table *, char *, size_t);
 char		*getsslflag(u_int8_t);
 char		**opts_add(char **, size_t *, const char *);

@@ -278,7 +278,6 @@ parseconf(struct relayd *env)
 	struct relay		*rlay;
 	struct netroute		*nr;
 	struct router		*rt;
-	char			 buf[256];
 	size_t			 i = 0;
 
 	if (env->sc_mainoptsc > 0) {
@@ -349,14 +348,20 @@ parseconf(struct relayd *env)
 			while ((nr = TAILQ_FIRST(&rt->rt_netroutes)) != NULL) {
 				TAILQ_REMOVE(&rt->rt_netroutes, nr, nr_entry);
 				TAILQ_REMOVE(env->sc_routes, nr, nr_route);
-				fprintf(stdout, "\troute %s/%d\n",
-				    print_host(&nr->nr_conf.ss, buf,
-				    sizeof(buf)),
-				    nr->nr_conf.prefixlen);
 				free(nr);
 				env->sc_routecount--;
 			}
-			print_rts_forward(rt);
+			/* print router opts */
+			if (rt->optsc > 0) {
+				for (i = 0; i < rt->optsc; i++) {
+					fprintf(stdout, "\t%s\n",
+						rt->opts[i]);
+					free(rt->opts[i]);
+					rt->opts[i] = NULL;
+				}
+				free(rt->opts);
+				rt->optsc = 0;
+			}
 			fprintf(stdout, "}\n");
 			free(rt);
 		}
@@ -561,22 +566,39 @@ print_tablecheck(struct table *t)
 }
 
 void
-print_rts_forward(struct router *rt)
+rts_print_forward(struct router *rt, char *buf, size_t buflen)
 {
-	char	*buf;
+	char	*port = NULL;
+	char	*check = NULL;
+	int	 lenopt = 0;
 
-	buf = print_tcpport(rt->rt_conf.gwport);
 	rt->rt_gwtable->conf.name[strcspn(rt->rt_gwtable->conf.name, ":")] =
 	    '\0';
-	fprintf(stdout, "\tforward to <%s>%s%s ", rt->rt_gwtable->conf.name,
-	    buf == NULL ? "" : " ", buf == NULL ? "" : buf);
-	if (buf)
-		free(buf);
-	if ((buf = print_tablecheck(rt->rt_gwtable)) != NULL)
-		fprintf(stdout, "%s", buf);
-	fprintf(stdout, "\n");
-	if (buf)
-		free(buf);
+	port = print_tcpport(rt->rt_conf.gwport);
+	lenopt += snprintf(buf, buflen, "forward to <%s>%s%s",
+	    rt->rt_gwtable->conf.name,
+	    port == NULL ? "" : " port ",
+	    port == NULL ? "" : port);
+
+	if (port)
+		free(port);
+
+	if ((check = print_tablecheck(rt->rt_gwtable)) != NULL) {
+		(void)snprintf(buf + lenopt, buflen, " %s", check);
+		free(check);
+	}
+}
+
+void
+rts_print_route(struct netroute *nr, char *buf, size_t buflen)
+{
+	char	 host[MAXHOSTNAMELEN];
+
+	bzero(host, sizeof(host));
+	print_host(&nr->nr_conf.ss, host, sizeof(host));
+	if (host[0])
+		snprintf(buf, buflen, "route %s/%d", host,
+		    nr->nr_conf.prefixlen);
 }
 
 void
