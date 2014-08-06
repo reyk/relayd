@@ -1875,7 +1875,6 @@ routeoptsl	: ROUTE address '/' NUMBER {
 			}
 			free($2);
 		}
-		| DISABLE		{ rlay->rl_conf.flags |= F_DISABLE; }
 		| include
 		;
 
