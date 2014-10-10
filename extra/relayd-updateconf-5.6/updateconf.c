@@ -781,7 +781,8 @@ table_print(struct table *table, char *buf, size_t len)
 	struct host	*host;
 
 	bzero(buf, len);
-	offs += snprintf(buf, len, "table <%s> {", table->conf.name);
+	offs += snprintf(buf, len, "table <%s> %s{", table->conf.name,
+	    table->conf.flags & F_DISABLE ? "disable " : "");
 	TAILQ_FOREACH(host, &table->hosts, entry) {
 		offs += snprintf(buf + offs, len, " %s", host->conf.name);
 		if (host->conf.retry > 0)
@@ -789,7 +790,7 @@ table_print(struct table *table, char *buf, size_t len)
 			    host->conf.retry);
 		if (host->conf.parentid > 0)
 			offs += snprintf(buf + offs, len, " parent %d",
-			    host->conf.retry);
+			    host->conf.parentid);
 		if (host->conf.priority > 0)
 			offs += snprintf(buf + offs, len, " priority %d",
 			    host->conf.priority);
