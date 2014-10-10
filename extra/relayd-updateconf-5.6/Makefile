@@ -16,3 +16,6 @@ CFLAGS+=	-Wsign-compare
 CLEANFILES+=	y.tab.h
 
 .include <bsd.prog.mk>
+
+run: .PHONY
+	./relayd-updateconf -f ./relayd.conf
