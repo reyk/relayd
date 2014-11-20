@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.182 2014/07/09 16:42:05 reyk Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.197 2014/11/19 10:24:40 blambert Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -59,6 +59,7 @@
 #define RELAY_NUMPROC		3
 #define RELAY_MAXPROC		32
 #define RELAY_MAXHOSTS		32
+#define RELAY_MAXHEADERLENGTH	8192
 #define RELAY_STATINTERVAL	60
 #define RELAY_BACKLOG		10
 #define RELAY_MAXLOOKUPLEVELS	5
@@ -161,6 +162,13 @@ enum direction {
 	RELAY_DIR_RESPONSE	=  2
 };
 
+enum sslreneg_state {
+	SSLRENEG_INIT		= 0,	/* first/next negotiation is allowed */
+	SSLRENEG_ALLOW		= 1,	/* all (re-)negotiations are allowed */
+	SSLRENEG_DENY		= 2,	/* next renegotiation must be denied */
+	SSLRENEG_ABORT		= 3	/* the connection should be aborted */
+};
+
 struct ctl_relay_event {
 	int			 s;
 	in_port_t		 port;
@@ -169,13 +177,17 @@ struct ctl_relay_event {
 	struct evbuffer		*output;
 	struct ctl_relay_event	*dst;
 	struct rsession		*con;
+
 	SSL			*ssl;
 	X509			*sslcert;
+	enum sslreneg_state	 sslreneg_state;
 
 	off_t			 splicelen;
-	int			 line;
 	off_t			 toread;
+	size_t			 headerlen;
+	int			 line;
 	int			 done;
+	int			 timedout;
 	enum direction		 dir;
 
 	u_int8_t		*buf;
@@ -272,6 +284,9 @@ enum digest_type {
 	DIGEST_MD5		= 2
 };
 
+TAILQ_HEAD(kvlist, kv);
+RB_HEAD(kvtree, kv);
+
 struct kv {
 	char			*kv_key;
 	char			*kv_value;
@@ -279,22 +294,26 @@ struct kv {
 	enum key_type		 kv_type;
 	enum key_option		 kv_option;
 	enum digest_type	 kv_digest;
-	u_int			 kv_header_id;
 
 #define KV_FLAG_MACRO		 0x01
 #define KV_FLAG_INVALID		 0x02
+#define KV_FLAG_GLOBBING	 0x04
 	u_int8_t		 kv_flags;
+
+	struct kvlist		 kv_children;
+	struct kv		*kv_parent;
+	TAILQ_ENTRY(kv)		 kv_entry;
+
+	RB_ENTRY(kv)		 kv_node;
 
 	/* A few pointers used by the rule actions */
 	struct kv		*kv_match;
-	struct kvlist		*kv_matchlist;
-	struct kv		**kv_matchptr;
+	struct kvtree		*kv_matchtree;
 
 	TAILQ_ENTRY(kv)		 kv_match_entry;
 	TAILQ_ENTRY(kv)		 kv_rule_entry;
-	TAILQ_ENTRY(kv)		 kv_entry;
+	TAILQ_ENTRY(kv)		 kv_action_entry;
 };
-TAILQ_HEAD(kvlist, kv);
 
 struct portrange {
 	in_port_t		 val[2];
@@ -365,6 +384,7 @@ struct host_config {
 
 struct host {
 	TAILQ_ENTRY(host)	 entry;
+	TAILQ_ENTRY(host)	 globalentry;
 	SLIST_ENTRY(host)	 child;
 	SLIST_HEAD(,host)	 children;
 	struct host_config	 conf;
@@ -507,6 +527,7 @@ struct rsession {
 	int				 se_retry;
 	int				 se_retrycount;
 	int				 se_connectcount;
+	int				 se_haslog;
 	struct evbuffer			*se_log;
 	struct relay			*se_relay;
 	struct ctl_natlook		*se_cnl;
@@ -517,8 +538,10 @@ struct rsession {
 	int				 se_cid;
 	pid_t				 se_pid;
 	SPLAY_ENTRY(rsession)		 se_nodes;
+	TAILQ_ENTRY(rsession)		 se_entry;
 };
 SPLAY_HEAD(session_tree, rsession);
+TAILQ_HEAD(sessionlist, rsession);
 
 enum prototype {
 	RELAY_PROTO_TCP		= 0,
@@ -615,17 +638,27 @@ TAILQ_HEAD(relay_rules, relay_rule);
 	"\10\01NODELAY\02NO_NODELAY\03SACK\04NO_SACK"		\
 	"\05SOCKET_BUFFER_SIZE\06IP_TTL\07IP_MINTTL\10NO_SPLICE"
 
-#define SSLFLAG_SSLV2		0x01
-#define SSLFLAG_SSLV3		0x02
-#define SSLFLAG_TLSV1		0x04
-#define SSLFLAG_VERSION		0x07
-#define SSLFLAG_DEFAULT		(SSLFLAG_SSLV3|SSLFLAG_TLSV1)
+#define SSLFLAG_SSLV3				0x01
+#define SSLFLAG_TLSV1_0				0x02
+#define SSLFLAG_TLSV1_1				0x04
+#define SSLFLAG_TLSV1_2				0x08
+#define SSLFLAG_TLSV1				0x0e
+#define SSLFLAG_VERSION				0x1f
+#define SSLFLAG_CIPHER_SERVER_PREF		0x20
+#define SSLFLAG_CLIENT_RENEG			0x40
+#define SSLFLAG_DEFAULT				\
+	(SSLFLAG_TLSV1|SSLFLAG_CLIENT_RENEG)
 
 #define SSLFLAG_BITS						\
-	"\10\01sslv2\02sslv3\03tlsv1\04version"
+	"\06\01sslv3\02tlsv1.0\03tlsv1.1\04tlsv1.2"	\
+	"\06cipher-server-preference\07client-renegotiation"
 
 #define SSLCIPHERS_DEFAULT	"HIGH:!aNULL"
 #define SSLECDHCURVE_DEFAULT	NID_X9_62_prime256v1
+
+#define SSLDHPARAMS_NONE	0
+#define SSLDHPARAMS_DEFAULT	0
+#define SSLDHPARAMS_MIN		1024
 
 struct protocol {
 	objid_t			 id;
@@ -637,6 +670,7 @@ struct protocol {
 	u_int8_t		 tcpipminttl;
 	u_int8_t		 sslflags;
 	char			 sslciphers[768];
+	int			 ssldhparams;
 	int			 sslecdhcurve;
 	char			 sslca[MAXPATHLEN];
 	char			 sslcacert[MAXPATHLEN];
@@ -684,7 +718,6 @@ struct relay_config {
 	u_int32_t		 flags;
 	objid_t			 proto;
 	char			 name[MAXHOSTNAMELEN];
-	char			 ifname[IFNAMSIZ];
 	in_port_t		 port;
 	in_port_t		 dstport;
 	int			 dstretry;
@@ -905,7 +938,9 @@ enum imsg_type {
 	IMSG_CFG_RELAY_TABLE,
 	IMSG_CFG_DONE,
 	IMSG_CA_PRIVENC,
-	IMSG_CA_PRIVDEC
+	IMSG_CA_PRIVDEC,
+	IMSG_SESS_PUBLISH,	/* from relay to hce */
+	IMSG_SESS_UNPUBLISH
 };
 
 enum privsep_procid {
@@ -947,6 +982,7 @@ struct privsep {
 	struct event			 ps_evsigchld;
 	struct event			 ps_evsighup;
 	struct event			 ps_evsigpipe;
+	struct event			 ps_evsigusr1;
 
 	int				 ps_noaction;
 	struct passwd			*ps_pw;
@@ -986,12 +1022,14 @@ struct relayd {
 	struct protocol		 sc_proto_default;
 	struct event		 sc_ev;
 	struct tablelist	*sc_tables;
+	struct hostlist		 sc_hosts;
 	struct rdrlist		*sc_rdrs;
 	struct protolist	*sc_protos;
 	struct relaylist	*sc_relays;
 	struct routerlist	*sc_rts;
 	struct netroutelist	*sc_routes;
 	struct ca_pkeylist	*sc_pkeys;
+	struct sessionlist	 sc_sessions;
 	u_int16_t		 sc_prefork_relay;
 	char			 sc_demote_group[IFNAMSIZ];
 	u_int16_t		 sc_id;
@@ -1048,7 +1086,6 @@ const char *table_check(enum table_check);
 const char *print_availability(u_long, u_long);
 const char *print_host(struct sockaddr_storage *, char *, size_t);
 const char *print_time(struct timeval *, struct timeval *, char *, size_t);
-const char *print_httperror(u_int);
 const char *printb_flags(const u_int32_t, const char *);
 void	 getmonotime(struct timeval *);
 
@@ -1121,7 +1158,11 @@ int	 relay_bufferevent_write(struct ctl_relay_event *,
 int	 relay_test(struct protocol *, struct ctl_relay_event *);
 void	 relay_calc_skip_steps(struct relay_rules *);
 void	 relay_match(struct kvlist *, struct kv *, struct kv *,
-	    struct kvlist *);
+	    struct kvtree *);
+void	 relay_session_insert(struct rsession *);
+void	 relay_session_remove(struct rsession *);
+void	 relay_session_publish(struct rsession *);
+void	 relay_session_unpublish(struct rsession *);
 
 SPLAY_PROTOTYPE(session_tree, rsession, se_nodes, relay_session_cmp);
 
@@ -1135,9 +1176,8 @@ void	 relay_close_http(struct rsession *);
 u_int	 relay_httpmethod_byname(const char *);
 const char
 	*relay_httpmethod_byid(u_int);
-u_int	 relay_httpheader_byname(const char *);
 const char
-	*relay_httpheader_byid(u_int id);
+	*relay_httperror_byid(u_int);
 int	 relay_httpdesc_init(struct ctl_relay_event *);
 
 /* relay_udp.c */
@@ -1220,15 +1260,19 @@ struct in6_addr *prefixlen2mask6(u_int8_t, u_int32_t *);
 u_int32_t	 prefixlen2mask(u_int8_t);
 int		 accept_reserve(int, struct sockaddr *, socklen_t *, int,
 		     volatile int *);
-struct kv	*kv_add(struct kvlist *, char *, char *);
+struct kv	*kv_add(struct kvtree *, char *, char *);
 int		 kv_set(struct kv *, char *, ...);
 int		 kv_setkey(struct kv *, char *, ...);
-void		 kv_delete(struct kvlist *, struct kv *);
-struct kv	*kv_extend(struct kvlist *, char *);
-void		 kv_purge(struct kvlist *);
+void		 kv_delete(struct kvtree *, struct kv *);
+struct kv	*kv_extend(struct kvtree *, struct kv *, char *);
+void		 kv_purge(struct kvtree *);
 void		 kv_free(struct kv *);
 struct kv	*kv_inherit(struct kv *, struct kv *);
-int		 kv_log(struct evbuffer *, struct kv *, u_int16_t);
+void		 relay_log(struct rsession *, char *);
+int		 kv_log(struct rsession *, struct kv *, u_int16_t,
+		     enum direction);
+struct kv	*kv_find(struct kvtree *, struct kv *);
+int		 kv_cmp(struct kv *, struct kv *);
 int		 rule_add(struct protocol *, struct relay_rule *, const char
 		     *);
 void		 rule_delete(struct relay_rules *, struct relay_rule *);
@@ -1236,6 +1280,7 @@ void		 rule_free(struct relay_rule *);
 struct relay_rule
 		*rule_inherit(struct relay_rule *);
 void		 rule_settable(struct relay_rules *, struct relay_table *);
+RB_PROTOTYPE(kvtree, kv, kv_node, kv_cmp);
 
 /* carp.c */
 int	 carp_demote_init(char *, int);
@@ -1271,6 +1316,7 @@ void	log_warn(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
 void	log_warnx(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
 void	log_info(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
 void	log_debug(const char *, ...) __attribute__((__format__ (printf, 1, 2)));
+void	logit(int, const char *, ...) __attribute__((__format__ (printf, 2, 3)));
 void	vlog(int, const char *, va_list) __attribute__((__format__ (printf, 2, 0)));
 __dead void fatal(const char *);
 __dead void fatalx(const char *);

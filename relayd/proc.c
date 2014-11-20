@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.c,v 1.14 2014/05/08 13:08:48 blambert Exp $	*/
+/*	$OpenBSD: proc.c,v 1.17 2014/10/25 03:23:49 lteo Exp $	*/
 
 /*
  * Copyright (c) 2010 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -24,7 +24,6 @@
 #include <sys/tree.h>
 
 #include <net/if.h>
-#include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <arpa/inet.h>
@@ -163,7 +162,7 @@ proc_open(struct privsep *ps, struct privsep_proc *p,
 
 	/*
 	 * Open socket pairs for our peers
-	 */	
+	 */
 	for (proc = 0; proc < nproc; proc++) {
 		procs[proc].p_ps = ps;
 		procs[proc].p_env = ps->ps_env;
@@ -323,6 +322,7 @@ proc_sig_handler(int sig, short event, void *arg)
 	case SIGCHLD:
 	case SIGHUP:
 	case SIGPIPE:
+	case SIGUSR1:
 		/* ignore */
 		break;
 	default:
@@ -409,12 +409,14 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 	signal_set(&ps->ps_evsigchld, SIGCHLD, proc_sig_handler, p);
 	signal_set(&ps->ps_evsighup, SIGHUP, proc_sig_handler, p);
 	signal_set(&ps->ps_evsigpipe, SIGPIPE, proc_sig_handler, p);
+	signal_set(&ps->ps_evsigusr1, SIGUSR1, proc_sig_handler, p);
 
 	signal_add(&ps->ps_evsigint, NULL);
 	signal_add(&ps->ps_evsigterm, NULL);
 	signal_add(&ps->ps_evsigchld, NULL);
 	signal_add(&ps->ps_evsighup, NULL);
 	signal_add(&ps->ps_evsigpipe, NULL);
+	signal_add(&ps->ps_evsigusr1, NULL);
 
 	proc_listen(ps, procs, nproc);
 
@@ -464,7 +466,7 @@ proc_dispatch(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if (msgbuf_write(&ibuf->w) == -1 && errno != EAGAIN)
+		if (msgbuf_write(&ibuf->w) <= 0 && errno != EAGAIN)
 			fatal(title);
 	}
 

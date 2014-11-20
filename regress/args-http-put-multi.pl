@@ -1,22 +1,19 @@
+# test 50 http put with length 1 over http relay
+
 use strict;
 use warnings;
 
-my @lengths = (21);
+my @lengths = map { 1 } (1..50);
 our %args = (
     client => {
 	func => \&http_client,
 	lengths => \@lengths,
-	path => "query?foo=bar&ok=yes",
+	method => "PUT",
     },
     relayd => {
-	protocol => [ "http",
-	    'block request',
-	    'block request query log "ok"',
-	    'pass query log "foo" value "bar"',
-	],
+	protocol => [ "http" ],
 	loggrep => {
-		qr/\[foo: bar\]/ => 2,
-		qr/\[ok: yes\]/ => 0,
+	    qr/, (?:done|last write \(done\)), PUT/ => (1 + @lengths),
 	},
     },
     server => {

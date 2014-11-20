@@ -1,4 +1,4 @@
-/*      $OpenBSD: agentx.c,v 1.5 2014/04/20 16:07:10 reyk Exp $    */
+/*      $OpenBSD: agentx.c,v 1.8 2014/11/19 10:24:40 blambert Exp $    */
 /*
  * Copyright (c) 2013,2014 Bret Stephen Lambert <blambert@openbsd.org>
  *
@@ -42,6 +42,7 @@ int	snmp_agentx_do_read_raw(struct agentx_pdu *, void *, int, int);
 void	snmp_agentx_update_ids(struct agentx_handle *, struct agentx_pdu *);
 struct agentx_pdu *
 	agentx_find_inflight(struct agentx_handle *, uint32_t, uint32_t);
+int	snmp_agentx_do_read_oid(struct agentx_pdu *, struct snmp_oid *, int *);
 
 #ifdef DEBUG
 static void	snmp_agentx_dump_hdr(struct agentx_hdr *);
@@ -254,17 +255,6 @@ snmp_agentx_pdu_free(struct agentx_pdu *pdu)
 	free(pdu);
 }
 
-/*
- * Set the callback function to be called when a complete PDU is received.
- */
-void
-snmp_agentx_set_callback(struct agentx_handle *h,
-    void (*cb)(struct agentx_handle *, struct agentx_pdu *, void *), void *arg)
-{
-	h->cb = cb;
-	h->cb_arg = arg;
-}
-
 int
 snmp_agentx_buffer_consume(struct agentx_pdu *b, u_int len)
 {
@@ -365,6 +355,11 @@ snmp_agentx_recv(struct agentx_handle *h)
 			return (NULL);
 		}
 
+		if (pdu->hdr->version != AGENTX_VERSION) {
+			h->error = AGENTX_ERR_PARSE_ERROR;
+			return (NULL);
+		}
+
 		if (snmp_agentx_buffercheck(pdu, pdu->hdr->length) == -1)
 			return (NULL);
 	}
@@ -385,16 +380,16 @@ snmp_agentx_recv(struct agentx_handle *h)
 #ifdef DEBUG
 	snmp_agentx_dump_hdr(pdu->hdr);
 #endif
+	if (pdu->hdr->version != AGENTX_VERSION) {
+		h->error = AGENTX_ERR_PARSE_ERROR;
+		goto fail;
+	}
+
 	/* If this is an open on a new connection, fix it up */
 	if (pdu->hdr->type == AGENTX_OPEN && h->sessionid == 0) {
 		pdu->hdr->sessionid = 0;		/* ignored, per RFC */
 		h->transactid = pdu->hdr->transactid;
 		h->packetid = pdu->hdr->packetid;
-	}
-
-	if (pdu->hdr->version != AGENTX_VERSION) {
-		h->error = AGENTX_ERR_PARSE_ERROR;
-		goto fail;
 	}
 
 	if (pdu->hdr->type == AGENTX_RESPONSE) {
@@ -409,9 +404,6 @@ snmp_agentx_recv(struct agentx_handle *h)
 		TAILQ_REMOVE(&h->inflight, match, entry);
 		pdu->request = match;
 		h->r = NULL;
-
-		if (h->cb)
-			h->cb(h, pdu, h->cb_arg);
 
 	} else {
 		if (pdu->hdr->sessionid != h->sessionid) {
@@ -479,14 +471,14 @@ int
 snmp_agentx_buffercheck(struct agentx_pdu *pdu, size_t len)
 {
 	uint8_t *newptr;
-	int newlen;
+	size_t newlen;
 
 	if (pdu->buflen - pdu->datalen >= len)
 		return (0);
 
-	newlen = pdu->buflen;
-	while (newlen - pdu->datalen < len)
-		newlen *= 2;
+	newlen = pdu->buflen + len;
+	if (newlen < pdu->buflen || newlen < len)
+		return (-1);
 
 	if ((newptr = realloc(pdu->buffer, newlen)) == NULL)
 		return (-1);
@@ -633,6 +625,61 @@ snmp_agentx_register_pdu(struct snmp_oid *oid, int timeout, int range_index,
 	    (range_index && snmp_agentx_int(pdu, &range_bound) == -1)) {
 		snmp_agentx_pdu_free(pdu);
 		return (NULL);
+	}
+
+	return (pdu);
+}
+
+struct agentx_pdu *
+snmp_agentx_unregister_pdu(struct snmp_oid *oid, int range_index,
+    int range_bound)
+{
+	struct agentx_unregister_hdr	 uhdr;
+	struct agentx_pdu		*pdu;
+
+	if ((pdu = snmp_agentx_pdu_alloc()) == NULL)
+		return (NULL);
+
+	pdu->hdr->version = AGENTX_VERSION;
+	pdu->hdr->type = AGENTX_UNREGISTER;
+
+	uhdr.reserved1 = 0;
+	uhdr.priority = AGENTX_REGISTER_PRIO_DEFAULT;
+	uhdr.subrange = range_index;
+	uhdr.reserved2 = 0;
+
+	if (snmp_agentx_raw(pdu, &uhdr, sizeof(uhdr)) == -1 ||
+	    snmp_agentx_oid(pdu, oid) == -1 ||
+	    snmp_agentx_oid(pdu, oid) == -1 ||
+	    (range_index && snmp_agentx_int(pdu, &range_bound) == -1)) {
+		snmp_agentx_pdu_free(pdu);
+		return (NULL);
+	}
+
+	return (pdu);
+}
+
+struct agentx_pdu *
+snmp_agentx_get_pdu(struct snmp_oid oid[], int noid)
+{
+	struct snmp_oid		 nulloid;
+	struct agentx_pdu	*pdu;
+	int			 i;
+
+	if ((pdu = snmp_agentx_pdu_alloc()) == NULL)
+		return (NULL);
+
+	pdu->hdr->version = AGENTX_VERSION;
+	pdu->hdr->type = AGENTX_GET;
+
+	bzero(&nulloid, sizeof(nulloid));
+
+	for (i = 0; i < noid; i++) {
+		if (snmp_agentx_oid(pdu, &oid[i]) == -1 ||
+		    snmp_agentx_oid(pdu, &nulloid) == -1) {
+			snmp_agentx_pdu_free(pdu);
+			return (NULL);
+		}
 	}
 
 	return (pdu);
@@ -831,6 +878,15 @@ snmp_agentx_read_int64(struct agentx_pdu *pdu, uint64_t *i)
 int
 snmp_agentx_read_oid(struct agentx_pdu *pdu, struct snmp_oid *oid)
 {
+	int dummy;
+
+	return (snmp_agentx_do_read_oid(pdu, oid, &dummy));
+}
+
+int
+snmp_agentx_do_read_oid(struct agentx_pdu *pdu, struct snmp_oid *oid,
+    int *include)
+{
 	struct agentx_oid_hdr ohdr;
 	int i = 0;
 
@@ -853,6 +909,17 @@ snmp_agentx_read_oid(struct agentx_pdu *pdu, struct snmp_oid *oid)
 			return (-1);
 
 	oid->o_n = i;
+	*include = ohdr.include;
+
+	return (0);
+}
+
+int
+snmp_agentx_read_searchrange(struct agentx_pdu *pdu, struct agentx_search_range *sr)
+{
+	if (snmp_agentx_do_read_oid(pdu, &sr->start, &sr->include) == -1 ||
+	    snmp_agentx_read_oid(pdu, &sr->end) == -1)
+		return (-1);
 
 	return (0);
 }
@@ -915,6 +982,63 @@ snmp_agentx_update_ids(struct agentx_handle *h, struct agentx_pdu *pdu)
 }
 
 char *
+snmp_oid2string(struct snmp_oid *o, char *buf, size_t len)
+{
+	char		 str[256];
+	size_t		 i;
+
+	bzero(buf, len);
+
+	for (i = 0; i < o->o_n; i++) {
+		snprintf(str, sizeof(str), "%u", o->o_id[i]);
+		strlcat(buf, str, len);
+		if (i < (o->o_n - 1))
+			strlcat(buf, ".", len);
+	}
+
+	return (buf);
+}
+
+int
+snmp_oid_cmp(struct snmp_oid *a, struct snmp_oid *b)
+{
+	size_t		i;
+
+	for (i = 0; i < SNMP_MAX_OID_LEN; i++) {
+		if (a->o_id[i] != 0) {
+			if (a->o_id[i] == b->o_id[i])
+				continue;
+			else if (a->o_id[i] < b->o_id[i]) {
+				/* b is a successor of a */
+				return (1);
+			} else {
+				/* b is a predecessor of a */
+				return (-1);
+			}
+		} else if (b->o_id[i] != 0) {
+			/* b is larger, but a child of a */
+			return (2);
+		} else
+			break;
+	}
+
+	/* b and a are identical */
+	return (0);
+}
+
+void
+snmp_oid_increment(struct snmp_oid *o)
+{
+	u_int		i;
+
+	for (i = o->o_n; i > 0; i--) {
+		o->o_id[i - 1]++;
+		if (o->o_id[i - 1] != 0)
+			break;
+	}
+}
+
+char *
 snmp_agentx_type2name(int type)
 {
 	static char *names[] = {
@@ -953,21 +1077,20 @@ snmp_agentx_dump_hdr(struct agentx_hdr *hdr)
 		return;
 	}
 
-	printf("Version: %i\n", hdr->version);
-	printf("Type: %s\n", snmp_agentx_type2name(hdr->type));
-	printf("Flags: %i\n", hdr->flags);
-	printf("Reserved: %i\n", hdr->reserved);
-	printf("Session ID: %i\n", hdr->sessionid);
-	printf("Transaction ID: %i\n", hdr->transactid);
-	printf("Packet ID: %i\n", hdr->packetid);
-	printf("Data Length: %i\n", hdr->length);
+	fprintf(stderr, 
+	    "agentx: version %d type %s flags %d reserved %d"
+	    " sessionid %d transactid %d packetid %d length %d",
+	    hdr->version, snmp_agentx_type2name(hdr->type), hdr->flags,
+	    hdr->reserved, hdr->sessionid, hdr->transactid,
+	    hdr->packetid, hdr->length);
 
 	if (hdr->type == AGENTX_RESPONSE) {
 		struct agentx_response *r = (struct agentx_response *)hdr;
 
-		printf("SysUptime: %i\n", r->data.sysuptime);
-		printf("Error: %i\n", r->data.error);
-		printf("Index: %i\n", r->data.index);
+		fprintf(stderr, " sysuptime %d error %d index %d",
+		    r->data.sysuptime, r->data.error, r->data.index);
 	}
+
+	fprintf(stderr, "\n");
 }
 #endif

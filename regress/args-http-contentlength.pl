@@ -8,7 +8,6 @@ our %args = (
     client => {
 	func => \&http_client,
 	lengths => \@lengths,
-	mreqs => 1,
     },
     relayd => {
 	protocol => [ "http",
@@ -19,8 +18,20 @@ our %args = (
     },
     server => {
 	func => \&http_server,
-	mreqs => scalar(@lengths),
     },
+    lengths => \@lengths,
+    md5 => [
+	"68b329da9893e34099c7d8ad5cb9c940",
+	"897316929176464ebc9ad085f31e7284",
+	"d41d8cd98f00b204e9800998ecf8427e",
+	"0ade138937c4b9cb36a28e2edb6485fc",
+	"e686f5db1f8610b65f98f3718e1a5b72",
+	"68b329da9893e34099c7d8ad5cb9c940",
+	"897316929176464ebc9ad085f31e7284",
+	"d41d8cd98f00b204e9800998ecf8427e",
+	"0ade138937c4b9cb36a28e2edb6485fc",
+	"e686f5db1f8610b65f98f3718e1a5b72",
+    ],
 );
 
 1;

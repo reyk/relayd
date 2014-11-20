@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_udp.c,v 1.30 2014/07/09 16:42:05 reyk Exp $	*/
+/*	$OpenBSD: relay_udp.c,v 1.34 2014/11/19 10:24:40 blambert Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -26,7 +26,6 @@
 #include <sys/hash.h>
 
 #include <net/if.h>
-#include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -219,6 +218,8 @@ relay_udp_server(int fd, short sig, void *arg)
 	void *priv = NULL;
 	ssize_t len;
 
+	event_add(&rlay->rl_ev, NULL);
+
 	if (relay_sessions >= RELAY_MAX_SESSIONS ||
 	    rlay->rl_conf.flags & F_DISABLE)
 		return;
@@ -268,6 +269,7 @@ relay_udp_server(int fd, short sig, void *arg)
 
 	relay_sessions++;
 	SPLAY_INSERT(session_tree, &rlay->rl_sessions, con);
+	relay_session_publish(con);
 
 	/* Increment the per-relay session counter */
 	rlay->rl_stats[proc_id].last++;
@@ -280,6 +282,7 @@ relay_udp_server(int fd, short sig, void *arg)
 	}
 
 	/* Pre-allocate log buffer */
+	con->se_haslog = 0;
 	con->se_log = evbuffer_new();
 	if (con->se_log == NULL) {
 		relay_close(con, "failed to allocate log buffer");
@@ -497,7 +500,7 @@ relay_dns_request(struct rsession *con)
 	}
 
 	event_again(&con->se_ev, con->se_out.s, EV_TIMEOUT|EV_READ,
-	    relay_udp_response, &con->se_tv_start, &env->sc_timeout, con);
+	    relay_udp_response, &con->se_tv_start, &rlay->rl_conf.timeout, con);
 
 	return (0);
 }

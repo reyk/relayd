@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.184 2014/07/09 16:42:05 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.195 2014/11/20 05:51:20 jsg Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -158,17 +158,17 @@ typedef struct {
 
 %}
 
-%token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK
-%token	CIPHERS CODE COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK
-%token	EXTERNAL FILENAME FORWARD FROM HASH HEADER HOST ICMP
-%token	INCLUDE INET INET6 INTERFACE INTERVAL IP LABEL LISTEN VALUE
-%token	LOADBALANCE LOG LOOKUP METHOD MODE NAT NO DESTINATION
-%token	NODELAY NOTHING ON PARENT PATH PFTAG PORT PREFORK PRIORITY PROTO
-%token	QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE RETRY QUICK
-%token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SNMP SOCKET SPLICE
-%token	SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TO ROUTER RTLABEL
-%token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
-%token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH CURVE
+%token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK CIPHERS CODE
+%token	COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK EXTERNAL FILENAME
+%token	FORWARD FROM HASH HEADER HOST ICMP INCLUDE INET INET6 INTERFACE
+%token	INTERVAL IP LABEL LISTEN VALUE LOADBALANCE LOG LOOKUP METHOD MODE NAT
+%token	NO DESTINATION NODELAY NOTHING ON PARENT PATH PFTAG PORT PREFORK
+%token	PRIORITY PROTO QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE
+%token	RETRY QUICK RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SNMP
+%token	SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TO
+%token	ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE
+%token	MATCH PARAMS RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH
+%token	EDH CURVE
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table value optstring
@@ -177,6 +177,7 @@ typedef struct {
 %type	<v.number>	optssl optsslclient sslcache
 %type	<v.number>	redirect_proto relay_proto match
 %type	<v.number>	action ruleaf key_option
+%type	<v.number>	ssldhparams sslecdhcurve
 %type	<v.port>	port
 %type	<v.host>	host
 %type	<v.addr>	address
@@ -904,6 +905,7 @@ proto		: relay_proto PROTO STRING	{
 			TAILQ_INIT(&p->rules);
 			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
 			    sizeof(p->sslciphers));
+			p->ssldhparams = SSLDHPARAMS_DEFAULT;
 			p->sslecdhcurve = SSLECDHCURVE_DEFAULT;
 			if (last_proto_id == INT_MAX) {
 				yyerror("too many protocols defined");
@@ -1002,15 +1004,17 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 			}
 			free($2);
 		}
-		| ECDH CURVE STRING		{
-			if (strcmp("none", $3) == 0)
-				proto->sslecdhcurve = 0;
-			else if ((proto->sslecdhcurve = OBJ_sn2nid($3)) == 0) {
-				yyerror("ECDH curve not supported");
-				free($3);
-				YYERROR;
-			}
-			free($3);
+		| NO EDH			{
+			proto->ssldhparams = SSLDHPARAMS_NONE;
+		}
+		| EDH ssldhparams		{
+			proto->ssldhparams = $2;
+		}
+		| NO ECDH			{
+			proto->sslecdhcurve = 0;
+		}
+		| ECDH sslecdhcurve		{
+			proto->sslecdhcurve = $2;
 		}
 		| CA FILENAME STRING		{
 			if (strlcpy(proto->sslca, $3,
@@ -1055,12 +1059,20 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 		;
 
 flag		: STRING			{
-			if (strcmp("sslv2", $1) == 0)
-				$$ = SSLFLAG_SSLV2;
-			else if (strcmp("sslv3", $1) == 0)
+			if (strcmp("sslv3", $1) == 0)
 				$$ = SSLFLAG_SSLV3;
 			else if (strcmp("tlsv1", $1) == 0)
 				$$ = SSLFLAG_TLSV1;
+			else if (strcmp("tlsv1.0", $1) == 0)
+				$$ = SSLFLAG_TLSV1_0;
+			else if (strcmp("tlsv1.1", $1) == 0)
+				$$ = SSLFLAG_TLSV1_1;
+			else if (strcmp("tlsv1.2", $1) == 0)
+				$$ = SSLFLAG_TLSV1_2;
+			else if (strcmp("cipher-server-preference", $1) == 0)
+				$$ = SSLFLAG_CIPHER_SERVER_PREF;
+			else if (strcmp("client-renegotiation", $1) == 0)
+				$$ = SSLFLAG_CLIENT_RENEG;
 			else {
 				yyerror("invalid SSL flag: %s", $1);
 				free($1);
@@ -1154,7 +1166,7 @@ ruleopts_t	: ruleopts ruleopts_t
 ruleopts	: METHOD STRING					{
 			u_int	id;
 			if ((id = relay_httpmethod_byname($2)) ==
-			    HTTP_HEADER_NONE) {
+			    HTTP_METHOD_NONE) {
 				yyerror("unknown HTTP method currently not "
 				    "supported");
 				free($2);
@@ -1186,8 +1198,6 @@ ruleopts	: METHOD STRING					{
 			keytype = KEY_TYPE_HEADER;
 			memset(&rule->rule_kv[keytype], 0,
 			    sizeof(rule->rule_kv[keytype]));
-			rule->rule_kv[keytype].kv_header_id =
-			    relay_httpheader_byname($3);
 			rule->rule_kv[keytype].kv_option = $2;
 			rule->rule_kv[keytype].kv_key = strdup($3);
 			rule->rule_kv[keytype].kv_value = (($4 != NULL) ?
@@ -1453,6 +1463,29 @@ key_option	: /* empty */		{ $$ = KEY_OPTION_NONE; }
 		| LOG			{ $$ = KEY_OPTION_LOG; }
 		;
 
+ssldhparams	: /* empty */		{ $$ = SSLDHPARAMS_MIN; }
+		| PARAMS NUMBER		{
+			if ($2 < SSLDHPARAMS_MIN) {
+				yyerror("EDH params not supported: %d", $2);
+				YYERROR;
+			}
+			$$ = $2;
+		}
+		;
+
+sslecdhcurve	: /* empty */		{ $$ = SSLECDHCURVE_DEFAULT; }
+		| CURVE STRING		{
+			if (strcmp("none", $2) == 0)
+				$$ = 0;
+			else if ((proto->sslecdhcurve = OBJ_sn2nid($2)) == 0) {
+				yyerror("ECDH curve not supported");
+				free($2);
+				YYERROR;
+			}
+			free($2);
+		}
+		;
+
 relay		: RELAY STRING	{
 			struct relay *r;
 
@@ -1584,32 +1617,11 @@ relayoptsl	: LISTEN ON STRING port optssl {
 			tableport = h->port.val[0];
 			host_free(&al);
 		}
-		| forwardmode optsslclient TO forwardspec interface dstaf {
+		| forwardmode optsslclient TO forwardspec dstaf {
 			rlay->rl_conf.fwdmode = $1;
-			switch ($1) {
-			case FWD_NORMAL:
-				if ($5 == NULL)
-					break;
-				yyerror("superfluous interface");
+			if ($1 == FWD_ROUTE) {
+				yyerror("no route for relays");
 				YYERROR;
-			case FWD_ROUTE:
-				yyerror("no route for redirections");
-				YYERROR;
-			case FWD_TRANS:
-				if ($5 != NULL)
-					break;
-				yyerror("missing interface");
-				YYERROR;
-			}
-			if ($5 != NULL) {
-				if (strlcpy(rlay->rl_conf.ifname, $5,
-				    sizeof(rlay->rl_conf.ifname)) >=
-				    sizeof(rlay->rl_conf.ifname)) {
-					yyerror("interface name truncated");
-					free($5);
-					YYERROR;
-				}
-				free($5);
 			}
 			if ($2) {
 				rlay->rl_conf.flags |= F_SSLCLIENT;
@@ -2019,15 +2031,15 @@ int
 yyerror(const char *fmt, ...)
 {
 	va_list		 ap;
-	char		*nfmt;
+	char		*msg;
 
 	file->errors++;
 	va_start(ap, fmt);
-	if (asprintf(&nfmt, "%s:%d: %s", file->name, yylval.lineno, fmt) == -1)
-		fatalx("yyerror asprintf");
-	vlog(LOG_CRIT, nfmt, ap);
+	if (vasprintf(&msg, fmt, ap) == -1)
+		fatalx("yyerror vasprintf");
 	va_end(ap);
-	free(nfmt);
+	logit(LOG_CRIT, "%s:%d: %s", file->name, yylval.lineno, msg);
+	free(msg);
 	return (0);
 }
 
@@ -2061,6 +2073,7 @@ lookup(char *s)
 		{ "digest",		DIGEST },
 		{ "disable",		DISABLE },
 		{ "ecdh",		ECDH },
+		{ "edh",		EDH },
 		{ "error",		ERROR },
 		{ "expect",		EXPECT },
 		{ "external",		EXTERNAL },
@@ -2092,6 +2105,7 @@ lookup(char *s)
 		{ "nodelay",		NODELAY },
 		{ "nothing",		NOTHING },
 		{ "on",			ON },
+		{ "params",		PARAMS },
 		{ "parent",		PARENT },
 		{ "pass",		PASS },
 		{ "password",		PASSWORD },
@@ -2316,6 +2330,9 @@ top:
 			} else if (c == quotec) {
 				*p = '\0';
 				break;
+			} else if (c == '\0') {
+				yyerror("syntax error");
+				return (findeol());
 			}
 			if (p + 1 >= buf + sizeof(buf) - 1) {
 				yyerror("string too long");
@@ -3004,6 +3021,7 @@ table_inherit(struct table *tb)
 		h->tablename = tb->conf.name;
 		SLIST_INIT(&h->children);
 		TAILQ_INSERT_TAIL(&tb->hosts, h, entry);
+		TAILQ_INSERT_TAIL(&conf->sc_hosts, h, globalentry);
 	}
 
 	conf->sc_tablecount++;

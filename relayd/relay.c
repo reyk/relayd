@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.172 2014/07/09 16:42:05 reyk Exp $	*/
+/*	$OpenBSD: relay.c,v 1.181 2014/11/19 10:24:40 blambert Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -26,7 +26,6 @@
 #include <sys/hash.h>
 
 #include <net/if.h>
-#include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -43,6 +42,7 @@
 #include <event.h>
 #include <fnmatch.h>
 
+#include <openssl/dh.h>
 #include <openssl/ssl.h>
 
 #include "relayd.h"
@@ -53,6 +53,8 @@ int		 relay_dispatch_parent(int, struct privsep_proc *,
 int		 relay_dispatch_pfe(int, struct privsep_proc *,
 		    struct imsg *);
 int		 relay_dispatch_ca(int, struct privsep_proc *,
+		    struct imsg *);
+int		 relay_dispatch_hce(int, struct privsep_proc *,
 		    struct imsg *);
 void		 relay_shutdown(void);
 
@@ -72,6 +74,9 @@ void		 relay_input(struct rsession *);
 
 u_int32_t	 relay_hash_addr(struct sockaddr_storage *, u_int32_t);
 
+DH *		 relay_ssl_get_dhparams(int);
+void		 relay_ssl_callback_info(const SSL *, int, int);
+DH		*relay_ssl_callback_dh(SSL *, int, int);
 SSL_CTX		*relay_ssl_ctx_create(struct relay *);
 void		 relay_ssl_transaction(struct rsession *,
 		    struct ctl_relay_event *);
@@ -96,7 +101,8 @@ int				 proc_id;
 static struct privsep_proc procs[] = {
 	{ "parent",	PROC_PARENT,	relay_dispatch_parent },
 	{ "pfe",	PROC_PFE,	relay_dispatch_pfe },
-	{ "ca",		PROC_CA,	relay_dispatch_ca }
+	{ "ca",		PROC_CA,	relay_dispatch_ca },
+	{ "hce",	PROC_HCE,	relay_dispatch_hce },
 };
 
 pid_t
@@ -331,6 +337,20 @@ relay_init(struct privsep *ps, struct privsep_proc *p, void *arg)
 	evtimer_set(&env->sc_statev, relay_statistics, NULL);
 	bcopy(&env->sc_statinterval, &tv, sizeof(tv));
 	evtimer_add(&env->sc_statev, &tv);
+}
+
+void
+relay_session_publish(struct rsession *s)
+{
+	proc_compose_imsg(env->sc_ps, PROC_PFE, -1, IMSG_SESS_PUBLISH, -1,
+	    s, sizeof(*s));
+}
+
+void
+relay_session_unpublish(struct rsession *s)
+{
+	proc_compose_imsg(env->sc_ps, PROC_PFE, -1, IMSG_SESS_UNPUBLISH, -1,
+	    &s->se_id, sizeof(s->se_id));
 }
 
 void
@@ -807,6 +827,7 @@ relay_read(struct bufferevent *bev, void *arg)
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	if (!EVBUFFER_LENGTH(src))
 		return;
@@ -938,6 +959,7 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				relay_close(con, "buffer event timeout");
 				break;
 			case 1:
+				cre->timedout = 1;
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
@@ -958,6 +980,9 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
+		} else if (cre->dst->timedout) {
+			relay_close(con, "splice timeout");
+			return;
 		}
 		if (relay_spliceadjust(cre) == -1)
 			goto fail;
@@ -1068,6 +1093,7 @@ relay_accept(int fd, short event, void *arg)
 
 	relay_sessions++;
 	SPLAY_INSERT(session_tree, &rlay->rl_sessions, con);
+	relay_session_publish(con);
 
 	/* Increment the per-relay session counter */
 	rlay->rl_stats[proc_id].last++;
@@ -1080,6 +1106,7 @@ relay_accept(int fd, short event, void *arg)
 	}
 
 	/* Pre-allocate log buffer */
+	con->se_haslog = 0;
 	con->se_log = evbuffer_new();
 	if (con->se_log == NULL) {
 		relay_close(con, "failed to allocate log buffer");
@@ -1566,6 +1593,7 @@ relay_close(struct rsession *con, const char *msg)
 	struct protocol	*proto = rlay->rl_proto;
 
 	SPLAY_REMOVE(session_tree, &rlay->rl_sessions, con);
+	relay_session_unpublish(con);
 
 	event_del(&con->se_ev);
 	if (con->se_in.bev != NULL)
@@ -1847,6 +1875,114 @@ relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	return (0);
 }
 
+void
+relay_ssl_callback_info(const SSL *ssl, int where, int rc)
+{
+	struct ctl_relay_event *cre;
+	int ssl_state;
+
+	cre = (struct ctl_relay_event *)SSL_get_app_data(ssl);
+
+	if (cre == NULL || cre->sslreneg_state == SSLRENEG_ALLOW)
+		return;
+
+	ssl_state = SSL_get_state(ssl);
+
+	/* Check renegotiations */
+	if ((where & SSL_CB_ACCEPT_LOOP) &&
+	    (cre->sslreneg_state == SSLRENEG_DENY)) {
+		if ((ssl_state == SSL3_ST_SR_CLNT_HELLO_A) ||
+		    (ssl_state == SSL23_ST_SR_CLNT_HELLO_A)) {
+			/*
+			 * This is a client initiated renegotiation
+			 * that we do not allow
+			 */
+			cre->sslreneg_state = SSLRENEG_ABORT;
+		}
+	} else if ((where & SSL_CB_HANDSHAKE_DONE) &&
+	    (cre->sslreneg_state == SSLRENEG_INIT)) {
+		/*
+		 * This is right after the first handshake,
+		 * disallow any further negotiations.
+		 */
+		cre->sslreneg_state = SSLRENEG_DENY;
+	}
+}
+
+DH *
+relay_ssl_get_dhparams(int keylen)
+{
+	DH		*dh;
+	BIGNUM		*(*prime)(BIGNUM *);
+	const char	*gen;
+
+	gen = "2";
+	if (keylen >= 8192)
+		prime = get_rfc3526_prime_8192;
+	else if (keylen >= 4096)
+		prime = get_rfc3526_prime_4096;
+	else if (keylen >= 3072)
+		prime = get_rfc3526_prime_3072;
+	else if (keylen >= 2048)
+		prime = get_rfc3526_prime_2048;
+	else if (keylen >= 1536)
+		prime = get_rfc3526_prime_1536;
+	else
+		prime = get_rfc2409_prime_1024;
+
+	if ((dh = DH_new()) == NULL)
+		return (NULL);
+
+	dh->p = (*prime)(NULL);
+	BN_dec2bn(&dh->g, gen);
+
+	if (dh->p == NULL || dh->g == NULL) {
+		DH_free(dh);
+		return (NULL);
+	}
+
+	return (dh);
+}
+
+DH *
+relay_ssl_callback_dh(SSL *ssl, int export, int keylen)
+{
+	struct ctl_relay_event	*cre;
+	EVP_PKEY		*pkey;
+	int			 keytype, maxlen;
+	DH			*dh = NULL;
+
+	/* Get maximum key length from config */
+	if ((cre = (struct ctl_relay_event *)SSL_get_app_data(ssl)) == NULL)
+		return (NULL);
+	maxlen = cre->con->se_relay->rl_proto->ssldhparams;
+
+	/* Get the private key length from the cert */
+	if ((pkey = SSL_get_privatekey(ssl))) {
+		keytype = EVP_PKEY_type(pkey->type);
+		if (keytype == EVP_PKEY_RSA || keytype == EVP_PKEY_DSA)
+			keylen = EVP_PKEY_bits(pkey);
+		else
+			return (NULL);
+	}
+
+	/* get built-in params based on the shorter key length */
+	dh = relay_ssl_get_dhparams(MIN(keylen, maxlen));
+
+	return (dh);
+}
+
+int
+relay_dispatch_hce(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	switch (imsg->hdr.type) {
+	default:
+		break;
+	}
+
+	return (-1);
+}
+
 SSL_CTX *
 relay_ssl_ctx_create(struct relay *rlay)
 {
@@ -1873,14 +2009,26 @@ relay_ssl_ctx_create(struct relay *rlay)
 	SSL_CTX_set_options(ctx, SSL_OP_ALL);
 	SSL_CTX_set_options(ctx,
 	    SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+	if (proto->sslflags & SSLFLAG_CIPHER_SERVER_PREF)
+		SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
 	/* Set the allowed SSL protocols */
-	if ((proto->sslflags & SSLFLAG_SSLV2) == 0)
-		SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2);
+	SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2);
+	SSL_CTX_clear_options(ctx, SSL_OP_NO_SSLv3);
 	if ((proto->sslflags & SSLFLAG_SSLV3) == 0)
 		SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
-	if ((proto->sslflags & SSLFLAG_TLSV1) == 0)
+	SSL_CTX_clear_options(ctx, SSL_OP_NO_TLSv1);
+	if ((proto->sslflags & SSLFLAG_TLSV1_0) == 0)
 		SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1);
+	SSL_CTX_clear_options(ctx, SSL_OP_NO_TLSv1_1);
+	if ((proto->sslflags & SSLFLAG_TLSV1_1) == 0)
+		SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1_1);
+	SSL_CTX_clear_options(ctx, SSL_OP_NO_TLSv1_2);
+	if ((proto->sslflags & SSLFLAG_TLSV1_2) == 0)
+		SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1_2);
+
+	/* add the SSL info callback */
+	SSL_CTX_set_info_callback(ctx, relay_ssl_callback_info);
 
 	if (proto->sslecdhcurve > 0) {
 		/* Enable ECDHE support for TLS perfect forward secrecy */
@@ -1890,6 +2038,11 @@ relay_ssl_ctx_create(struct relay *rlay)
 		SSL_CTX_set_tmp_ecdh(ctx, ecdhkey);
 		SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
 		EC_KEY_free(ecdhkey);
+	}
+
+	if (proto->ssldhparams > 0) {
+		/* Enable EDH params (forward secrecy for older clients) */
+		SSL_CTX_set_tmp_dh_callback(ctx, relay_ssl_callback_dh);
 	}
 
 	if (!SSL_CTX_set_cipher_list(ctx, proto->sslciphers))
@@ -1953,6 +2106,7 @@ void
 relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 {
 	struct relay		*rlay = con->se_relay;
+	struct protocol	*proto = rlay->rl_proto;
 	SSL			*ssl;
 	const SSL_METHOD	*method;
 	void			(*cb)(int, short, void *);
@@ -1981,11 +2135,21 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 	if (!SSL_set_fd(ssl, cre->s))
 		goto err;
 
-	if (cre->dir == RELAY_DIR_REQUEST)
+	if (cre->dir == RELAY_DIR_REQUEST) {
+		if ((proto->sslflags & SSLFLAG_CLIENT_RENEG) == 0)
+			/* Only allow negotiation during the first handshake */
+			cre->sslreneg_state = SSLRENEG_INIT;
+		else
+			/* Allow client initiated renegotiations */
+			cre->sslreneg_state = SSLRENEG_ALLOW;
 		SSL_set_accept_state(ssl);
-	else
+	} else {
+		/* Always allow renegotiations if we're the client */
+		cre->sslreneg_state = SSLRENEG_ALLOW;
 		SSL_set_connect_state(ssl);
+	}
 
+	SSL_set_app_data(ssl, cre);
 	cre->ssl = ssl;
 
 	DPRINTF("%s: session %d: scheduling on %s", __func__, con->se_id,
@@ -2166,6 +2330,11 @@ relay_ssl_readcb(int fd, short event, void *arg)
 		goto err;
 	}
 
+	if (cre->sslreneg_state == SSLRENEG_ABORT) {
+		what |= EVBUFFER_ERROR;
+		goto err;
+	}
+
 	if (bufev->wm_read.high != 0)
 		howmuch = MIN(sizeof(rbuf), bufev->wm_read.high);
 
@@ -2235,6 +2404,11 @@ relay_ssl_writecb(int fd, short event, void *arg)
 
 	if (event == EV_TIMEOUT) {
 		what |= EVBUFFER_TIMEOUT;
+		goto err;
+	}
+
+        if (cre->sslreneg_state == SSLRENEG_ABORT) {
+		what |= EVBUFFER_ERROR;
 		goto err;
 	}
 
@@ -2521,6 +2695,14 @@ relay_session_cmp(struct rsession *a, struct rsession *b)
 		return ((*proto->cmp)(a, b));
 
 	return ((int)a->se_id - b->se_id);
+}
+
+void
+relay_log(struct rsession *con, char *msg)
+{
+	if (con->se_haslog && con->se_log != NULL) {
+		evbuffer_add(con->se_log, msg, strlen(msg));
+	}
 }
 
 SPLAY_GENERATE(session_tree, rsession, se_nodes, relay_session_cmp);

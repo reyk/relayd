@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_http.c,v 1.21 2014/07/10 00:05:59 reyk Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.35 2014/10/25 03:23:49 lteo Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -26,7 +26,6 @@
 #include <sys/hash.h>
 
 #include <net/if.h>
-#include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -59,6 +58,7 @@ void		 relay_read_httpcontent(struct bufferevent *, void *);
 void		 relay_read_httpchunks(struct bufferevent *, void *);
 char		*relay_expand_http(struct ctl_relay_event *, char *,
 		    char *, size_t);
+int		 relay_writeheader_kv(struct ctl_relay_event *, struct kv *);
 int		 relay_writeheader_http(struct ctl_relay_event *,
 		    struct ctl_relay_event *);
 int		 relay_writerequest_http(struct ctl_relay_event *,
@@ -67,7 +67,7 @@ int		 relay_writeresponse_http(struct ctl_relay_event *,
 		    struct ctl_relay_event *);
 void		 relay_reset_http(struct ctl_relay_event *);
 static int	 relay_httpmethod_cmp(const void *, const void *);
-static int	 relay_httpheader_cmp(const void *, const void *);
+static int	 relay_httperror_cmp(const void *, const void *);
 int		 relay_httpquery_test(struct ctl_relay_event *,
 		    struct relay_rule *, struct kvlist *);
 int		 relay_httpheader_test(struct ctl_relay_event *,
@@ -86,7 +86,7 @@ void		 relay_httpdesc_free(struct http_descriptor *);
 static struct relayd	*env = NULL;
 
 static struct http_method	 http_methods[] = HTTP_METHODS;
-static struct http_header	 http_headers[] = HTTP_HEADERS;
+static struct http_error	 http_errors[] = HTTP_ERRORS;
 
 void
 relay_http(struct relayd *x_env)
@@ -100,9 +100,9 @@ relay_http(struct relayd *x_env)
 	qsort(http_methods, sizeof(http_methods) /
 	    sizeof(http_methods[0]) - 1,
 	    sizeof(http_methods[0]), relay_httpmethod_cmp);
-	qsort(http_headers, sizeof(http_headers) /
-	    sizeof(http_headers[0]) - 1,
-	    sizeof(http_headers[0]), relay_httpheader_cmp);
+	qsort(http_errors, sizeof(http_errors) /
+	    sizeof(http_errors[0]) - 1,
+	    sizeof(http_errors[0]), relay_httperror_cmp);
 }
 
 void
@@ -123,7 +123,8 @@ relay_httpdesc_init(struct ctl_relay_event *cre)
 
 	if ((desc = calloc(1, sizeof(*desc))) == NULL)
 		return (-1);
-	TAILQ_INIT(&desc->http_headers);
+
+	RB_INIT(&desc->http_headers);
 	cre->desc = desc;
 
 	return (0);
@@ -132,8 +133,6 @@ relay_httpdesc_init(struct ctl_relay_event *cre)
 void
 relay_httpdesc_free(struct http_descriptor *desc)
 {
-	int	i;
-
 	if (desc->http_path != NULL) {
 		free(desc->http_path);
 		desc->http_path = NULL;
@@ -154,8 +153,6 @@ relay_httpdesc_free(struct http_descriptor *desc)
 		free(desc->query_val);
 		desc->query_val = NULL;
 	}
-	for (i = HTTP_HEADER_NONE; i < HTTP_HEADER_MAX; i++)
-		desc->http_header[i] = NULL;
 	kv_purge(&desc->http_headers);
 }
 
@@ -171,11 +168,11 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	char			*line = NULL, *key, *value;
 	int			 action;
 	const char		*errstr;
-	size_t			 size;
+	size_t			 size, linelen;
 	struct kv		*hdr = NULL;
-	enum httpheader		 hdrid;
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld",
@@ -188,16 +185,26 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	}
 
 	while (!cre->done && (line = evbuffer_readline(src)) != NULL) {
+		linelen = strlen(line);
+
 		/*
 		 * An empty line indicates the end of the request.
 		 * libevent already stripped the \r\n for us.
 		 */
-		if (!strlen(line)) {
+		if (!linelen) {
 			cre->done = 1;
 			free(line);
 			break;
 		}
 		key = line;
+
+		/* Limit the total header length minus \r\n */
+		cre->headerlen += linelen;
+		if (cre->headerlen > RELAY_MAXHEADERLENGTH) {
+			free(line);
+			relay_abort_http(con, 413, "request too large", 0);
+			return;
+		}
 
 		/*
 		 * The first line is the GET/POST/PUT/... request,
@@ -218,7 +225,8 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			}
 
 			/* Append line to the last header, if present */
-			if (kv_extend(&desc->http_headers, line) == NULL) {
+			if (kv_extend(&desc->http_headers,
+			    desc->http_lastheader, line) == NULL) {
 				free(line);
 				goto fail;
 			}
@@ -282,18 +290,20 @@ relay_read_http(struct bufferevent *bev, void *arg)
 				goto fail;
 			}
 			desc->http_version = strchr(desc->http_path, ' ');
-			if (desc->http_version != NULL)
-				*desc->http_version++ = '\0';
+			if (desc->http_version == NULL) {
+				free(line);
+				goto fail;
+			}
+			*desc->http_version++ = '\0';
 			desc->http_query = strchr(desc->http_path, '?');
 			if (desc->http_query != NULL)
 				*desc->http_query++ = '\0';
 
 			/*
 			 * Have to allocate the strings because they could
-			 * be changed independetly by the filters later.
+			 * be changed independently by the filters later.
 			 */
-			if (desc->http_version != NULL &&
-			    (desc->http_version =
+			if ((desc->http_version =
 			    strdup(desc->http_version)) == NULL) {
 				free(line);
 				goto fail;
@@ -341,21 +351,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 				free(line);
 				goto fail;
 			}
-			/*
-			 * Remember the header if it is known to us for a
-			 * quicker lookup later.
-			 */
-			if ((hdrid = relay_httpheader_byname(key)) !=
-			    HTTP_HEADER_OTHER) {
-				if (desc->http_header[hdrid] != NULL) {
-					kv_delete(&desc->http_headers, hdr);
-					free(line);
-					relay_abort_http(con, 400, "repeated "
-					    "header line", 0);
-					return;
-				}
-				desc->http_header[hdrid] = hdr;
-			}
+			desc->http_lastheader = hdr;
 		}
 
 		free(line);
@@ -386,7 +382,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		case HTTP_METHOD_HEAD:
 		case HTTP_METHOD_OPTIONS:
 			cre->toread = 0;
-			/* FALLTHROUGH */
+			break;
 		case HTTP_METHOD_POST:
 		case HTTP_METHOD_PUT:
 		case HTTP_METHOD_RESPONSE:
@@ -432,9 +428,10 @@ relay_read_http(struct bufferevent *bev, void *arg)
 				relay_bindanyreq(con, 0, IPPROTO_TCP);
 				return;
 			}
-			if (relay_connect(con) == -1)
+			if (relay_connect(con) == -1) {
 				relay_abort_http(con, 502, "session failed", 0);
-			return;
+				return;
+			}
 		}
 	}
 	if (con->se_done) {
@@ -463,6 +460,7 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	size_t			 size;
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
@@ -516,6 +514,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	size_t			 size;
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
@@ -635,6 +634,7 @@ relay_reset_http(struct ctl_relay_event *cre)
 	}
 	desc->http_method = 0;
 	desc->http_chunked = 0;
+	cre->headerlen = 0;
 	cre->line = 0;
 	cre->done = 0;
 }
@@ -880,12 +880,15 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 {
 	struct relay		*rlay = con->se_relay;
 	struct bufferevent	*bev = con->se_in.bev;
-	const char		*httperr = print_httperror(code), *text = "";
+	const char		*httperr = NULL, *text = "";
 	char			*httpmsg;
 	time_t			 t;
 	struct tm		*lt;
 	char			 tmbuf[32], hbuf[128];
 	const char		*style, *label = NULL;
+
+	if ((httperr = relay_httperror_byid(code)) == NULL)
+		httperr = "Unknown Error";
 
 	if (labelid != 0)
 		label = label_id2name(labelid);
@@ -1077,26 +1080,47 @@ relay_writeresponse_http(struct ctl_relay_event *dst,
 }
 
 int
+relay_writeheader_kv(struct ctl_relay_event *dst, struct kv *hdr)
+{
+	char			*ptr;
+	const char		*key;
+
+	if (hdr->kv_flags & KV_FLAG_INVALID)
+		return (0);
+
+	/* The key might have been updated in the parent */
+	if (hdr->kv_parent != NULL && hdr->kv_parent->kv_key != NULL)
+		key = hdr->kv_parent->kv_key;
+	else
+		key = hdr->kv_key;
+
+	ptr = hdr->kv_value;
+	if (relay_bufferevent_print(dst, key) == -1 ||
+	    (ptr != NULL &&
+	    (relay_bufferevent_print(dst, ": ") == -1 ||
+	    relay_bufferevent_print(dst, ptr) == -1 ||
+	    relay_bufferevent_print(dst, "\r\n") == -1)))
+		return (-1);
+	DPRINTF("%s: %s: %s", __func__, key,
+	    hdr->kv_value == NULL ? "" : hdr->kv_value);
+
+	return (0);
+}
+
+int
 relay_writeheader_http(struct ctl_relay_event *dst, struct ctl_relay_event
     *cre)
 {
-	struct kv		*hdr;
+	struct kv		*hdr, *kv;
 	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
-	char			*ptr;
 
-	TAILQ_FOREACH(hdr, &desc->http_headers, kv_entry) {
-		if (hdr->kv_flags & KV_FLAG_INVALID)
-			continue;
-		ptr = hdr->kv_value;
-		DPRINTF("%s: ptr %s", __func__, ptr);
-		if (relay_bufferevent_print(dst, hdr->kv_key) == -1 ||
-		    (ptr != NULL &&
-		    (relay_bufferevent_print(dst, ": ") == -1 ||
-		    relay_bufferevent_print(dst, ptr) == -1 ||
-		    relay_bufferevent_print(dst, "\r\n") == -1)))
+	RB_FOREACH(hdr, kvtree, &desc->http_headers) {
+		if (relay_writeheader_kv(dst, hdr) == -1)
 			return (-1);
-		DPRINTF("%s: %s: %s", __func__, hdr->kv_key,
-			hdr->kv_value == NULL ? "" : hdr->kv_value);
+		TAILQ_FOREACH(kv, &hdr->kv_children, kv_entry) {
+			if (relay_writeheader_kv(dst, kv) == -1)
+				return (-1);
+		}
 	}
 
 	return (0);
@@ -1111,10 +1135,6 @@ relay_httpmethod_byname(const char *name)
 	/* Set up key */
 	method.method_name = name;
 
-	/*
-	 * RFC 2616 section 5.1.1 says that the method is case
-	 * sensitive so we don't do a strcasecmp here.
-	 */
 	if ((res = bsearch(&method, http_methods,
 	    sizeof(http_methods) / sizeof(http_methods[0]) - 1,
 	    sizeof(http_methods[0]), relay_httpmethod_cmp)) != NULL)
@@ -1139,57 +1159,40 @@ relay_httpmethod_byid(u_int id)
 	return (name);
 }
 
-const char *
-relay_httpheader_byid(u_int id)
-{
-	const char	*name = NULL;
-	int		 i;
-
-	for (i = 0; http_headers[i].header_name != NULL; i++) {
-		if (http_headers[i].header_id == id) {
-			name = http_headers[i].header_name;
-			break;
-		}
-	}
-
-	return (name);
-}
-
-u_int
-relay_httpheader_byname(const char *name)
-{
-	enum httpheader		 id = HTTP_HEADER_OTHER;
-	struct http_header	 header, *res = NULL;
-
-	/* Set up key */
-	header.header_name = name;
-
-	/*
-	 * In contrast to HTTP methods, HTTP header names are
-	 * case-insensitive (see RFC 2616 section 2.4).
-	 */
-	if ((res = bsearch(&header, http_headers,
-	    sizeof(http_headers) / sizeof(http_headers[0]) - 1,
-	    sizeof(http_headers[0]), relay_httpheader_cmp)) != NULL)
-		id = res->header_id;
-
-	return (id);
-}
-
 static int
 relay_httpmethod_cmp(const void *a, const void *b)
 {
 	const struct http_method *ma = a;
 	const struct http_method *mb = b;
+
+	/*
+	 * RFC 2616 section 5.1.1 says that the method is case
+	 * sensitive so we don't do a strcasecmp here.
+	 */
 	return (strcmp(ma->method_name, mb->method_name));
 }
 
-static int
-relay_httpheader_cmp(const void *a, const void *b)
+const char *
+relay_httperror_byid(u_int id)
 {
-	const struct http_header *ha = a;
-	const struct http_header *hb = b;
-	return (strcasecmp(ha->header_name, hb->header_name));
+	struct http_error	 error, *res = NULL;
+
+	/* Set up key */
+	error.error_code = (int)id;
+
+	res = bsearch(&error, http_errors,
+	    sizeof(http_errors) / sizeof(http_errors[0]) - 1,
+	    sizeof(http_errors[0]), relay_httperror_cmp);
+
+	return (res->error_name);
+}
+
+static int
+relay_httperror_cmp(const void *a, const void *b)
+{
+	const struct http_error *ea = a;
+	const struct http_error *eb = b;
+	return (ea->error_code - eb->error_code);
 }
 
 int
@@ -1219,42 +1222,24 @@ relay_httpheader_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*kv = &rule->rule_kv[KEY_TYPE_HEADER];
 	struct kv		*match;
-	u_int			 id = kv->kv_header_id;
-	const char		*value;
 
-	kv->kv_matchptr = NULL;
-
-	if (id == HTTP_HEADER_NONE || kv->kv_type != KEY_TYPE_HEADER)
+	if (kv->kv_type != KEY_TYPE_HEADER)
 		return (0);
-	else if (id < HTTP_HEADER_MAX) {
-		match = desc->http_header[id];
-		DPRINTF("%s: standard header %s: %p", __func__,
-		    kv->kv_key, match);
-		if (match != NULL)
-			kv->kv_matchptr = &desc->http_header[id];
-	} else {
-		DPRINTF("%s: other header %s", __func__, kv->kv_key);
-		TAILQ_FOREACH_REVERSE(match, &desc->http_headers,
-		    kvlist, kv_entry) {
-			if (strcasecmp(match->kv_key, kv->kv_key) == 0 ||
-			    fnmatch(kv->kv_key, match->kv_key, FNM_CASEFOLD) !=
-			    FNM_NOMATCH)
-				goto done;
-		}
-		match = NULL;
-	}
 
- done:
+	match = kv_find(&desc->http_headers, kv);
+
 	if (kv->kv_option == KEY_OPTION_APPEND ||
 	    kv->kv_option == KEY_OPTION_SET) {
 		/* header can be NULL and will be added later */
 	} else if (match == NULL) {
 		/* Fail if header doesn't exist */
 		return (-1);
-	} else if (kv->kv_value != NULL) {
-		/* Test header value using shell globbing rules */
-		value = match->kv_value == NULL ? "" : match->kv_value;
-		if (fnmatch(kv->kv_value, value, FNM_CASEFOLD) == FNM_NOMATCH)
+	} else {
+		if (fnmatch(kv->kv_key, match->kv_key, FNM_CASEFOLD) == FNM_NOMATCH)
+			return (-1);
+		if (kv->kv_value != NULL &&
+		    match->kv_value != NULL &&
+		    fnmatch(kv->kv_value, match->kv_value, 0) == FNM_NOMATCH)
 			return (-1);
 	}
 
@@ -1294,13 +1279,18 @@ relay_httpurl_test(struct ctl_relay_event *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
 	struct http_descriptor	*desc = cre->desc;
-	struct kv		*host = desc->http_header[HTTP_HEADER_HOST];
+	struct kv		*host, key;
 	struct kv		*kv = &rule->rule_kv[KEY_TYPE_URL];
 	struct kv		*match = &desc->http_pathquery;
 
-	if (cre->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_URL)
+	if (cre->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_URL ||
+	    kv->kv_key == NULL)
 		return (0);
-	else if (kv->kv_key == NULL || host == NULL || host->kv_value == NULL)
+
+	key.kv_key = "Host";
+	host = kv_find(&desc->http_headers, &key);
+
+	if (host == NULL || host->kv_value == NULL)
 		return (0);
 	else if (rule->rule_action != RULE_ACTION_BLOCK &&
 	    kv->kv_option == KEY_OPTION_LOG &&
@@ -1319,8 +1309,7 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
 	struct http_descriptor	*desc = cre->desc;
-	struct kv		*kv = &rule->rule_kv[KEY_TYPE_COOKIE];
-	u_int			 id = HTTP_HEADER_NONE;
+	struct kv               *kv = &rule->rule_kv[KEY_TYPE_COOKIE], key;
 	struct kv		*match = NULL;
 
 	if (kv->kv_type != KEY_TYPE_COOKIE)
@@ -1328,28 +1317,24 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 
 	switch (cre->dir) {
 	case RELAY_DIR_REQUEST:
-		id = HTTP_HEADER_COOKIE;
+		key.kv_key = "Cookie";
 		break;
 	case RELAY_DIR_RESPONSE:
-		id = HTTP_HEADER_SET_COOKIE;
+		key.kv_key = "Set-Cookie";
 		break;
 	default:
 		return (0);
 		/* NOTREACHED */
 		break;
 	}
+
 	if (kv->kv_option == KEY_OPTION_APPEND ||
 	    kv->kv_option == KEY_OPTION_SET) {
-		kv->kv_header_id = id;
 		/* no cookie, can be NULL and will be added later */
-	} else if (id == HTTP_HEADER_NONE) {
-		/* Fail if cookie doesn't exist */
-		return (-1);
 	} else {
-		match = desc->http_header[id];
+		match = kv_find(&desc->http_headers, &key);
 		if (match == NULL)
 			return (-1);
-		kv->kv_matchptr = &desc->http_header[id];
 		if (kv->kv_key == NULL || match->kv_value == NULL)
 			return (0);
 		else if (relay_lookup_cookie(cre, match->kv_value, kv) != 0)
@@ -1386,13 +1371,13 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
 	if (matches == NULL) {
 		/* 'pass' or 'block' rule */
 		TAILQ_FOREACH(kv, &rule->rule_kvlist, kv_rule_entry) {
-			TAILQ_INSERT_TAIL(actions, kv, kv_entry);
+			TAILQ_INSERT_TAIL(actions, kv, kv_action_entry);
 			TAILQ_REMOVE(&rule->rule_kvlist, kv, kv_rule_entry);
 		}
 	} else {
 		/* 'match' rule */
 		TAILQ_FOREACH(kv, matches, kv_match_entry) {
-			TAILQ_INSERT_TAIL(actions, kv, kv_entry);
+			TAILQ_INSERT_TAIL(actions, kv, kv_action_entry);
 		}
 	}
 
@@ -1406,20 +1391,21 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*host = NULL;
 	const char		*value;
-	struct kv		*kv, *match, *kp, *mp, kvcopy, matchcopy;
-	int			 httpindex, addkv, ret;
+	struct kv		*kv, *match, *kp, *mp, kvcopy, matchcopy, key;
+	int			 addkv, ret;
 	char			 buf[IBUF_READ_SIZE], *ptr;
-	enum httpheader		 hdrid;
+	char			*msg = NULL;
+	const char		*meth = NULL;
 
 	memset(&kvcopy, 0, sizeof(kvcopy));
 	memset(&matchcopy, 0, sizeof(matchcopy));
 
 	ret = -1;
 	kp = mp = NULL;
-	TAILQ_FOREACH(kv, actions, kv_entry) {
+	TAILQ_FOREACH(kv, actions, kv_action_entry) {
 		kp = NULL;
 		match = kv->kv_match;
-		httpindex = addkv = 0;
+		addkv = 0;
 
 		/*
 		 * Although marked as deleted, give a chance to non-critical
@@ -1450,16 +1436,12 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 				if (kv_set(kp, "%s=%s;", kp->kv_key,
 				    kp->kv_value) == -1)
 					goto fail;
-				if (kv->kv_header_id >= HTTP_HEADER_MAX ||
-				    kv->kv_header_id <= HTTP_HEADER_NONE)
-					goto fail;
-				if (kv_setkey(kp, "%s",
-				    relay_httpheader_byid(kp->kv_header_id)) ==
-				    -1)
+				if (kv_setkey(kp, "%s", cre->dir ==
+				    RELAY_DIR_REQUEST ?
+				    "Cookie" : "Set-Cookie") == -1)
 					goto fail;
 				/* FALLTHROUGH cookie is a header */
 			case KEY_TYPE_HEADER:
-				httpindex = 1;
 				if (match == NULL) {
 					addkv = 1;
 					break;
@@ -1469,11 +1451,8 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 					if (kv_set(match, "%s",
 					    kv->kv_value) == -1)
 						goto fail;
-				} else {
-					if (kv_setkey(match, "%s,%s",
-					    match->kv_key, kv->kv_key) == -1)
-						goto fail;
-				}
+				} else
+					addkv = 1;
 				break;
 			default:
 				/* query, url not supported */
@@ -1488,12 +1467,10 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 				break;
 			case KEY_TYPE_COOKIE:
 			case KEY_TYPE_HEADER:
-				if (kv->kv_matchlist != NULL)
+				if (kv->kv_matchtree != NULL)
 					match->kv_flags |= KV_FLAG_INVALID;
 				else
 					kv_free(match);
-				if (kv->kv_matchptr)
-					*kv->kv_matchptr = NULL;
 				match = kv->kv_match = NULL;
 				break;
 			default:
@@ -1528,23 +1505,14 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 		/* from now on, reads from kp writes to kv */
 		if (kp == NULL)
 			kp = kv;
-		if (addkv && kv->kv_matchlist != NULL) {
+		if (addkv && kv->kv_matchtree != NULL) {
 			/* Add new entry to the list (eg. new HTTP header) */
-			if ((match = kv_add(kv->kv_matchlist, kp->kv_key,
+			if ((match = kv_add(kv->kv_matchtree, kp->kv_key,
 			    kp->kv_value)) == NULL)
 				goto fail;
 			match->kv_option = kp->kv_option;
 			match->kv_type = kp->kv_type;
 			kv->kv_match = match;
-		}
-		if (httpindex && kv->kv_matchptr != NULL) {
-			/* Re-index the fast lookup method */
-			if ((hdrid = relay_httpheader_byname(kp->kv_key)) !=
-			    HTTP_HEADER_OTHER) {
-				desc->http_header[hdrid] = match;
-				kv->kv_matchptr = &desc->http_header[hdrid];
-			} else
-				kv->kv_matchptr = NULL;
 		}
 		if (match != NULL && kp->kv_flags & KV_FLAG_MACRO) {
 			bzero(buf, sizeof(buf));
@@ -1554,6 +1522,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 			if (kv_set(match, ptr) == -1)
 				goto fail;
 		}
+
  matchdel:
 		switch(kv->kv_option) {
 		case KEY_OPTION_LOG:
@@ -1563,13 +1532,14 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 			if (kv_inherit(mp, match) == NULL)
 				goto fail;
 			if (mp->kv_flags & KV_FLAG_INVALID) {
-				if (kv_set(mp, "%s*removed*",
+				if (kv_set(mp, "%s (removed)",
 				   mp->kv_value) == -1)
 					goto fail;
 			}
 			switch(kv->kv_type) {
 			case KEY_TYPE_URL:
-				host = desc->http_header[HTTP_HEADER_HOST];
+				key.kv_key = "Host";
+				host = kv_find(&desc->http_headers, &key);
 				switch (kv->kv_digest) {
 				case DIGEST_NONE:
 					if (host == NULL ||
@@ -1590,7 +1560,8 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 			default:
 				break;
 			}
-			if (kv_log(con->se_log, mp, con->se_label) == -1)
+			if (kv_log(con, mp, con->se_label, cre->dir)
+			    == -1)
 				goto fail;
 			break;
 		default:
@@ -1599,13 +1570,23 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 
 		/* actions applied, cleanup kv */
 		kv->kv_match = NULL;
-		kv->kv_matchlist = NULL;
+		kv->kv_matchtree = NULL;
 		TAILQ_REMOVE(actions, kv, kv_match_entry);
 
 		kv_free(&kvcopy);
 		kv_free(&matchcopy);
 	}
 
+	/*
+	 * log tag for request and response, request method
+	 * and end of request marker ","
+	 */
+	if ((con->se_log != NULL) &&
+	    ((meth = relay_httpmethod_byid(desc->http_method)) != NULL) &&
+	    (asprintf(&msg, " %s",meth) >= 0))
+		evbuffer_add(con->se_log, msg, strlen(msg));
+	free(msg);
+	relay_log(con, cre->dir == RELAY_DIR_REQUEST ? "" : ";");
 	ret = 0;
  fail:
 	kv_free(&kvcopy);
@@ -1767,11 +1748,11 @@ relay_calc_skip_steps(struct relay_rules *rules)
 
 void
 relay_match(struct kvlist *actions, struct kv *kv, struct kv *match,
-    struct kvlist *matchlist)
+    struct kvtree *matchtree)
 {
 	if (kv->kv_option != KEY_OPTION_NONE) {
 		kv->kv_match = match;
-		kv->kv_matchlist = matchlist;
+		kv->kv_matchtree = matchtree;
 		TAILQ_INSERT_TAIL(actions, kv, kv_match_entry);
 	}
 }
