@@ -6,9 +6,10 @@ relayd is free software under OpenBSD's ISC-style license.
 * Most of the code has been written by Reyk Floeter <reyk@openbsd.org>
 * And initially also by Pierre-Yves Ritschard <pyr@openbsd.org>
 * The regress tests have been written by Alexander Bluhm <bluhm@openbsd.org>
+* AgentX code has been written by Bret Lambert <blambert@openbsd.org>
 * Please refer to the individual source files for other copyright holders!
 
-> Copyright (c) 2006-2013 Reyk Floeter <reyk@openbsd.org>
+> Copyright (c) 2006-2014 Reyk Floeter <reyk@openbsd.org>
 > 
 > Permission to use, copy, modify, and distribute this software for any
 > purpose with or without fee is hereby granted, provided that the above
