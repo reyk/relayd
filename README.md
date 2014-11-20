@@ -19,10 +19,10 @@ experimental changes, please do not use it in production.  The main
 development is happening in OpenBSD's CVS tree, please refer to it for
 any authoritative use:
 
-* http://www.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/relayd/
-* http://www.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/relayctl/
-* http://www.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/snmpd/snmp.h
-* http://www.openbsd.org/cgi-bin/cvsweb/src/regress/usr.sbin/relayd/
+* http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/relayd/
+* http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/relayctl/
+* http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/snmpd/snmp.h
+* http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/regress/usr.sbin/relayd/
 
 The official relayd page can be found at [bsd.plumbing](http://bsd.plumbing/).
 
