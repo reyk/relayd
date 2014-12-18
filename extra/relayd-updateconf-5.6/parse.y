@@ -30,7 +30,6 @@
 #include <sys/stat.h>
 #include <sys/queue.h>
 #include <sys/ioctl.h>
-#include <sys/hash.h>
 
 #include <net/if.h>
 #include <net/pfvar.h>
