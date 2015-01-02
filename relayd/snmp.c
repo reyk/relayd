@@ -1,4 +1,4 @@
-/*	$OpenBSD: snmp.c,v 1.18 2014/11/19 10:24:40 blambert Exp $	*/
+/*	$OpenBSD: snmp.c,v 1.21 2014/12/21 00:54:49 guenther Exp $	*/
 
 /*
  * Copyright (c) 2008 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -23,7 +23,6 @@
 
 #include <netinet/in.h>
 #include <net/if.h>
-#include <arpa/inet.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -532,7 +531,6 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 			if (snmp_agentx_response(h, pdu) == -1)
 				break;
 			break;
-		break;
 
 		case AGENTX_UNREGISTER:
 			if (snmp_agentx_response(h, pdu) == -1)
@@ -1640,7 +1638,7 @@ snmp_session(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 		getmonotime(&now);
 		timerclear(&tv);
 		timersub(&now, &session->se_tv_start, &tv);
-		ticks = tv.tv_sec * 100 + tv.tv_usec / 10;
+		ticks = tv.tv_sec * 100 + tv.tv_usec / 10000;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &ticks,
 		    sizeof(ticks)) == -1)
@@ -1650,7 +1648,7 @@ snmp_session(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 		getmonotime(&now);
 		timerclear(&tv);
 		timersub(&now, &session->se_tv_last, &tv);
-		ticks = tv.tv_sec * 100 + tv.tv_usec / 10;
+		ticks = tv.tv_sec * 100 + tv.tv_usec / 10000;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &ticks,
 		    sizeof(ticks)) == -1)

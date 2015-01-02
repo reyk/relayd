@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.195 2014/11/20 05:51:20 jsg Exp $	*/
+/*	$OpenBSD: parse.y,v 1.199 2014/12/23 13:18:23 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -30,13 +30,11 @@
 #include <sys/stat.h>
 #include <sys/queue.h>
 #include <sys/ioctl.h>
-#include <sys/hash.h>
 
 #include <net/if.h>
 #include <net/pfvar.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <arpa/nameser.h>
 #include <net/route.h>
 
 #include <ctype.h>
@@ -52,6 +50,7 @@
 #include <string.h>
 #include <ifaddrs.h>
 #include <syslog.h>
+#include <md5.h>
 
 #include <openssl/ssl.h>
 
@@ -118,6 +117,7 @@ static int		 dstmode;
 static enum key_type	 keytype = KEY_TYPE_NONE;
 static enum direction	 dir = RELAY_DIR_ANY;
 static char		*rulefile = NULL;
+static union hashkey	*hashkey = NULL;
 
 struct address	*host_v4(const char *);
 struct address	*host_v6(const char *);
@@ -143,6 +143,10 @@ typedef struct {
 		struct timeval		 tv;
 		struct table		*table;
 		struct portrange	 port;
+		struct {
+			union hashkey	 key;
+			int		 keyset;
+		}			 key;
 		enum direction		 dir;
 		struct {
 			struct sockaddr_storage	 ss;
@@ -165,7 +169,7 @@ typedef struct {
 %token	NO DESTINATION NODELAY NOTHING ON PARENT PATH PFTAG PORT PREFORK
 %token	PRIORITY PROTO QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE
 %token	RETRY QUICK RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SNMP
-%token	SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TO
+%token	SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TLS TO
 %token	ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE
 %token	MATCH PARAMS RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH
 %token	EDH CURVE
@@ -174,10 +178,10 @@ typedef struct {
 %type	<v.string>	hostname interface table value optstring
 %type	<v.number>	http_type loglevel quick trap
 %type	<v.number>	dstmode flag forwardmode retry
-%type	<v.number>	optssl optsslclient sslcache
+%type	<v.number>	opttls opttlsclient tlscache
 %type	<v.number>	redirect_proto relay_proto match
 %type	<v.number>	action ruleaf key_option
-%type	<v.number>	ssldhparams sslecdhcurve
+%type	<v.number>	tlsdhparams tlsecdhcurve
 %type	<v.port>	port
 %type	<v.host>	host
 %type	<v.addr>	address
@@ -185,6 +189,7 @@ typedef struct {
 %type	<v.digest>	digest optdigest
 %type	<v.table>	tablespec
 %type	<v.dir>		dir
+%type	<v.key>		hashkey
 
 %%
 
@@ -216,12 +221,21 @@ include		: INCLUDE STRING		{
 		}
 		;
 
-optssl		: /*empty*/	{ $$ = 0; }
-		| SSL		{ $$ = 1; }
+ssltls		: SSL		{
+			log_warnx("%s:%d: %s",
+			    file->name, yylval.lineno,
+			    "please use the \"tls\" keyword"
+			    " instead of \"ssl\"");
+		}
+		| TLS
 		;
 
-optsslclient	: /*empty*/	{ $$ = 0; }
-		| WITH SSL	{ $$ = 1; }
+opttls		: /*empty*/	{ $$ = 0; }
+		| ssltls	{ $$ = 1; }
+		;
+
+opttlsclient	: /*empty*/	{ $$ = 0; }
+		| WITH ssltls	{ $$ = 1; }
 		;
 
 http_type	: STRING	{
@@ -477,6 +491,14 @@ rdropts_l	: rdropts_l rdroptsl nl
 		;
 
 rdroptsl	: forwardmode TO tablespec interface	{
+			if (hashkey != NULL) {
+				memcpy(&rdr->conf.key,
+				    hashkey, sizeof(rdr->conf.key));
+				rdr->conf.flags |= F_HASHKEY;
+				free(hashkey);
+				hashkey = NULL;
+			}
+
 			switch ($1) {
 			case FWD_NORMAL:
 				if ($4 == NULL)
@@ -673,6 +695,7 @@ tablespec	: table			{
 			free($1);
 			table = tb;
 			dstmode = RELAY_DSTMODE_DEFAULT;
+			hashkey = NULL;
 		} tableopts_l		{
 			struct table	*tb;
 			if (table->conf.port == 0)
@@ -728,19 +751,42 @@ tableopts	: CHECK tablecheck
 			table->conf.skip_cnt =
 			    ($2 / conf->sc_interval.tv_sec) - 1;
 		}
-		| MODE dstmode		{
+		| MODE dstmode hashkey	{
 			switch ($2) {
 			case RELAY_DSTMODE_LOADBALANCE:
 			case RELAY_DSTMODE_HASH:
 			case RELAY_DSTMODE_SRCHASH:
-			case RELAY_DSTMODE_RANDOM:
+				if (hashkey != NULL) {
+					yyerror("key already specified");
+					free(hashkey);
+					YYERROR;
+				}
+				if ((hashkey = calloc(1,
+				    sizeof(*hashkey))) == NULL)
+					fatal("out of memory");
+				memcpy(hashkey, &$3.key, sizeof(*hashkey));
+				break;
+			default:
+				if ($3.keyset) {
+					yyerror("key not supported by mode");
+					YYERROR;
+				}
+				hashkey = NULL;
+				break;
+			}
+
+			switch ($2) {
+			case RELAY_DSTMODE_LOADBALANCE:
+			case RELAY_DSTMODE_HASH:
 				if (rdr != NULL) {
 					yyerror("mode not supported "
 					    "for redirections");
 					YYERROR;
 				}
 				/* FALLTHROUGH */
+			case RELAY_DSTMODE_RANDOM:
 			case RELAY_DSTMODE_ROUNDROBIN:
+			case RELAY_DSTMODE_SRCHASH:
 				dstmode = $2;
 				break;
 			case RELAY_DSTMODE_LEASTSTATES:
@@ -755,17 +801,61 @@ tableopts	: CHECK tablecheck
 		}
 		;
 
+/* should be in sync with sbin/pfctl/parse.y's hashkey */
+hashkey		: /* empty */		{
+			$$.keyset = 0;
+			$$.key.data[0] = arc4random();
+			$$.key.data[1] = arc4random();
+			$$.key.data[2] = arc4random();
+			$$.key.data[3] = arc4random();
+		}
+		| STRING		{
+			/* manual key configuration */
+			$$.keyset = 1;
+
+			if (!strncmp($1, "0x", 2)) {
+				if (strlen($1) != 34) {
+					free($1);
+					yyerror("hex key must be 128 bits "
+					    "(32 hex digits) long");
+					YYERROR;
+				}
+
+				if (sscanf($1, "0x%8x%8x%8x%8x",
+				    &$$.key.data[0], &$$.key.data[1],
+				    &$$.key.data[2], &$$.key.data[3]) != 4) {
+					free($1);
+					yyerror("invalid hex key");
+					YYERROR;
+				}
+			} else {
+				MD5_CTX	context;
+
+				MD5Init(&context);
+				MD5Update(&context, (unsigned char *)$1,
+				    strlen($1));
+				MD5Final((unsigned char *)$$.key.data,
+				    &context);
+				HTONL($$.key.data[0]);
+				HTONL($$.key.data[1]);
+				HTONL($$.key.data[2]);
+				HTONL($$.key.data[3]);
+			}
+			free($1);
+		}
+		;
+
 tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 		| TCP			{ table->conf.check = CHECK_TCP; }
-		| SSL			{
+		| ssltls		{
 			table->conf.check = CHECK_TCP;
-			conf->sc_flags |= F_SSL;
-			table->conf.flags |= F_SSL;
+			conf->sc_flags |= F_TLS;
+			table->conf.flags |= F_TLS;
 		}
 		| http_type STRING hostname CODE NUMBER {
 			if ($1) {
-				conf->sc_flags |= F_SSL;
-				table->conf.flags |= F_SSL;
+				conf->sc_flags |= F_TLS;
+				table->conf.flags |= F_TLS;
 			}
 			table->conf.check = CHECK_HTTP_CODE;
 			if ((table->conf.retcode = $5) <= 0) {
@@ -785,8 +875,8 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 		}
 		| http_type STRING hostname digest {
 			if ($1) {
-				conf->sc_flags |= F_SSL;
-				table->conf.flags |= F_SSL;
+				conf->sc_flags |= F_TLS;
+				table->conf.flags |= F_TLS;
 			}
 			table->conf.check = CHECK_HTTP_DIGEST;
 			if (asprintf(&table->sendbuf,
@@ -807,11 +897,11 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 			table->conf.digest_type = $4.type;
 			free($4.digest);
 		}
-		| SEND sendbuf EXPECT STRING optssl {
+		| SEND sendbuf EXPECT STRING opttls {
 			table->conf.check = CHECK_SEND_EXPECT;
 			if ($5) {
-				conf->sc_flags |= F_SSL;
-				table->conf.flags |= F_SSL;
+				conf->sc_flags |= F_TLS;
+				table->conf.flags |= F_TLS;
 			}
 			if (strlcpy(table->conf.exbuf, $4,
 			    sizeof(table->conf.exbuf))
@@ -900,13 +990,13 @@ proto		: relay_proto PROTO STRING	{
 			p->type = $1;
 			p->cache = RELAY_CACHESIZE;
 			p->tcpflags = TCPFLAG_DEFAULT;
-			p->sslflags = SSLFLAG_DEFAULT;
+			p->tlsflags = TLSFLAG_DEFAULT;
 			p->tcpbacklog = RELAY_BACKLOG;
 			TAILQ_INIT(&p->rules);
-			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
-			    sizeof(p->sslciphers));
-			p->ssldhparams = SSLDHPARAMS_DEFAULT;
-			p->sslecdhcurve = SSLECDHCURVE_DEFAULT;
+			(void)strlcpy(p->tlsciphers, TLSCIPHERS_DEFAULT,
+			    sizeof(p->tlsciphers));
+			p->tlsdhparams = TLSDHPARAMS_DEFAULT;
+			p->tlsecdhcurve = TLSECDHCURVE_DEFAULT;
 			if (last_proto_id == INT_MAX) {
 				yyerror("too many protocols defined");
 				free(p);
@@ -916,8 +1006,8 @@ proto		: relay_proto PROTO STRING	{
 		} protopts_n			{
 			conf->sc_protocount++;
 
-			if ((proto->sslflags & SSLFLAG_VERSION) == 0) {
-				yyerror("invalid SSL protocol");
+			if ((proto->tlsflags & TLSFLAG_VERSION) == 0) {
+				yyerror("invalid TLS protocol");
 				YYERROR;
 			}
 
@@ -934,8 +1024,8 @@ protopts_l	: protopts_l protoptsl nl
 		| protoptsl optnl
 		;
 
-protoptsl	: SSL sslflags
-		| SSL '{' sslflags_l '}'
+protoptsl	: ssltls tlsflags
+		| ssltls '{' tlsflags_l '}'
 		| TCP tcpflags
 		| TCP '{' tcpflags_l '}'
 		| RETURN ERROR opteflags	{ proto->flags |= F_RETURN; }
@@ -989,54 +1079,54 @@ tcpflags	: SACK			{ proto->tcpflags |= TCPFLAG_SACK; }
 		}
 		;
 
-sslflags_l	: sslflags comma sslflags_l
-		| sslflags
+tlsflags_l	: tlsflags comma tlsflags_l
+		| tlsflags
 		;
 
-sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
+tlsflags	: SESSION CACHE tlscache	{ proto->cache = $3; }
 		| CIPHERS STRING		{
-			if (strlcpy(proto->sslciphers, $2,
-			    sizeof(proto->sslciphers)) >=
-			    sizeof(proto->sslciphers)) {
-				yyerror("sslciphers truncated");
+			if (strlcpy(proto->tlsciphers, $2,
+			    sizeof(proto->tlsciphers)) >=
+			    sizeof(proto->tlsciphers)) {
+				yyerror("tlsciphers truncated");
 				free($2);
 				YYERROR;
 			}
 			free($2);
 		}
 		| NO EDH			{
-			proto->ssldhparams = SSLDHPARAMS_NONE;
+			proto->tlsdhparams = TLSDHPARAMS_NONE;
 		}
-		| EDH ssldhparams		{
-			proto->ssldhparams = $2;
+		| EDH tlsdhparams		{
+			proto->tlsdhparams = $2;
 		}
 		| NO ECDH			{
-			proto->sslecdhcurve = 0;
+			proto->tlsecdhcurve = 0;
 		}
-		| ECDH sslecdhcurve		{
-			proto->sslecdhcurve = $2;
+		| ECDH tlsecdhcurve		{
+			proto->tlsecdhcurve = $2;
 		}
 		| CA FILENAME STRING		{
-			if (strlcpy(proto->sslca, $3,
-			    sizeof(proto->sslca)) >=
-			    sizeof(proto->sslca)) {
-				yyerror("sslca truncated");
+			if (strlcpy(proto->tlsca, $3,
+			    sizeof(proto->tlsca)) >=
+			    sizeof(proto->tlsca)) {
+				yyerror("tlsca truncated");
 				free($3);
 				YYERROR;
 			}
 			free($3);
 		}
 		| CA KEY STRING PASSWORD STRING	{
-			if (strlcpy(proto->sslcakey, $3,
-			    sizeof(proto->sslcakey)) >=
-			    sizeof(proto->sslcakey)) {
-				yyerror("sslcakey truncated");
+			if (strlcpy(proto->tlscakey, $3,
+			    sizeof(proto->tlscakey)) >=
+			    sizeof(proto->tlscakey)) {
+				yyerror("tlscakey truncated");
 				free($3);
 				free($5);
 				YYERROR;
 			}
-			if ((proto->sslcapass = strdup($5)) == NULL) {
-				yyerror("sslcapass");
+			if ((proto->tlscapass = strdup($5)) == NULL) {
+				yyerror("tlscapass");
 				free($3);
 				free($5);
 				YYERROR;
@@ -1045,36 +1135,36 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 			free($5);
 		}
 		| CA CERTIFICATE STRING		{
-			if (strlcpy(proto->sslcacert, $3,
-			    sizeof(proto->sslcacert)) >=
-			    sizeof(proto->sslcacert)) {
-				yyerror("sslcacert truncated");
+			if (strlcpy(proto->tlscacert, $3,
+			    sizeof(proto->tlscacert)) >=
+			    sizeof(proto->tlscacert)) {
+				yyerror("tlscacert truncated");
 				free($3);
 				YYERROR;
 			}
 			free($3);
 		}
-		| NO flag			{ proto->sslflags &= ~($2); }
-		| flag				{ proto->sslflags |= $1; }
+		| NO flag			{ proto->tlsflags &= ~($2); }
+		| flag				{ proto->tlsflags |= $1; }
 		;
 
 flag		: STRING			{
 			if (strcmp("sslv3", $1) == 0)
-				$$ = SSLFLAG_SSLV3;
+				$$ = TLSFLAG_SSLV3;
 			else if (strcmp("tlsv1", $1) == 0)
-				$$ = SSLFLAG_TLSV1;
+				$$ = TLSFLAG_TLSV1;
 			else if (strcmp("tlsv1.0", $1) == 0)
-				$$ = SSLFLAG_TLSV1_0;
+				$$ = TLSFLAG_TLSV1_0;
 			else if (strcmp("tlsv1.1", $1) == 0)
-				$$ = SSLFLAG_TLSV1_1;
+				$$ = TLSFLAG_TLSV1_1;
 			else if (strcmp("tlsv1.2", $1) == 0)
-				$$ = SSLFLAG_TLSV1_2;
+				$$ = TLSFLAG_TLSV1_2;
 			else if (strcmp("cipher-server-preference", $1) == 0)
-				$$ = SSLFLAG_CIPHER_SERVER_PREF;
+				$$ = TLSFLAG_CIPHER_SERVER_PREF;
 			else if (strcmp("client-renegotiation", $1) == 0)
-				$$ = SSLFLAG_CLIENT_RENEG;
+				$$ = TLSFLAG_CLIENT_RENEG;
 			else {
-				yyerror("invalid SSL flag: %s", $1);
+				yyerror("invalid TLS flag: %s", $1);
 				free($1);
 				YYERROR;
 			}
@@ -1082,9 +1172,9 @@ flag		: STRING			{
 		}
 		;
 
-sslcache	: NUMBER			{
+tlscache	: NUMBER			{
 			if ($1 < 0) {
-				yyerror("invalid sslcache value: %d", $1);
+				yyerror("invalid tlscache value: %d", $1);
 				YYERROR;
 			}
 			$$ = $1;
@@ -1463,9 +1553,9 @@ key_option	: /* empty */		{ $$ = KEY_OPTION_NONE; }
 		| LOG			{ $$ = KEY_OPTION_LOG; }
 		;
 
-ssldhparams	: /* empty */		{ $$ = SSLDHPARAMS_MIN; }
+tlsdhparams	: /* empty */		{ $$ = TLSDHPARAMS_MIN; }
 		| PARAMS NUMBER		{
-			if ($2 < SSLDHPARAMS_MIN) {
+			if ($2 < TLSDHPARAMS_MIN) {
 				yyerror("EDH params not supported: %d", $2);
 				YYERROR;
 			}
@@ -1473,11 +1563,11 @@ ssldhparams	: /* empty */		{ $$ = SSLDHPARAMS_MIN; }
 		}
 		;
 
-sslecdhcurve	: /* empty */		{ $$ = SSLECDHCURVE_DEFAULT; }
+tlsecdhcurve	: /* empty */		{ $$ = TLSECDHCURVE_DEFAULT; }
 		| CURVE STRING		{
 			if (strcmp("none", $2) == 0)
 				$$ = 0;
-			else if ((proto->sslecdhcurve = OBJ_sn2nid($2)) == 0) {
+			else if ((proto->tlsecdhcurve = OBJ_sn2nid($2)) == 0) {
 				yyerror("ECDH curve not supported");
 				free($2);
 				YYERROR;
@@ -1583,7 +1673,7 @@ relayopts_l	: relayopts_l relayoptsl nl
 		| relayoptsl optnl
 		;
 
-relayoptsl	: LISTEN ON STRING port optssl {
+relayoptsl	: LISTEN ON STRING port opttls {
 			struct addresslist	 al;
 			struct address		*h;
 			struct relay		*r;
@@ -1611,21 +1701,21 @@ relayoptsl	: LISTEN ON STRING port optssl {
 			bcopy(&h->ss, &r->rl_conf.ss, sizeof(r->rl_conf.ss));
 			r->rl_conf.port = h->port.val[0];
 			if ($5) {
-				r->rl_conf.flags |= F_SSL;
-				conf->sc_flags |= F_SSL;
+				r->rl_conf.flags |= F_TLS;
+				conf->sc_flags |= F_TLS;
 			}
 			tableport = h->port.val[0];
 			host_free(&al);
 		}
-		| forwardmode optsslclient TO forwardspec dstaf {
+		| forwardmode opttlsclient TO forwardspec dstaf {
 			rlay->rl_conf.fwdmode = $1;
 			if ($1 == FWD_ROUTE) {
 				yyerror("no route for relays");
 				YYERROR;
 			}
 			if ($2) {
-				rlay->rl_conf.flags |= F_SSLCLIENT;
-				conf->sc_flags |= F_SSLCLIENT;
+				rlay->rl_conf.flags |= F_TLSCLIENT;
+				conf->sc_flags |= F_TLSCLIENT;
 			}
 		}
 		| SESSION TIMEOUT NUMBER		{
@@ -1712,6 +1802,15 @@ forwardspec	: STRING port retry	{
 			rlt->rlt_flags = F_USED;
 			if (!TAILQ_EMPTY(&rlay->rl_tables))
 				rlt->rlt_flags |= F_BACKUP;
+
+			if (hashkey != NULL &&
+			    (rlay->rl_conf.flags & F_HASHKEY) == 0) {
+				memcpy(&rlay->rl_conf.hashkey,
+				    hashkey, sizeof(rlay->rl_conf.hashkey));
+				rlay->rl_conf.flags |= F_HASHKEY;
+			}
+			free(hashkey);
+			hashkey = NULL;
 
 			TAILQ_INSERT_TAIL(&rlay->rl_tables, rlt, rlt_entry);
 		}
@@ -1825,6 +1924,9 @@ routeoptsl	: ROUTE address '/' NUMBER {
 			TAILQ_INSERT_TAIL(conf->sc_routes, nr, nr_route);
 		}
 		| FORWARD TO tablespec {
+			free(hashkey);
+			hashkey = NULL;
+
 			if (router->rt_gwtable) {
 				yyerror("router %s table already specified",
 				    router->rt_conf.name);
@@ -2148,6 +2250,7 @@ lookup(char *s)
 		{ "tagged",		TAGGED },
 		{ "tcp",		TCP },
 		{ "timeout",		TIMEOUT },
+		{ "tls",		TLS },
 		{ "to",			TO },
 		{ "transparent",	TRANSPARENT },
 		{ "trap",		TRAP },
@@ -3038,8 +3141,8 @@ int
 relay_id(struct relay *rl)
 {
 	rl->rl_conf.id = ++last_relay_id;
-	rl->rl_conf.ssl_keyid = ++last_key_id;
-	rl->rl_conf.ssl_cakeyid = ++last_key_id;
+	rl->rl_conf.tls_keyid = ++last_key_id;
+	rl->rl_conf.tls_cakeyid = ++last_key_id;
 
 	if (last_relay_id == INT_MAX || last_key_id == INT_MAX)
 		return (-1);
@@ -3059,12 +3162,12 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	bcopy(&rc.ss, &rb->rl_conf.ss, sizeof(rb->rl_conf.ss));
 	rb->rl_conf.port = rc.port;
 	rb->rl_conf.flags =
-	    (ra->rl_conf.flags & ~F_SSL) | (rc.flags & F_SSL);
-	if (!(rb->rl_conf.flags & F_SSL)) {
-		rb->rl_ssl_cert = NULL;
-		rb->rl_conf.ssl_cert_len = 0;
-		rb->rl_ssl_key = NULL;
-		rb->rl_conf.ssl_key_len = 0;
+	    (ra->rl_conf.flags & ~F_TLS) | (rc.flags & F_TLS);
+	if (!(rb->rl_conf.flags & F_TLS)) {
+		rb->rl_tls_cert = NULL;
+		rb->rl_conf.tls_cert_len = 0;
+		rb->rl_tls_key = NULL;
+		rb->rl_conf.tls_key_len = 0;
 	}
 	TAILQ_INIT(&rb->rl_tables);
 

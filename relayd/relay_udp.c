@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_udp.c,v 1.34 2014/11/19 10:24:40 blambert Exp $	*/
+/*	$OpenBSD: relay_udp.c,v 1.37 2014/12/21 00:54:49 guenther Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -23,13 +23,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/tree.h>
-#include <sys/hash.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -74,8 +72,8 @@ relay_udp_privinit(struct relayd *x_env, struct relay *rlay)
 	if (env == NULL)
 		env = x_env;
 
-	if (rlay->rl_conf.flags & F_SSL)
-		fatalx("ssl over udp is not supported");
+	if (rlay->rl_conf.flags & F_TLS)
+		fatalx("tls over udp is not supported");
 	rlay->rl_conf.flags |= F_UDP;
 }
 

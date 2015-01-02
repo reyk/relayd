@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_http.c,v 1.35 2014/10/25 03:23:49 lteo Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.39 2015/01/01 14:54:06 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -23,13 +23,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/tree.h>
-#include <sys/hash.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -873,6 +871,17 @@ relay_lookup_query(struct ctl_relay_event *cre, struct kv *kv)
 	return (ret);
 }
 
+ssize_t
+relay_http_time(time_t t, char *tmbuf, size_t len)
+{
+	struct tm		 tm;
+
+	/* New HTTP/1.1 RFC 7231 prefers IMF-fixdate from RFC 5322 */
+	if (t == -1 || gmtime_r(&t, &tm) == NULL)
+		return (-1);
+	else
+		return (strftime(tmbuf, len, "%a, %d %h %Y %T %Z", &tm));
+}
 
 void
 relay_abort_http(struct rsession *con, u_int code, const char *msg,
@@ -881,11 +890,10 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	struct relay		*rlay = con->se_relay;
 	struct bufferevent	*bev = con->se_in.bev;
 	const char		*httperr = NULL, *text = "";
-	char			*httpmsg;
-	time_t			 t;
-	struct tm		*lt;
+	char			*httpmsg, *body = NULL;
 	char			 tmbuf[32], hbuf[128];
 	const char		*style, *label = NULL;
+	int			 bodylen;
 
 	if ((httperr = relay_httperror_byid(code)) == NULL)
 		httperr = "Unknown Error";
@@ -907,31 +915,27 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	if (print_host(&rlay->rl_conf.ss, hbuf, sizeof(hbuf)) == NULL)
 		goto done;
 
-	/* RFC 2616 "tolerates" asctime() */
-	time(&t);
-	lt = localtime(&t);
-	tmbuf[0] = '\0';
-	if (asctime_r(lt, tmbuf) != NULL)
-		tmbuf[strlen(tmbuf) - 1] = '\0';	/* skip final '\n' */
+	if (relay_http_time(time(NULL), tmbuf, sizeof(tmbuf)) <= 0)
+		goto done;
 
 	/* Do not send details of the Internal Server Error */
-	if (code != 500)
+	switch (code) {
+	case 500:
+		break;
+	default:
 		text = msg;
+		break;
+	}
 
 	/* A CSS stylesheet allows minimal customization by the user */
-	if ((style = rlay->rl_proto->style) == NULL)
-		style = "body { background-color: #a00000; color: white; }";
+	style = (rlay->rl_proto->style != NULL) ? rlay->rl_proto->style :
+	    "body { background-color: #a00000; color: white; font-family: "
+	    "'Comic Sans MS', 'Chalkboard SE', 'Comic Neue', sans-serif; }\n"
+	    "hr { border: 0; border-bottom: 1px dashed; }\n";
 
 	/* Generate simple HTTP+HTML error document */
-	if (asprintf(&httpmsg,
-	    "HTTP/1.0 %03d %s\r\n"
-	    "Date: %s\r\n"
-	    "Server: %s\r\n"
-	    "Connection: close\r\n"
-	    "Content-Type: text/html\r\n"
-	    "\r\n"
-	    "<!DOCTYPE HTML PUBLIC "
-	    "\"-//W3C//DTD HTML 4.01 Transitional//EN\">\n"
+	if ((bodylen = asprintf(&body,
+	    "<!DOCTYPE html>\n"
 	    "<html>\n"
 	    "<head>\n"
 	    "<title>%03d %s</title>\n"
@@ -944,10 +948,22 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	    "<hr><address>%s at %s port %d</address>\n"
 	    "</body>\n"
 	    "</html>\n",
-	    code, httperr, tmbuf, RELAYD_SERVERNAME,
 	    code, httperr, style, httperr, text,
 	    label == NULL ? "" : label,
-	    RELAYD_SERVERNAME, hbuf, ntohs(rlay->rl_conf.port)) == -1)
+	    RELAYD_SERVERNAME, hbuf, ntohs(rlay->rl_conf.port))) == -1)
+		goto done;
+
+	/* Generate simple HTTP+HTML error document */
+	if (asprintf(&httpmsg,
+	    "HTTP/1.0 %03d %s\r\n"
+	    "Date: %s\r\n"
+	    "Server: %s\r\n"
+	    "Connection: close\r\n"
+	    "Content-Type: text/html\r\n"
+	    "Content-Length: %d\r\n"
+	    "\r\n"
+	    "%s",
+	    code, httperr, tmbuf, RELAYD_SERVERNAME, bodylen, body) == -1)
 		goto done;
 
 	/* Dump the message without checking for success */
@@ -955,6 +971,7 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	free(httpmsg);
 
  done:
+	free(body);
 	if (asprintf(&httpmsg, "%s (%03d %s)", msg, code, httperr) == -1)
 		relay_close(con, msg);
 	else {
@@ -1487,12 +1504,8 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 				value = match->kv_value;
 				break;
 			}
-			if (!con->se_hashkeyset)
-				con->se_hashkey = HASHINIT;
-			con->se_hashkey = hash32_str(value, con->se_hashkey);
-			con->se_hashkeyset = 1;
-			log_debug("%s: hashkey 0x%04x", __func__,
-			    con->se_hashkey);
+			SipHash24_Update(&con->se_siphashctx,
+			    value, strlen(value));
 			break;
 		case KEY_OPTION_LOG:
 			/* perform this later */

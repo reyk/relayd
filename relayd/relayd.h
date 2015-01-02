@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.197 2014/11/19 10:24:40 blambert Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.202 2015/01/01 14:54:06 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -24,8 +24,10 @@
 #include <sys/tree.h>
 
 #include <sys/param.h>		/* MAXHOSTNAMELEN */
+#include <netinet/in.h>
 #include <limits.h>
 #include <imsg.h>
+#include <siphash.h>
 
 #ifndef nitems
 #define	nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
@@ -49,7 +51,7 @@
 #define SRV_NAME_SIZE		64
 #define MAX_NAME_SIZE		64
 #define SRV_MAX_VIRTS		16
-#define SSL_NAME_SIZE		512
+#define TLS_NAME_SIZE		512
 
 #define FD_RESERVE		5
 
@@ -152,7 +154,8 @@ struct ctl_tcp_event {
 	struct event		 ev;
 	int			(*validate_read)(struct ctl_tcp_event *);
 	int			(*validate_close)(struct ctl_tcp_event *);
-	SSL			*ssl;
+
+	SSL			*ssl;	/* libssl object */
 };
 
 enum direction {
@@ -162,11 +165,11 @@ enum direction {
 	RELAY_DIR_RESPONSE	=  2
 };
 
-enum sslreneg_state {
-	SSLRENEG_INIT		= 0,	/* first/next negotiation is allowed */
-	SSLRENEG_ALLOW		= 1,	/* all (re-)negotiations are allowed */
-	SSLRENEG_DENY		= 2,	/* next renegotiation must be denied */
-	SSLRENEG_ABORT		= 3	/* the connection should be aborted */
+enum tlsreneg_state {
+	TLSRENEG_INIT		= 0,	/* first/next negotiation is allowed */
+	TLSRENEG_ALLOW		= 1,	/* all (re-)negotiations are allowed */
+	TLSRENEG_DENY		= 2,	/* next renegotiation must be denied */
+	TLSRENEG_ABORT		= 3	/* the connection should be aborted */
 };
 
 struct ctl_relay_event {
@@ -178,9 +181,10 @@ struct ctl_relay_event {
 	struct ctl_relay_event	*dst;
 	struct rsession		*con;
 
-	SSL			*ssl;
-	X509			*sslcert;
-	enum sslreneg_state	 sslreneg_state;
+	SSL			*ssl;	/* libssl object */
+
+	X509			*tlscert;
+	enum tlsreneg_state	 tlsreneg_state;
 
 	off_t			 splicelen;
 	off_t			 toread;
@@ -330,6 +334,12 @@ struct address {
 };
 TAILQ_HEAD(addresslist, address);
 
+union hashkey {
+	/* Simplified version of pf_poolhashkey */
+	u_int32_t		 data[4];
+	SIPHASH_KEY		 siphashkey;
+};
+
 #define F_DISABLE		0x00000001
 #define F_BACKUP		0x00000002
 #define F_USED			0x00000004
@@ -341,7 +351,7 @@ TAILQ_HEAD(addresslist, address);
 #define F_CHECK_DONE		0x00000100
 #define F_ACTIVE_RULESET	0x00000200
 #define F_CHECK_SENT		0x00000400
-#define F_SSL			0x00000800
+#define F_TLS			0x00000800
 #define F_NATLOOK		0x00001000
 #define F_DEMOTE		0x00002000
 #define F_LOOKUP_PATH		0x00004000
@@ -351,19 +361,20 @@ TAILQ_HEAD(addresslist, address);
 #define F_SNMP			0x00040000
 #define F_NEEDPF		0x00080000
 #define F_PORT			0x00100000
-#define F_SSLCLIENT		0x00200000
+#define F_TLSCLIENT		0x00200000
 #define F_NEEDRT		0x00400000
 #define F_MATCH			0x00800000
 #define F_DIVERT		0x01000000
 #define F_SCRIPT		0x02000000
-#define F_SSLINSPECT		0x04000000
+#define F_TLSINSPECT		0x04000000
+#define F_HASHKEY		0x08000000
 
 #define F_BITS								\
 	"\10\01DISABLE\02BACKUP\03USED\04DOWN\05ADD\06DEL\07CHANGED"	\
 	"\10STICKY-ADDRESS\11CHECK_DONE\12ACTIVE_RULESET\13CHECK_SENT"	\
-	"\14SSL\15NAT_LOOKUP\16DEMOTE\17LOOKUP_PATH\20DEMOTED\21UDP"	\
-	"\22RETURN\23TRAP\24NEEDPF\25PORT\26SSL_CLIENT\27NEEDRT"	\
-	"\30MATCH\31DIVERT\32SCRIPT"
+	"\14TLS\15NAT_LOOKUP\16DEMOTE\17LOOKUP_PATH\20DEMOTED\21UDP"	\
+	"\22RETURN\23TRAP\24NEEDPF\25PORT\26TLS_CLIENT\27NEEDRT"	\
+	"\30MATCH\31DIVERT\32SCRIPT\33TLS_INSPECT\34HASHKEY"
 
 enum forwardmode {
 	FWD_NORMAL		= 0,
@@ -420,14 +431,14 @@ enum host_error {
 	HCE_TCP_READ_FAIL,
 	HCE_SCRIPT_OK,
 	HCE_SCRIPT_FAIL,
-	HCE_SSL_CONNECT_ERROR,
-	HCE_SSL_CONNECT_FAIL,
-	HCE_SSL_CONNECT_OK,
-	HCE_SSL_CONNECT_TIMEOUT,
-	HCE_SSL_READ_TIMEOUT,
-	HCE_SSL_WRITE_TIMEOUT,
-	HCE_SSL_READ_ERROR,
-	HCE_SSL_WRITE_ERROR,
+	HCE_TLS_CONNECT_ERROR,
+	HCE_TLS_CONNECT_FAIL,
+	HCE_TLS_CONNECT_OK,
+	HCE_TLS_CONNECT_TIMEOUT,
+	HCE_TLS_READ_TIMEOUT,
+	HCE_TLS_WRITE_TIMEOUT,
+	HCE_TLS_READ_ERROR,
+	HCE_TLS_WRITE_ERROR,
 	HCE_SEND_EXPECT_FAIL,
 	HCE_SEND_EXPECT_OK,
 	HCE_HTTP_CODE_ERROR,
@@ -471,7 +482,7 @@ struct table {
 	int			 up;
 	int			 skipped;
 	struct hostlist		 hosts;
-	SSL_CTX			*ssl_ctx;
+	SSL_CTX			*ssl_ctx;	/* libssl context */
 	char			*sendbuf;
 };
 TAILQ_HEAD(tablelist, table);
@@ -493,6 +504,7 @@ struct rdr_config {
 	objid_t			 table_id;
 	objid_t			 backup_id;
 	int			 mode;
+	union hashkey		 key;
 	char			 name[SRV_NAME_SIZE];
 	char			 tag[RD_TAG_NAME_SIZE];
 	struct timeval		 timeout;
@@ -515,8 +527,7 @@ struct rsession {
 	struct ctl_relay_event		 se_in;
 	struct ctl_relay_event		 se_out;
 	void				*se_priv;
-	u_int32_t			 se_hashkey;
-	int				 se_hashkeyset;
+	SIPHASH_CTX			 se_siphashctx;
 	struct relay_table		*se_table;
 	struct event			 se_ev;
 	struct timeval			 se_timeout;
@@ -638,27 +649,27 @@ TAILQ_HEAD(relay_rules, relay_rule);
 	"\10\01NODELAY\02NO_NODELAY\03SACK\04NO_SACK"		\
 	"\05SOCKET_BUFFER_SIZE\06IP_TTL\07IP_MINTTL\10NO_SPLICE"
 
-#define SSLFLAG_SSLV3				0x01
-#define SSLFLAG_TLSV1_0				0x02
-#define SSLFLAG_TLSV1_1				0x04
-#define SSLFLAG_TLSV1_2				0x08
-#define SSLFLAG_TLSV1				0x0e
-#define SSLFLAG_VERSION				0x1f
-#define SSLFLAG_CIPHER_SERVER_PREF		0x20
-#define SSLFLAG_CLIENT_RENEG			0x40
-#define SSLFLAG_DEFAULT				\
-	(SSLFLAG_TLSV1|SSLFLAG_CLIENT_RENEG)
+#define TLSFLAG_SSLV3				0x01
+#define TLSFLAG_TLSV1_0				0x02
+#define TLSFLAG_TLSV1_1				0x04
+#define TLSFLAG_TLSV1_2				0x08
+#define TLSFLAG_TLSV1				0x0e
+#define TLSFLAG_VERSION				0x1f
+#define TLSFLAG_CIPHER_SERVER_PREF		0x20
+#define TLSFLAG_CLIENT_RENEG			0x40
+#define TLSFLAG_DEFAULT				\
+	(TLSFLAG_TLSV1|TLSFLAG_CLIENT_RENEG)
 
-#define SSLFLAG_BITS						\
+#define TLSFLAG_BITS						\
 	"\06\01sslv3\02tlsv1.0\03tlsv1.1\04tlsv1.2"	\
 	"\06cipher-server-preference\07client-renegotiation"
 
-#define SSLCIPHERS_DEFAULT	"HIGH:!aNULL"
-#define SSLECDHCURVE_DEFAULT	NID_X9_62_prime256v1
+#define TLSCIPHERS_DEFAULT	"HIGH:!aNULL"
+#define TLSECDHCURVE_DEFAULT	NID_X9_62_prime256v1
 
-#define SSLDHPARAMS_NONE	0
-#define SSLDHPARAMS_DEFAULT	0
-#define SSLDHPARAMS_MIN		1024
+#define TLSDHPARAMS_NONE	0
+#define TLSDHPARAMS_DEFAULT	0
+#define TLSDHPARAMS_MIN		1024
 
 struct protocol {
 	objid_t			 id;
@@ -668,14 +679,14 @@ struct protocol {
 	int			 tcpbacklog;
 	u_int8_t		 tcpipttl;
 	u_int8_t		 tcpipminttl;
-	u_int8_t		 sslflags;
-	char			 sslciphers[768];
-	int			 ssldhparams;
-	int			 sslecdhcurve;
-	char			 sslca[MAXPATHLEN];
-	char			 sslcacert[MAXPATHLEN];
-	char			 sslcakey[MAXPATHLEN];
-	char			*sslcapass;
+	u_int8_t		 tlsflags;
+	char			 tlsciphers[768];
+	int			 tlsdhparams;
+	int			 tlsecdhcurve;
+	char			 tlsca[MAXPATHLEN];
+	char			 tlscacert[MAXPATHLEN];
+	char			 tlscakey[MAXPATHLEN];
+	char			*tlscapass;
 	char			 name[MAX_NAME_SIZE];
 	int			 cache;
 	enum prototype		 type;
@@ -699,7 +710,7 @@ struct relay_table {
 	struct table		*rlt_table;
 	u_int32_t		 rlt_flags;
 	int			 rlt_mode;
-	u_int32_t		 rlt_key;
+	u_int32_t		 rlt_index;
 	struct host		*rlt_host[RELAY_MAXHOSTS];
 	int			 rlt_nhosts;
 	TAILQ_ENTRY(relay_table) rlt_entry;
@@ -726,13 +737,14 @@ struct relay_config {
 	struct sockaddr_storage	 dstaf;
 	struct timeval		 timeout;
 	enum forwardmode	 fwdmode;
-	off_t			 ssl_cert_len;
-	off_t			 ssl_key_len;
-	objid_t			 ssl_keyid;
-	off_t			 ssl_ca_len;
-	off_t			 ssl_cacert_len;
-	off_t			 ssl_cakey_len;
-	objid_t			 ssl_cakeyid;
+	union hashkey		 hashkey;
+	off_t			 tls_cert_len;
+	off_t			 tls_key_len;
+	objid_t			 tls_keyid;
+	off_t			 tls_ca_len;
+	off_t			 tls_cacert_len;
+	off_t			 tls_cakey_len;
+	objid_t			 tls_cakeyid;
 };
 
 struct relay {
@@ -752,21 +764,17 @@ struct relay {
 	struct event		 rl_ev;
 	struct event		 rl_evt;
 
-	SSL_CTX			*rl_ssl_ctx;
+	SSL_CTX			*rl_ssl_ctx;	/* libssl context */
 
-	char			*rl_ssl_cert;
-	X509			*rl_ssl_x509;
-
-	char			*rl_ssl_key;
-	EVP_PKEY		*rl_ssl_pkey;
-
-	char			*rl_ssl_ca;
-
-	char			*rl_ssl_cacert;
-	X509			*rl_ssl_cacertx509;
-
-	char			*rl_ssl_cakey;
-	EVP_PKEY		*rl_ssl_capkey;
+	char			*rl_tls_cert;
+	X509			*rl_tls_x509;
+	char			*rl_tls_key;
+	EVP_PKEY		*rl_tls_pkey;
+	char			*rl_tls_ca;
+	char			*rl_tls_cacert;
+	X509			*rl_tls_cacertx509;
+	char			*rl_tls_cakey;
+	EVP_PKEY		*rl_tls_capkey;
 
 	struct ctl_stats	 rl_stats[RELAY_MAXPROC + 1];
 
@@ -1179,6 +1187,7 @@ const char
 const char
 	*relay_httperror_byid(u_int);
 int	 relay_httpdesc_init(struct ctl_relay_event *);
+ssize_t	 relay_http_time(time_t, char *, size_t);
 
 /* relay_udp.c */
 void	 relay_udp_privinit(struct relayd *, struct relay *);
