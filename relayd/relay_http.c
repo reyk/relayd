@@ -384,6 +384,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		case HTTP_METHOD_POST:
 		case HTTP_METHOD_PUT:
 		case HTTP_METHOD_RESPONSE:
+		default:
 			/* HTTP request payload */
 			if (cre->toread > 0)
 				bev->readcb = relay_read_httpcontent;
@@ -393,11 +394,6 @@ relay_read_http(struct bufferevent *bev, void *arg)
 				cre->toread = TOREAD_UNLIMITED;
 				bev->readcb = relay_read;
 			}
-			break;
-		default:
-			/* HTTP handler */
-			cre->toread = TOREAD_HTTP_HEADER;
-			bev->readcb = relay_read_http;
 			break;
 		}
 		if (desc->http_chunked) {
