@@ -1151,6 +1151,7 @@ int	 relay_spliceadjust(struct ctl_relay_event *);
 void	 relay_error(struct bufferevent *, short, void *);
 int	 relay_preconnect(struct rsession *);
 int	 relay_connect(struct rsession *);
+void	 relay_disconnect(struct rsession *, const char *);
 void	 relay_connected(int, short, void *);
 void	 relay_bindanyreq(struct rsession *, in_port_t, int);
 void	 relay_bindany(int, short, void *);

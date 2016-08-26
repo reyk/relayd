@@ -1373,8 +1373,13 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
 	/*
 	 * Apply the following options instantly (action per match).
 	 */
-	if (rule->rule_table != NULL)
+	if (rule->rule_table != NULL) {
+		if (con->se_table != rule->rule_table &&
+		    cre->dst->state == STATE_CONNECTED) {
+			relay_disconnect(con, "change destination");
+		}
 		con->se_table = rule->rule_table;
+	}
 
 	if (rule->rule_tag != 0)
 		con->se_tag = rule->rule_tag == -1 ? 0 : rule->rule_tag;

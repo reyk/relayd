@@ -1583,6 +1583,67 @@ relay_connect(struct rsession *con)
 }
 
 void
+relay_disconnect(struct rsession *con, const char *msg)
+{
+	char		 ibuf[128], obuf[128], *ptr = NULL;
+	struct relay	*rlay = con->se_relay;
+
+	if ((env->sc_opts & RELAYD_OPT_LOGUPDATE) && msg != NULL) {
+		bzero(&ibuf, sizeof(ibuf));
+		bzero(&obuf, sizeof(obuf));
+		(void)print_host(&con->se_in.ss, ibuf, sizeof(ibuf));
+		(void)print_host(&con->se_out.ss, obuf, sizeof(obuf));
+		if (EVBUFFER_LENGTH(con->se_log) &&
+		    evbuffer_add_printf(con->se_log, "\r\n") != -1)
+			ptr = evbuffer_readline(con->se_log);
+		log_info("relay %s, "
+		    "session %d (%d active), %s, %s -> %s:%d, "
+		    "%s%s%s", rlay->rl_conf.name, con->se_id, relay_sessions,
+		    con->se_tag != 0 ? tag_id2name(con->se_tag) : "0", ibuf,
+		    obuf, ntohs(con->se_out.port), msg, ptr == NULL ? "" : ",",
+		    ptr == NULL ? "" : ptr);
+		free(ptr);
+	}
+
+	if (con->se_out.bev != NULL) {
+		bufferevent_free(con->se_out.bev);
+		con->se_out.bev = NULL;
+	}
+	if (con->se_out.ssl != NULL) {
+		/* XXX handle non-blocking shutdown */
+		if (SSL_shutdown(con->se_out.ssl) == 0)
+			SSL_shutdown(con->se_out.ssl);
+		SSL_free(con->se_out.ssl);
+		con->se_out.ssl = NULL;
+	}
+	if (con->se_out.tlscert != NULL) {
+		X509_free(con->se_out.tlscert);
+		con->se_out.tlscert = NULL;
+	}
+	if (con->se_out.s != -1) {
+		close(con->se_out.s);
+
+		/* Some file descriptors are available again. */
+		if (evtimer_pending(&rlay->rl_evt, NULL)) {
+			evtimer_del(&rlay->rl_evt);
+			event_add(&rlay->rl_ev, NULL);
+		}
+		con->se_out.s = -1;
+	}
+
+	/* Pre-allocate output buffer */
+	con->se_out.output = evbuffer_new();
+	if (con->se_out.output == NULL) {
+		relay_close(con, "failed to allocate output buffer");
+		return;
+	}
+
+	con->se_out.state = STATE_INIT;
+
+	free(con->se_out.buf);
+}
+
+void
 relay_close(struct rsession *con, const char *msg)
 {
 	char		 ibuf[128], obuf[128], *ptr = NULL;
