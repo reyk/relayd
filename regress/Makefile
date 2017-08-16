@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.10 2014/12/31 01:25:07 bluhm Exp $
+#	$OpenBSD: Makefile,v 1.14 2016/09/23 20:04:21 bluhm Exp $
 
 # The following ports must be installed for the regression tests:
 # p5-IO-Socket-INET6	object interface for AF_INET and AF_INET6 domain sockets
@@ -17,6 +17,16 @@ PERL_REQUIRE !=	perl -Mstrict -Mwarnings -e ' \
 regress:
 	@echo "${PERL_REQUIRE}"
 	@echo install these perl packages for additional tests
+	@echo SKIPPED
+.endif
+
+.if make (regress) || make (all)
+.BEGIN:
+.if empty (REMOTE_SSH)
+	${SUDO} true
+.else
+	ssh -t ${REMOTE_SSH} ${SUDO} true
+.endif
 .endif
 
 # Fill out these variables if you want to test relayd with
@@ -58,7 +68,6 @@ run-regress-$a: $a
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}relayd.pl copy ${PERLPATH}$a
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}relayd.pl splice ${PERLPATH}$a
 .else
-	ssh -t ${REMOTE_SSH} ${SUDO} true
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}remote.pl copy ${LOCAL_ADDR} ${REMOTE_ADDR} ${REMOTE_SSH} ${PERLPATH}$a
 	time SUDO=${SUDO} KTRACE=${KTRACE} RELAYD=${RELAYD} perl ${PERLINC} ${PERLPATH}remote.pl splice ${LOCAL_ADDR} ${REMOTE_ADDR} ${REMOTE_SSH} ${PERLPATH}$a
 .endif
@@ -67,14 +76,15 @@ run-regress-$a: $a
 # create certificates for TLS
 
 .for ip in ${REMOTE_ADDR} 127.0.0.1
-${ip}.crt:
-	openssl req -batch -new -subj /L=OpenBSD/O=relayd-regress/OU=relay/CN=${ip}/ -nodes -newkey rsa -keyout ${ip}.key -x509 -out $@
+${ip}.crt: ca.crt
+	openssl req -batch -new -subj /L=OpenBSD/O=relayd-regress/OU=relayd/CN=${ip}/ -nodes -newkey rsa -keyout ${ip}.key -x509 -out $@
 .if empty (REMOTE_SSH)
 	${SUDO} cp 127.0.0.1.crt /etc/ssl/
 	${SUDO} cp 127.0.0.1.key /etc/ssl/private/
 .else
 	scp ${REMOTE_ADDR}.crt root@${REMOTE_SSH}:/etc/ssl/
 	scp ${REMOTE_ADDR}.key root@${REMOTE_SSH}:/etc/ssl/private/
+	scp ca.crt ca.key ${REMOTE_SSH}:
 .endif
 .endfor
 

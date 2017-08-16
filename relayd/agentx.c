@@ -1,4 +1,4 @@
-/*      $OpenBSD: agentx.c,v 1.9 2014/12/21 00:54:49 guenther Exp $    */
+/*      $OpenBSD: agentx.c,v 1.14 2017/05/28 10:39:15 benno Exp $    */
 /*
  * Copyright (c) 2013,2014 Bret Stephen Lambert <blambert@openbsd.org>
  *
@@ -17,11 +17,9 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
-#include <sys/uio.h>
+#include <sys/queue.h>
 #include <sys/un.h>
 
-#include <err.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -248,8 +246,7 @@ void
 snmp_agentx_pdu_free(struct agentx_pdu *pdu)
 {
 	free(pdu->buffer);
-	if (pdu->request)
-		free(pdu->request);
+	free(pdu->request);
 	free(pdu);
 }
 
@@ -331,7 +328,7 @@ snmp_agentx_recv(struct agentx_handle *h)
 	if (h->r == NULL) {
 		if ((h->r = snmp_agentx_pdu_alloc()) == NULL)
 			return (NULL);
-		h->r->datalen = 0;	/* XXX -- force this for receive buffers */
+		h->r->datalen = 0;	/* XXX force this for receive buffers */
 	}
 	pdu = h->r;
 
@@ -363,21 +360,21 @@ snmp_agentx_recv(struct agentx_handle *h)
 	}
 
 	/* read body */
-	n = recv(h->fd, pdu->ioptr, pdu->hdr->length, 0);
+	if (pdu->hdr->length > 0) {
+		n = recv(h->fd, pdu->ioptr, pdu->hdr->length, 0);
 
-	if (n == 0 || n == -1)
-		return (NULL);
+		if (n == 0 || n == -1)
+			return (NULL);
 
-	pdu->datalen += n;
-	pdu->ioptr += n;
+		pdu->datalen += n;
+		pdu->ioptr += n;
+	}
 
 	if (pdu->datalen < pdu->hdr->length + sizeof(struct agentx_hdr)) {
 		errno = EAGAIN;
 		return (NULL);
 	}
-#ifdef DEBUG
-	snmp_agentx_dump_hdr(pdu->hdr);
-#endif
+
 	if (pdu->hdr->version != AGENTX_VERSION) {
 		h->error = AGENTX_ERR_PARSE_ERROR;
 		goto fail;
@@ -422,11 +419,20 @@ snmp_agentx_recv(struct agentx_handle *h)
 		}
 	}
 
+#ifdef DEBUG
+	snmp_agentx_dump_hdr(pdu->hdr);
+#endif
 	h->r = NULL;
+
 	return (pdu);
+
  fail:
+#ifdef DEBUG
+	snmp_agentx_dump_hdr(pdu->hdr);
+#endif
 	snmp_agentx_pdu_free(pdu);
 	h->r = NULL;
+
 	return (NULL);
 }
 
@@ -913,7 +919,8 @@ snmp_agentx_do_read_oid(struct agentx_pdu *pdu, struct snmp_oid *oid,
 }
 
 int
-snmp_agentx_read_searchrange(struct agentx_pdu *pdu, struct agentx_search_range *sr)
+snmp_agentx_read_searchrange(struct agentx_pdu *pdu,
+    struct agentx_search_range *sr)
 {
 	if (snmp_agentx_do_read_oid(pdu, &sr->start, &sr->include) == -1 ||
 	    snmp_agentx_read_oid(pdu, &sr->end) == -1)
@@ -1075,7 +1082,7 @@ snmp_agentx_dump_hdr(struct agentx_hdr *hdr)
 		return;
 	}
 
-	fprintf(stderr, 
+	fprintf(stderr,
 	    "agentx: version %d type %s flags %d reserved %d"
 	    " sessionid %d transactid %d packetid %d length %d",
 	    hdr->version, snmp_agentx_type2name(hdr->type), hdr->flags,

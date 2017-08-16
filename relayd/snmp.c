@@ -1,4 +1,4 @@
-/*	$OpenBSD: snmp.c,v 1.21 2014/12/21 00:54:49 guenther Exp $	*/
+/*	$OpenBSD: snmp.c,v 1.29 2017/05/28 10:39:15 benno Exp $	*/
 
 /*
  * Copyright (c) 2008 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -18,22 +18,21 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/queue.h>
+#include <sys/time.h>
 #include <sys/un.h>
-#include <sys/uio.h>
 
 #include <netinet/in.h>
-#include <net/if.h>
 
-#include <errno.h>
-#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdio.h>
-#include <err.h>
 #include <event.h>
-
-#include <openssl/ssl.h>
+#include <imsg.h>
 
 #include "relayd.h"
 #include "snmp.h"
@@ -77,8 +76,6 @@ void	 snmp_agentx_process(struct agentx_handle *, struct agentx_pdu *,
 	    void *);
 int	 snmp_register(struct relayd *);
 int	 snmp_unregister(struct relayd *);
-void	 snmp_event_add(struct relayd *, int);
-void	 snmp_agentx_process(struct agentx_handle *, struct agentx_pdu *, void *);
 
 void	*sstodata(struct sockaddr_storage *);
 size_t	 sstolen(struct sockaddr_storage *);
@@ -130,13 +127,12 @@ snmp_init(struct relayd *env, enum privsep_procid id)
 		env->sc_snmp = -1;
 	}
 
-	if ((env->sc_flags & F_SNMP) == 0)
+	if ((env->sc_conf.flags & F_SNMP) == 0)
 		return;
 
 	snmp_procid = id;
 
-	proc_compose_imsg(env->sc_ps, snmp_procid, -1,
-	    IMSG_SNMPSOCK, -1, NULL, 0);
+	proc_compose(env->sc_ps, snmp_procid, IMSG_SNMPSOCK, NULL, 0);
 }
 
 void
@@ -145,23 +141,21 @@ snmp_setsock(struct relayd *env, enum privsep_procid id)
 	struct sockaddr_un	 sun;
 	int			 s = -1;
 
-	if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+	if ((s = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1)
 		goto done;
 
 	bzero(&sun, sizeof(sun));
 	sun.sun_family = AF_UNIX;
-	if (strlcpy(sun.sun_path, env->sc_snmp_path,
+	if (strlcpy(sun.sun_path, env->sc_conf.snmp_path,
 	    sizeof(sun.sun_path)) >= sizeof(sun.sun_path))
 		fatalx("invalid socket path");
-
-	socket_set_blockmode(s, BM_NONBLOCK);
 
 	if (connect(s, (struct sockaddr *)&sun, sizeof(sun)) == -1) {
 		close(s);
 		s = -1;
 	}
  done:
-	proc_compose_imsg(env->sc_ps, id, -1, IMSG_SNMPSOCK, s, NULL, 0);
+	proc_compose_imsg(env->sc_ps, id, -1, IMSG_SNMPSOCK, -1, s, NULL, 0);
 }
 
 int
@@ -178,9 +172,9 @@ snmp_getsock(struct relayd *env, struct imsg *imsg)
 	log_debug("%s: got new snmp socket %d", __func__, imsg->fd);
 
 	if ((snmp_agentx = snmp_agentx_alloc(env->sc_snmp)) == NULL)
-		fatal("snmp_getsock: agentx alloc");
+		fatal("%s: agentx alloc", __func__);
 	if ((pdu = snmp_agentx_open_pdu(snmp_agentx, "relayd", NULL)) == NULL)
-		fatal("snmp_getsock: agentx pdu");
+		fatal("%s: agentx pdu", __func__);
 	(void)snmp_agentx_send(snmp_agentx, pdu);
 
 	snmp_event_add(env, EV_WRITE);
@@ -232,11 +226,12 @@ snmp_sock(int fd, short event, void *arg)
 			}
 
 			/* short read */
+			goto out;
 		}
 
 		snmp_agentx_process(snmp_agentx, pdu, env);
 	}
-
+out:
 	snmp_event_add(env, evflags);
 	return;
 
@@ -246,8 +241,7 @@ snmp_sock(int fd, short event, void *arg)
 	env->sc_snmp = -1;
 	snmp_agentx = NULL;
  reopen:
-	proc_compose_imsg(env->sc_ps, snmp_procid, -1,
-	    IMSG_SNMPSOCK, -1, NULL, 0);
+	proc_compose(env->sc_ps, snmp_procid, IMSG_SNMPSOCK, NULL, 0);
 	return;
 }
 
@@ -275,8 +269,7 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 		snmp_agentx_free(snmp_agentx);
 		env->sc_snmp = -1;
 		snmp_agentx = NULL;
-		proc_compose_imsg(env->sc_ps, snmp_procid, -1,
-		    IMSG_SNMPSOCK, -1, NULL, 0);
+		proc_compose(env->sc_ps, snmp_procid, IMSG_SNMPSOCK, NULL, 0);
 		break;
 
 	case AGENTX_GET_BULK:
@@ -290,14 +283,17 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 		/* FALLTHROUGH */
 	case AGENTX_GET:
 	case AGENTX_GET_NEXT:
-		if ((resp = snmp_agentx_response_pdu(0, AGENTX_ERR_NONE, 0)) == NULL) {
-			log_warn("%s unable to allocate response pdu", __func__);
+		if ((resp = snmp_agentx_response_pdu(0,
+		    AGENTX_ERR_NONE, 0)) == NULL) {
+			log_warn("%s unable to allocate response pdu",
+			    __func__);
 			break;
 		}
 		repetitions = 0;
  repeat:
 		while (pdu->datalen > sizeof(struct agentx_hdr)) {
-			uint32_t infoendidx, infoentryendidx, infoentryidxendidx;
+			uint32_t infoendidx, infoentryendidx,
+			    infoentryidxendidx;
 
 			erridx++;
 
@@ -313,25 +309,27 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 			else
 				infoendidx = UINT32_MAX;
 			if (sr.end.o_n >= OIDIDX_relaydInfo + 1 + 1)
-				infoentryendidx = sr.end.o_id[OIDIDX_relaydInfo + 1];
+				infoentryendidx =
+				    sr.end.o_id[OIDIDX_relaydInfo + 1];
 			else
 				infoentryendidx = UINT32_MAX;
 			if (sr.end.o_n >= OIDIDX_relaydInfo + 2 + 1)
-				infoentryidxendidx = sr.end.o_id[OIDIDX_relaydInfo + 2];
+				infoentryidxendidx =
+				    sr.end.o_id[OIDIDX_relaydInfo + 2];
 			else
 				infoentryidxendidx = UINT32_MAX;
 
 			bcopy(&sr.start, &oid, sizeof(oid));
 
 			/*
-			 * If the requested OID is not part of the registered MIB,
-			 * return "no such object", per RFC
+			 * If the requested OID is not part of the registered
+			 * MIB, return "no such object", per RFC
 			 */
 			if (snmp_oid_cmp(&relaydinfooid, &oid) == -1) {
 				if (snmp_agentx_varbind(resp, &sr.start,
 				    AGENTX_NO_SUCH_OBJECT, NULL, 0) == -1) {
-					log_warn("%s: unable to generate response",
-					    __func__);
+					log_warn("%s: unable to generate"
+					    " response", __func__);
 					snmp_agentx_pdu_free(resp);
 					resp = NULL;
 				}
@@ -339,7 +337,7 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 			}
 
 			if (oid.o_n != OIDIDX_relaydInfo + 2 + 1) {
-				/* GET requests require the exact OID to exist */
+				/* GET requests require the exact OID */
 				if (pdu->hdr->type == AGENTX_GET)
 					goto nosuchinstance;
 
@@ -369,7 +367,8 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 				if (infoendidx < 1)
 					break;
 				if (snmp_redirect(env, &oid, resp, getnext,
-				    infoentryendidx, infoentryidxendidx, sr.include) == 0)
+				    infoentryendidx, infoentryidxendidx,
+				    sr.include) == 0)
 					break;
 				if (!getnext)
 					goto nosuchinstance;
@@ -383,7 +382,8 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 				if (infoendidx < 2)
 					break;
 				if (snmp_relay(env, &oid, resp, getnext,
-				    infoentryendidx, infoentryidxendidx, sr.include) == 0)
+				    infoentryendidx, infoentryidxendidx,
+				    sr.include) == 0)
 					break;
 				if (!getnext)
 					goto nosuchinstance;
@@ -397,7 +397,8 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 				if (infoendidx < 3)
 					break;
 				if (snmp_router(env, &oid, resp, getnext,
-				    infoentryendidx, infoentryidxendidx, sr.include) == 0)
+				    infoentryendidx, infoentryidxendidx,
+				    sr.include) == 0)
 					break;
 				if (!getnext)
 					goto nosuchinstance;
@@ -411,7 +412,8 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 				if (infoendidx < 4)
 					break;
 				if (snmp_netroute(env, &oid, resp, getnext,
-				    infoentryendidx, infoentryidxendidx, sr.include) == 0)
+				    infoentryendidx, infoentryidxendidx,
+				    sr.include) == 0)
 					break;
 				if (!getnext)
 					goto nosuchinstance;
@@ -425,7 +427,8 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 				if (infoendidx < 5)
 					break;
 				if (snmp_host(env, &oid, resp, getnext,
-				    infoentryendidx, infoentryidxendidx, sr.include) == 0)
+				    infoentryendidx, infoentryidxendidx,
+				    sr.include) == 0)
 					break;
 				if (!getnext)
 					goto nosuchinstance;
@@ -439,7 +442,8 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 				if (infoendidx < 6)
 					break;
 				if (snmp_session(env, &oid, resp, getnext,
-				    infoentryendidx, infoentryidxendidx, sr.include) == 0)
+				    infoentryendidx, infoentryidxendidx,
+				    sr.include) == 0)
 					break;
 				if (!getnext)
 					goto nosuchinstance;
@@ -453,26 +457,28 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 				if (infoendidx < 7)
 					break;
 				if (snmp_table(env, &oid, resp, getnext,
-				    infoentryendidx, infoentryidxendidx, sr.include) == 0)
+				    infoentryendidx, infoentryidxendidx,
+				    sr.include) == 0)
 					break;
 				if (!getnext)
 					goto nosuchinstance;
 
 				if (snmp_agentx_varbind(resp, &oid,
 				    AGENTX_END_OF_MIB_VIEW, NULL, 0) == -1) {
-					log_warn("%s: unable to generate response",
-					    __func__);
+					log_warn("%s: unable to generate"
+					    " response", __func__);
 					snmp_agentx_pdu_free(resp);
 					resp = NULL;
 				}
 				goto reply;
 			default:
  nosuchinstance:
-				log_warnx("unknown index %i", oid.o_id[OIDIDX_relaydInfo]);
+				log_warnx("unknown index %i",
+				    oid.o_id[OIDIDX_relaydInfo]);
 				if (snmp_agentx_varbind(resp, &sr.start,
 				    AGENTX_NO_SUCH_INSTANCE, NULL, 0) == -1) {
-					log_warn("%s: unable to generate response",
-					    __func__);
+					log_warn("%s: unable to generate"
+					    " response", __func__);
 					snmp_agentx_pdu_free(resp);
 					resp = NULL;
 				}
@@ -515,7 +521,7 @@ snmp_agentx_process(struct agentx_handle *h, struct agentx_pdu *pdu, void *arg)
 			if (snmp_agentx_open_response(h, pdu) == -1)
 				break;
 			/* Open AgentX socket; register MIB if not trap-only */
-			if (!(env->sc_snmp_flags & FSNMP_TRAPONLY))
+			if (!(env->sc_conf.flags & F_SNMP_TRAPONLY))
 				if (snmp_register(env) == -1) {
 					log_warn("failed to register MIB");
 					break;
@@ -880,7 +886,8 @@ snmp_router_byidx(struct relayd *env, u_int *instanceidx, u_int *objectidx,
 				/*  Lexographical ordering */
 
 				/* 1) try the next instance index */
-				if (router->rt_conf.id == *instanceidx && !include)
+				if ((router->rt_conf.id == *instanceidx) &&
+				    !include)
 					router = TAILQ_NEXT(router, rt_entry);
 				if (router) {
 					*instanceidx = router->rt_conf.id;
@@ -1214,7 +1221,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 	u_int		 instanceidx, objectidx;
 	u_int32_t	 status, value = 0;
 	u_int64_t	 value64 = 0;
-	int		 i;
+	int		 i, nrelay = env->sc_conf.prefork_relay;
 
 	instanceidx = oid->o_id[OIDIDX_relaydInfo + 2];
 	objectidx = oid->o_id[OIDIDX_relaydInfo + 1];
@@ -1253,7 +1260,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 4:		/* count */
-		for (i = 0; i < env->sc_prefork_relay; i++)
+		for (i = 0; i < nrelay; i++)
 			value64 += rly->rl_stats[i].cnt;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_COUNTER64, &value64,
@@ -1261,7 +1268,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 5:		/* average */
-		for (i = 0; i < env->sc_prefork_relay; i++)
+		for (i = 0; i < nrelay; i++)
 			value += rly->rl_stats[i].avg;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &value,
@@ -1269,7 +1276,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 6:		/* last */
-		for (i = 0; i < env->sc_prefork_relay; i++)
+		for (i = 0; i < nrelay; i++)
 			value += rly->rl_stats[i].last;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &value,
@@ -1277,7 +1284,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 7:		/* average hour */
-		for (i = 0; i < env->sc_prefork_relay; i++)
+		for (i = 0; i < nrelay; i++)
 			value += rly->rl_stats[i].avg_hour;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &value,
@@ -1285,7 +1292,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 8:		/* last hour */
-		for (i = 0; i < env->sc_prefork_relay; i++)
+		for (i = 0; i < nrelay; i++)
 			value += rly->rl_stats[i].last_hour;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &value,
@@ -1293,7 +1300,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 9:		/* average day */
-		for (i = 0; i < env->sc_prefork_relay; i++)
+		for (i = 0; i < nrelay; i++)
 			value += rly->rl_stats[i].avg_day;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &value,
@@ -1301,7 +1308,7 @@ snmp_relay(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 10:	/* last day */
-		for (i = 0; i < env->sc_prefork_relay; i++)
+		for (i = 0; i < nrelay; i++)
 			value += rly->rl_stats[i].last_day;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &value,
@@ -1391,7 +1398,7 @@ snmp_netroute(struct relayd *env, struct snmp_oid *oid,
 {
 	struct netroute			*nr;
 	u_int32_t			 addrtype;
-	u_int		 		 instanceidx, objectidx;
+	u_int				 instanceidx, objectidx;
 
 	instanceidx = oid->o_id[OIDIDX_relaydInfo + 2];
 	objectidx = oid->o_id[OIDIDX_relaydInfo + 1];
@@ -1559,7 +1566,7 @@ snmp_session(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 	struct timeval		 tv, now;
 	time_t			 ticks;
 	struct rsession		*session;
-	u_int	 		 instanceidx, objectidx;
+	u_int			 instanceidx, objectidx;
 	u_int32_t		 status, pid, port, addrtype;
 
 	instanceidx = oid->o_id[OIDIDX_relaydInfo + 2];
@@ -1683,7 +1690,7 @@ snmp_table(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
     int getnext, uint32_t einstanceidx, uint32_t eobjectidx, u_int include)
 {
 	struct table		*table;
-	u_int	 		 instanceidx, objectidx;
+	u_int			 instanceidx, objectidx;
 	u_int32_t		 status;
 
 	instanceidx = oid->o_id[OIDIDX_relaydInfo + 2];

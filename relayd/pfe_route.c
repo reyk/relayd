@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_route.c,v 1.7 2014/12/21 00:54:49 guenther Exp $	*/
+/*	$OpenBSD: pfe_route.c,v 1.12 2017/05/28 10:39:15 benno Exp $	*/
 
 /*
  * Copyright (c) 2009 - 2011 Reyk Floeter <reyk@openbsd.org>
@@ -20,18 +20,15 @@
 #include <sys/queue.h>
 #include <sys/socket.h>
 
-#include <net/if.h>
 #include <netinet/in.h>
 #include <net/route.h>
+#include <arpa/inet.h>
 
+#include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
-#include <event.h>
 #include <string.h>
 #include <errno.h>
-
-#include <openssl/ssl.h>
 
 #include "relayd.h"
 
@@ -58,16 +55,16 @@ init_routes(struct relayd *env)
 {
 	u_int	 rtfilter;
 
-	if (!(env->sc_flags & F_NEEDRT))
+	if (!(env->sc_conf.flags & F_NEEDRT))
 		return;
 
 	if ((env->sc_rtsock = socket(AF_ROUTE, SOCK_RAW, 0)) == -1)
-		fatal("init_routes: failed to open routing socket");
+		fatal("%s: failed to open routing socket", __func__);
 
 	rtfilter = ROUTE_FILTER(0);
 	if (setsockopt(env->sc_rtsock, AF_ROUTE, ROUTE_MSGFILTER,
 	    &rtfilter, sizeof(rtfilter)) == -1)
-		fatal("init_routes: ROUTE_MSGFILTER");
+		fatal("%s: ROUTE_MSGFILTER", __func__);
 }
 
 void
@@ -75,10 +72,10 @@ sync_routes(struct relayd *env, struct router *rt)
 {
 	struct netroute		*nr;
 	struct host		*host;
-	char			 buf[MAXHOSTNAMELEN];
+	char			 buf[HOST_NAME_MAX+1];
 	struct ctl_netroute	 crt;
 
-	if (!(env->sc_flags & F_NEEDRT))
+	if (!(env->sc_conf.flags & F_NEEDRT))
 		return;
 
 	TAILQ_FOREACH(nr, &rt->rt_netroutes, nr_entry) {
@@ -100,8 +97,8 @@ sync_routes(struct relayd *env, struct router *rt)
 			memcpy(&crt.host, &host->conf, sizeof(host->conf));
 			memcpy(&crt.rt, &rt->rt_conf, sizeof(rt->rt_conf));
 
-			proc_compose_imsg(env->sc_ps, PROC_PARENT, -1,
-			    IMSG_RTMSG, -1, &crt, sizeof(crt));
+			proc_compose(env->sc_ps, PROC_PARENT,
+			    IMSG_RTMSG, &crt, sizeof(crt));
 		}
 	}
 }
@@ -199,7 +196,7 @@ pfe_route(struct relayd *env, struct ctl_netroute *crt)
 		} else if (crt->nr.prefixlen < 0)
 			rm.rm_hdr.rtm_flags |= RTF_HOST;
 	} else
-		fatal("pfe_route: invalid address family");
+		fatal("%s: invalid address family", __func__);
 
  retry:
 	if (write(env->sc_rtsock, &rm, len) == -1) {

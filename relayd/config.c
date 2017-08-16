@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.22 2014/12/21 00:54:49 guenther Exp $	*/
+/*	$OpenBSD: config.c,v 1.32 2017/05/27 08:33:25 claudio Exp $	*/
 
 /*
  * Copyright (c) 2011 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -17,30 +17,16 @@
  */
 
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/queue.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 
-#include <net/if.h>
-#include <net/pfvar.h>
-#include <netinet/in.h>
-#include <net/route.h>
-
-#include <ctype.h>
-#include <unistd.h>
-#include <err.h>
-#include <errno.h>
-#include <event.h>
-#include <limits.h>
-#include <stdint.h>
-#include <stdarg.h>
 #include <stdio.h>
-#include <netdb.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <limits.h>
 #include <string.h>
-#include <ifaddrs.h>
-
-#include <openssl/ssl.h>
+#include <imsg.h>
 
 #include "relayd.h"
 
@@ -52,20 +38,20 @@ config_init(struct relayd *env)
 
 	/* Global configuration */
 	if (privsep_process == PROC_PARENT) {
-		env->sc_timeout.tv_sec = CHECK_TIMEOUT / 1000;
-		env->sc_timeout.tv_usec = (CHECK_TIMEOUT % 1000) * 1000;
-		env->sc_interval.tv_sec = CHECK_INTERVAL;
-		env->sc_interval.tv_usec = 0;
-		env->sc_prefork_relay = RELAY_NUMPROC;
-		env->sc_statinterval.tv_sec = RELAY_STATINTERVAL;
-
-		ps->ps_what[PROC_PARENT] = CONFIG_ALL;
-		ps->ps_what[PROC_PFE] = CONFIG_ALL & ~CONFIG_PROTOS;
-		ps->ps_what[PROC_HCE] = CONFIG_TABLES;
-		ps->ps_what[PROC_CA] = CONFIG_RELAYS;
-		ps->ps_what[PROC_RELAY] = CONFIG_RELAYS|
-		    CONFIG_TABLES|CONFIG_PROTOS|CONFIG_CA_ENGINE;
+		env->sc_conf.timeout.tv_sec = CHECK_TIMEOUT / 1000;
+		env->sc_conf.timeout.tv_usec = (CHECK_TIMEOUT % 1000) * 1000;
+		env->sc_conf.interval.tv_sec = CHECK_INTERVAL;
+		env->sc_conf.interval.tv_usec = 0;
+		env->sc_conf.prefork_relay = RELAY_NUMPROC;
+		env->sc_conf.statinterval.tv_sec = RELAY_STATINTERVAL;
 	}
+
+	ps->ps_what[PROC_PARENT] = CONFIG_ALL;
+	ps->ps_what[PROC_PFE] = CONFIG_ALL & ~CONFIG_PROTOS;
+	ps->ps_what[PROC_HCE] = CONFIG_TABLES;
+	ps->ps_what[PROC_CA] = CONFIG_RELAYS;
+	ps->ps_what[PROC_RELAY] = CONFIG_RELAYS|
+	    CONFIG_TABLES|CONFIG_PROTOS|CONFIG_CA_ENGINE;
 
 	/* Other configuration */
 	what = ps->ps_what[privsep_process];
@@ -108,15 +94,18 @@ config_init(struct relayd *env)
 		bzero(&env->sc_proto_default, sizeof(env->sc_proto_default));
 		env->sc_proto_default.id = EMPTY_ID;
 		env->sc_proto_default.flags = F_USED;
-		env->sc_proto_default.cache = RELAY_CACHESIZE;
 		env->sc_proto_default.tcpflags = TCPFLAG_DEFAULT;
 		env->sc_proto_default.tcpbacklog = RELAY_BACKLOG;
 		env->sc_proto_default.tlsflags = TLSFLAG_DEFAULT;
 		(void)strlcpy(env->sc_proto_default.tlsciphers,
 		    TLSCIPHERS_DEFAULT,
 		    sizeof(env->sc_proto_default.tlsciphers));
-		env->sc_proto_default.tlsecdhcurve = TLSECDHCURVE_DEFAULT;
-		env->sc_proto_default.tlsdhparams = TLSDHPARAMS_DEFAULT;
+		(void)strlcpy(env->sc_proto_default.tlsecdhcurve,
+		    TLSECDHCURVE_DEFAULT,
+		    sizeof(env->sc_proto_default.tlsecdhcurve));
+		(void)strlcpy(env->sc_proto_default.tlsdhparams,
+		    TLSDHPARAM_DEFAULT,
+		    sizeof(env->sc_proto_default.tlsdhparams));
 		env->sc_proto_default.type = RELAY_PROTO_TCP;
 		(void)strlcpy(env->sc_proto_default.name, "default",
 		    sizeof(env->sc_proto_default.name));
@@ -156,7 +145,7 @@ config_purge(struct relayd *env, u_int reset)
 
 	if (what & CONFIG_TABLES && env->sc_tables != NULL) {
 		while ((table = TAILQ_FIRST(env->sc_tables)) != NULL)
-			purge_table(env->sc_tables, table);
+			purge_table(env, env->sc_tables, table);
 		env->sc_tablecount = 0;
 	}
 	if (what & CONFIG_RDRS && env->sc_rdrs != NULL) {
@@ -192,10 +181,8 @@ config_purge(struct relayd *env, u_int reset)
 	if (what & CONFIG_PROTOS && env->sc_protos != NULL) {
 		while ((proto = TAILQ_FIRST(env->sc_protos)) != NULL) {
 			TAILQ_REMOVE(env->sc_protos, proto, entry);
-			if (proto->style != NULL)
-				free(proto->style);
-			if (proto->tlscapass != NULL)
-				free(proto->tlscapass);
+			free(proto->style);
+			free(proto->tlscapass);
 			free(proto);
 		}
 		env->sc_protocount = 0;
@@ -234,8 +221,7 @@ config_setreset(struct relayd *env, u_int reset)
 		if ((reset & ps->ps_what[id]) == 0 ||
 		    id == privsep_process)
 			continue;
-		proc_compose_imsg(ps, id, -1, IMSG_CTL_RESET, -1,
-		    &reset, sizeof(reset));
+		proc_compose(ps, id, IMSG_CTL_RESET, &reset, sizeof(reset));
 	}
 
 	return (0);
@@ -260,16 +246,13 @@ config_getcfg(struct relayd *env, struct imsg *imsg)
 	struct privsep		*ps = env->sc_ps;
 	struct table		*tb;
 	struct host		*h, *ph;
-	struct ctl_flags	 cf;
 	u_int			 what;
 
-	if (IMSG_DATA_SIZE(imsg) != sizeof(cf))
+	if (IMSG_DATA_SIZE(imsg) != sizeof(struct relayd_config))
 		return (0); /* ignore */
 
 	/* Update runtime flags */
-	memcpy(&cf, imsg->data, sizeof(cf));
-	env->sc_opts = cf.cf_opts;
-	env->sc_flags = cf.cf_flags;
+	memcpy(&env->sc_conf, imsg->data, sizeof(env->sc_conf));
 
 	what = ps->ps_what[privsep_process];
 
@@ -286,15 +269,16 @@ config_getcfg(struct relayd *env, struct imsg *imsg)
 		}
 	}
 
-	if (env->sc_flags & (F_TLS|F_TLSCLIENT)) {
+	if (env->sc_conf.flags & (F_TLS|F_TLSCLIENT)) {
 		ssl_init(env);
 		if (what & CONFIG_CA_ENGINE)
 			ca_engine_init(env);
+		if (tls_init() == -1)
+			fatalx("unable to initialize TLS");
 	}
 
 	if (privsep_process != PROC_PARENT)
-		proc_compose_imsg(env->sc_ps, PROC_PARENT, -1,
-		    IMSG_CFG_DONE, -1, NULL, 0);
+		proc_compose(env->sc_ps, PROC_PARENT, IMSG_CFG_DONE, NULL, 0);
 
 	return (0);
 }
@@ -327,10 +311,10 @@ config_settable(struct relayd *env, struct table *tb)
 			iov[c++].iov_len = strlen(tb->sendbuf);
 		}
 
-		proc_composev_imsg(ps, id, -1, IMSG_CFG_TABLE, -1, iov, c);
+		proc_composev(ps, id, IMSG_CFG_TABLE, iov, c);
 
 		TAILQ_FOREACH(host, &tb->hosts, entry) {
-			proc_compose_imsg(ps, id, -1, IMSG_CFG_HOST, -1,
+			proc_compose(ps, id, IMSG_CFG_HOST,
 			    &host->conf, sizeof(host->conf));
 		}
 	}
@@ -429,12 +413,12 @@ config_setrdr(struct relayd *env, struct rdr *rdr)
 		DPRINTF("%s: sending rdr %s to %s", __func__,
 		    rdr->conf.name, ps->ps_title[id]);
 
-		proc_compose_imsg(ps, id, -1, IMSG_CFG_RDR, -1,
+		proc_compose(ps, id, IMSG_CFG_RDR,
 		    &rdr->conf, sizeof(rdr->conf));
 
 		TAILQ_FOREACH(virt, &rdr->virts, entry) {
 			virt->rdrid = rdr->conf.id;
-			proc_compose_imsg(ps, id, -1, IMSG_CFG_VIRT, -1,
+			proc_compose(ps, id, IMSG_CFG_VIRT,
 			    virt, sizeof(*virt));
 		}
 	}
@@ -517,11 +501,11 @@ config_setrt(struct relayd *env, struct router *rt)
 		DPRINTF("%s: sending router %s to %s tbl %d", __func__,
 		    rt->rt_conf.name, ps->ps_title[id], rt->rt_conf.gwtable);
 
-		proc_compose_imsg(ps, id, -1, IMSG_CFG_ROUTER, -1,
+		proc_compose(ps, id, IMSG_CFG_ROUTER,
 		    &rt->rt_conf, sizeof(rt->rt_conf));
 
 		TAILQ_FOREACH(nr, &rt->rt_netroutes, nr_entry) {
-			proc_compose_imsg(ps, id, -1, IMSG_CFG_ROUTE, -1,
+			proc_compose(ps, id, IMSG_CFG_ROUTE,
 			    &nr->nr_conf, sizeof(nr->nr_conf));
 		}
 	}
@@ -622,7 +606,7 @@ config_setproto(struct relayd *env, struct protocol *proto)
 			iov[c++].iov_len = strlen(proto->style);
 		}
 
-		proc_composev_imsg(ps, id, -1, IMSG_CFG_PROTO, -1, iov, c);
+		proc_composev(ps, id, IMSG_CFG_PROTO, iov, c);
 	}
 
 	return (0);
@@ -673,8 +657,7 @@ config_setrule(struct relayd *env, struct protocol *proto)
 					rule->rule_ctl.kvlen[i].value = -1;
 			}
 
-			proc_composev_imsg(ps, id, -1,
-			    IMSG_CFG_RULE, -1, iov, c);
+			proc_composev(ps, id, IMSG_CFG_RULE, iov, c);
 		}
 	}
 
@@ -850,12 +833,30 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 			for (n = 0; n < m; n++) {
 				if ((fd = dup(rlay->rl_s)) == -1)
 					return (-1);
-				proc_composev_imsg(ps, id, n,
-				    IMSG_CFG_RELAY, fd, iov, c);
+				if (proc_composev_imsg(ps, id, n,
+				    IMSG_CFG_RELAY, -1, fd, iov, c) != 0) {
+					log_warn("%s: failed to compose "
+					    "IMSG_CFG_RELAY imsg for `%s'",
+					    __func__, rlay->rl_conf.name);
+					return (-1);
+				}
+
+				/* Prevent fd exhaustion in the parent. */
+				if (proc_flush_imsg(ps, id, n) == -1) {
+					log_warn("%s: failed to flush "
+					    "IMSG_CFG_RELAY imsg for `%s'",
+					    __func__, rlay->rl_conf.name);
+					return (-1);
+				}
 			}
 		} else {
-			proc_composev_imsg(ps, id, -1, IMSG_CFG_RELAY, -1,
-			    iov, c);
+			if (proc_composev(ps, id,
+			    IMSG_CFG_RELAY, iov, c) != 0) {
+				log_warn("%s: failed to compose "
+				    "IMSG_CFG_RELAY imsg for `%s'",
+				    __func__, rlay->rl_conf.name);
+				return (-1);
+			}
 		}
 
 		if ((what & CONFIG_TABLES) == 0)
@@ -872,13 +873,15 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 			iov[c].iov_base = &crt;
 			iov[c++].iov_len = sizeof(crt);
 
-			proc_composev_imsg(ps, id, -1,
-			    IMSG_CFG_RELAY_TABLE, -1, iov, c);
+			proc_composev(ps, id, IMSG_CFG_RELAY_TABLE, iov, c);
 		}
 	}
 
-	close(rlay->rl_s);
-	rlay->rl_s = -1;
+	/* Close server socket early to prevent fd exhaustion in the parent. */
+	if (rlay->rl_s != -1) {
+		close(rlay->rl_s);
+		rlay->rl_s = -1;
+	}
 
 	return (0);
 }
@@ -963,12 +966,9 @@ config_getrelay(struct relayd *env, struct imsg *imsg)
 	return (0);
 
  fail:
-	if (rlay->rl_tls_cert)
-		free(rlay->rl_tls_cert);
-	if (rlay->rl_tls_key)
-		free(rlay->rl_tls_key);
-	if (rlay->rl_tls_ca)
-		free(rlay->rl_tls_ca);
+	free(rlay->rl_tls_cert);
+	free(rlay->rl_tls_key);
+	free(rlay->rl_tls_ca);
 	close(rlay->rl_s);
 	free(rlay);
 	return (-1);
@@ -1012,7 +1012,6 @@ config_getrelaytable(struct relayd *env, struct imsg *imsg)
 	return (0);
 
  fail:
-	if (rlt != NULL)
-		free(rlt);
+	free(rlt);
 	return (-1);
 }

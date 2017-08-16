@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_icmp.c,v 1.38 2014/12/21 00:54:49 guenther Exp $	*/
+/*	$OpenBSD: check_icmp.c,v 1.47 2017/07/12 22:57:40 jca Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -16,26 +16,23 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 
-#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/icmp6.h>
+#include <arpa/inet.h>
 
-#include <limits.h>
 #include <event.h>
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
-
-#include <openssl/ssl.h>
 
 #include "relayd.h"
 
@@ -51,13 +48,15 @@ int	in_cksum(u_short *, int);
 void
 icmp_setup(struct relayd *env, struct ctl_icmp_event *cie, int af)
 {
-	int proto = IPPROTO_ICMP;
+	int proto = IPPROTO_ICMP, val;
 
 	if (af == AF_INET6)
 		proto = IPPROTO_ICMPV6;
-	if ((cie->s = socket(af, SOCK_RAW, proto)) < 0)
-		fatal("icmp_setup: socket");
-	socket_set_blockmode(cie->s, BM_NONBLOCK);
+	if ((cie->s = socket(af, SOCK_RAW | SOCK_NONBLOCK, proto)) < 0)
+		fatal("%s: socket", __func__);
+	val = ICMP_RCVBUF_SIZE;
+	if (setsockopt(cie->s, SOL_SOCKET, SO_RCVBUF, &val, sizeof(val)) == -1)
+		fatal("%s: setsockopt", __func__);
 	cie->env = env;
 	cie->af = af;
 }
@@ -92,7 +91,7 @@ check_icmp_add(struct ctl_icmp_event *cie, int flags, struct timeval *start,
 
 	if (start != NULL)
 		bcopy(start, &cie->tv_start, sizeof(cie->tv_start));
-	bcopy(&cie->env->sc_timeout, &tv, sizeof(tv));
+	bcopy(&cie->env->sc_conf.timeout, &tv, sizeof(tv));
 	getmonotime(&cie->tv_start);
 	event_del(&cie->ev);
 	event_set(&cie->ev, cie->s, EV_TIMEOUT|flags, fn, cie);
@@ -166,9 +165,8 @@ send_icmp(int s, short event, void *arg)
 	struct icmp6_hdr	*icp6;
 	ssize_t			 r;
 	u_char			 packet[ICMP_BUF_SIZE];
-	socklen_t		 slen;
-	int			 i = 0, ttl, mib[4];
-	size_t			 len;
+	socklen_t		 slen, len;
+	int			 i = 0, ttl;
 	u_int32_t		 id;
 
 	if (event == EV_TIMEOUT) {
@@ -222,19 +220,46 @@ send_icmp(int s, short event, void *arg)
 				    sizeof(packet));
 			}
 
-			if ((ttl = host->conf.ttl) > 0)
-				(void)setsockopt(s, IPPROTO_IP, IP_TTL,
-				    &host->conf.ttl, sizeof(int));
-			else {
-				/* Revert to default TTL */
-				mib[0] = CTL_NET;
-				mib[1] = cie->af;
-				mib[2] = IPPROTO_IP;
-				mib[3] = IPCTL_DEFTTL;
-				len = sizeof(ttl);
-				if (sysctl(mib, 4, &ttl, &len, NULL, 0) == 0)
-					(void)setsockopt(s, IPPROTO_IP, IP_TTL,
-					    &ttl, sizeof(int));
+			ttl = host->conf.ttl;
+			switch(cie->af) {
+			case AF_INET:
+				if (ttl > 0) {
+					if (setsockopt(s, IPPROTO_IP, IP_TTL,
+					    &ttl, sizeof(ttl)) == -1)
+						log_warn("%s: setsockopt",
+						    __func__);
+				} else {
+					/* Revert to default TTL */
+					len = sizeof(ttl);
+					if (getsockopt(s, IPPROTO_IP,
+					    IP_IPDEFTTL, &ttl, &len) == 0) {
+						if (setsockopt(s, IPPROTO_IP,
+						    IP_TTL, &ttl, len) == -1)
+							log_warn(
+							    "%s: setsockopt",
+							    __func__);
+					} else
+						log_warn("%s: getsockopt",
+						    __func__);
+				}
+				break;
+			case AF_INET6:
+				if (ttl > 0) {
+					if (setsockopt(s, IPPROTO_IPV6,
+					    IPV6_UNICAST_HOPS, &ttl,
+					    sizeof(ttl)) == -1)
+						log_warn("%s: setsockopt",
+						    __func__);
+				} else {
+					/* Revert to default hop limit */
+					ttl = -1;
+					if (setsockopt(s, IPPROTO_IPV6,
+					    IPV6_UNICAST_HOPS, &ttl,
+					    sizeof(ttl)) == -1)
+						log_warn("%s: setsockopt",
+						    __func__);
+				}
+				break;
 			}
 
 			r = sendto(s, packet, sizeof(packet), 0, to, slen);
@@ -253,7 +278,7 @@ send_icmp(int s, short event, void *arg)
 
  retry:
 	event_again(&cie->ev, s, EV_TIMEOUT|EV_WRITE, send_icmp,
-	    &cie->tv_start, &cie->env->sc_timeout, cie);
+	    &cie->tv_start, &cie->env->sc_conf.timeout, cie);
 }
 
 void
@@ -318,7 +343,7 @@ recv_icmp(int s, short event, void *arg)
 
  retry:
 	event_again(&cie->ev, s, EV_TIMEOUT|EV_READ, recv_icmp,
-	    &cie->tv_start, &cie->env->sc_timeout, cie);
+	    &cie->tv_start, &cie->env->sc_conf.timeout, cie);
 }
 
 /* in_cksum from ping.c --

@@ -1,4 +1,4 @@
-/*	$OpenBSD: carp.c,v 1.9 2012/11/27 05:00:28 guenther Exp $ */
+/*	$OpenBSD: carp.c,v 1.12 2016/08/18 00:45:52 jsg Exp $ */
 
 /*
  * Copyright (c) 2006 Henning Brauer <henning@openbsd.org>
@@ -16,8 +16,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/param.h>
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/queue.h>
 #include <sys/ioctl.h>
 
 #include <net/if.h>
@@ -26,9 +27,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <event.h>
-
-#include <openssl/ssl.h>
 
 #include "relayd.h"
 
@@ -119,6 +117,7 @@ carp_demote_get(char *group)
 	if (strlcpy(ifgr.ifgr_name, group, sizeof(ifgr.ifgr_name)) >=
 	    sizeof(ifgr.ifgr_name)) {
 		log_warn("%s: invalid group", __func__);
+		close(s);
 		return (-1);
 	}
 
@@ -203,6 +202,7 @@ carp_demote_ioctl(char *group, int demote)
 	if (strlcpy(ifgr.ifgr_name, group, sizeof(ifgr.ifgr_name)) >=
 	    sizeof(ifgr.ifgr_name)) {
 		log_warn("%s: invalid group", __func__);
+		close(s);
 		return (-1);
 	}
 	ifgr.ifgr_attrib.ifg_carp_demoted = demote;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: log.c,v 1.26 2014/12/21 00:54:49 guenther Exp $	*/
+/*	$OpenBSD: log.c,v 1.35 2017/03/21 12:06:56 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -11,60 +11,76 @@
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
  * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
- * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
- * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/types.h>
-#include <sys/queue.h>
-#include <sys/socket.h>
-#include <sys/tree.h>
-
-#include <net/if.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-
-#include <errno.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <syslog.h>
-#include <event.h>
-#include <netdb.h>
-#include <ctype.h>
+#include <errno.h>
+#include <time.h>
 
-#include <openssl/ssl.h>
+static int	 debug;
+static int	 verbose;
+const char	*log_procname;
 
-#include "relayd.h"
-
-int	 debug;
-int	 verbose;
-
-void	 vlog(int, const char *, va_list)
-	    __attribute__((__format__ (printf, 2, 0)));
-void	 logit(int, const char *, ...)
+void	log_init(int, int);
+void	log_procinit(const char *);
+void	log_setverbose(int);
+int	log_getverbose(void);
+void	log_warn(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	log_warnx(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	log_info(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	log_debug(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+void	logit(int, const char *, ...)
 	    __attribute__((__format__ (printf, 2, 3)));
+void	vlog(int, const char *, va_list)
+	    __attribute__((__format__ (printf, 2, 0)));
+__dead void fatal(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
+__dead void fatalx(const char *, ...)
+	    __attribute__((__format__ (printf, 1, 2)));
 
 void
-log_init(int n_debug)
+log_init(int n_debug, int facility)
 {
 	extern char	*__progname;
 
 	debug = n_debug;
 	verbose = n_debug;
+	log_procinit(__progname);
 
 	if (!debug)
-		openlog(__progname, LOG_PID | LOG_NDELAY, LOG_DAEMON);
+		openlog(__progname, LOG_PID | LOG_NDELAY, facility);
 
 	tzset();
 }
 
 void
-log_verbose(int v)
+log_procinit(const char *procname)
+{
+	if (procname != NULL)
+		log_procname = procname;
+}
+
+void
+log_setverbose(int v)
 {
 	verbose = v;
+}
+
+int
+log_getverbose(void)
+{
+	return (verbose);
 }
 
 void
@@ -81,6 +97,7 @@ void
 vlog(int pri, const char *fmt, va_list ap)
 {
 	char	*nfmt;
+	int	 saved_errno = errno;
 
 	if (debug) {
 		/* best effort in out of mem situations */
@@ -94,31 +111,36 @@ vlog(int pri, const char *fmt, va_list ap)
 		fflush(stderr);
 	} else
 		vsyslog(pri, fmt, ap);
-}
 
+	errno = saved_errno;
+}
 
 void
 log_warn(const char *emsg, ...)
 {
-	char	*nfmt;
-	va_list	 ap;
+	char		*nfmt;
+	va_list		 ap;
+	int		 saved_errno = errno;
 
 	/* best effort to even work in out of memory situations */
 	if (emsg == NULL)
-		logit(LOG_CRIT, "%s", strerror(errno));
+		logit(LOG_ERR, "%s", strerror(saved_errno));
 	else {
 		va_start(ap, emsg);
 
-		if (asprintf(&nfmt, "%s: %s", emsg, strerror(errno)) == -1) {
+		if (asprintf(&nfmt, "%s: %s", emsg,
+		    strerror(saved_errno)) == -1) {
 			/* we tried it... */
-			vlog(LOG_CRIT, emsg, ap);
-			logit(LOG_CRIT, "%s", strerror(errno));
+			vlog(LOG_ERR, emsg, ap);
+			logit(LOG_ERR, "%s", strerror(saved_errno));
 		} else {
-			vlog(LOG_CRIT, nfmt, ap);
+			vlog(LOG_ERR, nfmt, ap);
 			free(nfmt);
 		}
 		va_end(ap);
 	}
+
+	errno = saved_errno;
 }
 
 void
@@ -127,7 +149,7 @@ log_warnx(const char *emsg, ...)
 	va_list	 ap;
 
 	va_start(ap, emsg);
-	vlog(LOG_CRIT, emsg, ap);
+	vlog(LOG_ERR, emsg, ap);
 	va_end(ap);
 }
 
@@ -153,258 +175,44 @@ log_debug(const char *emsg, ...)
 	}
 }
 
-void
-fatal(const char *emsg)
+static void
+vfatalc(int code, const char *emsg, va_list ap)
 {
-	if (emsg == NULL)
-		logit(LOG_CRIT, "fatal: %s", strerror(errno));
-	else
-		if (errno)
-			logit(LOG_CRIT, "fatal: %s: %s",
-			    emsg, strerror(errno));
-		else
-			logit(LOG_CRIT, "fatal: %s", emsg);
+	static char	s[BUFSIZ];
+	const char	*sep;
 
+	if (emsg != NULL) {
+		(void)vsnprintf(s, sizeof(s), emsg, ap);
+		sep = ": ";
+	} else {
+		s[0] = '\0';
+		sep = "";
+	}
+	if (code)
+		logit(LOG_CRIT, "%s: %s%s%s",
+		    log_procname, s, sep, strerror(code));
+	else
+		logit(LOG_CRIT, "%s%s%s", log_procname, sep, s);
+}
+
+void
+fatal(const char *emsg, ...)
+{
+	va_list	ap;
+
+	va_start(ap, emsg);
+	vfatalc(errno, emsg, ap);
+	va_end(ap);
 	exit(1);
 }
 
 void
-fatalx(const char *emsg)
+fatalx(const char *emsg, ...)
 {
-	errno = 0;
-	fatal(emsg);
-}
+	va_list	ap;
 
-const char *
-host_error(enum host_error he)
-{
-	switch (he) {
-	case HCE_NONE:
-		return ("none");
-		break;
-	case HCE_ABORT:
-		return ("aborted");
-		break;
-	case HCE_INTERVAL_TIMEOUT:
-		return ("interval timeout");
-		break;
-	case HCE_ICMP_OK:
-		return ("icmp ok");
-		break;
-	case HCE_ICMP_READ_TIMEOUT:
-		return ("icmp read timeout");
-		break;
-	case HCE_ICMP_WRITE_TIMEOUT:
-		return ("icmp write timeout");
-		break;
-	case HCE_TCP_SOCKET_ERROR:
-		return ("tcp socket error");
-		break;
-	case HCE_TCP_SOCKET_LIMIT:
-		return ("tcp socket limit");
-		break;
-	case HCE_TCP_SOCKET_OPTION:
-		return ("tcp socket option");
-		break;
-	case HCE_TCP_CONNECT_FAIL:
-		return ("tcp connect failed");
-		break;
-	case HCE_TCP_CONNECT_TIMEOUT:
-		return ("tcp connect timeout");
-		break;
-	case HCE_TCP_CONNECT_OK:
-		return ("tcp connect ok");
-		break;
-	case HCE_TCP_WRITE_TIMEOUT:
-		return ("tcp write timeout");
-		break;
-	case HCE_TCP_WRITE_FAIL:
-		return ("tcp write failed");
-		break;
-	case HCE_TCP_READ_TIMEOUT:
-		return ("tcp read timeout");
-		break;
-	case HCE_TCP_READ_FAIL:
-		return ("tcp read failed");
-		break;
-	case HCE_SCRIPT_OK:
-		return ("script ok");
-		break;
-	case HCE_SCRIPT_FAIL:
-		return ("script failed");
-		break;
-	case HCE_TLS_CONNECT_OK:
-		return ("tls connect ok");
-		break;
-	case HCE_TLS_CONNECT_FAIL:
-		return ("tls connect failed");
-		break;
-	case HCE_TLS_CONNECT_TIMEOUT:
-		return ("tls connect timeout");
-		break;
-	case HCE_TLS_CONNECT_ERROR:
-		return ("tls connect error");
-		break;
-	case HCE_TLS_READ_TIMEOUT:
-		return ("tls read timeout");
-		break;
-	case HCE_TLS_WRITE_TIMEOUT:
-		return ("tls write timeout");
-		break;
-	case HCE_TLS_READ_ERROR:
-		return ("tls read error");
-		break;
-	case HCE_TLS_WRITE_ERROR:
-		return ("tls write error");
-		break;
-	case HCE_SEND_EXPECT_FAIL:
-		return ("send/expect failed");
-		break;
-	case HCE_SEND_EXPECT_OK:
-		return ("send/expect ok");
-		break;
-	case HCE_HTTP_CODE_ERROR:
-		return ("http code malformed");
-		break;
-	case HCE_HTTP_CODE_FAIL:
-		return ("http code mismatch");
-		break;
-	case HCE_HTTP_CODE_OK:
-		return ("http code ok");
-		break;
-	case HCE_HTTP_DIGEST_ERROR:
-		return ("http digest malformed");
-		break;
-	case HCE_HTTP_DIGEST_FAIL:
-		return ("http digest mismatch");
-		break;
-	case HCE_HTTP_DIGEST_OK:
-		return ("http digest ok");
-		break;
-	}
-	/* NOTREACHED */
-	return ("invalid");
-}
-
-const char *
-host_status(enum host_status status)
-{
-	switch (status) {
-	case HOST_DOWN:
-		return ("down");
-	case HOST_UNKNOWN:
-		return ("unknown");
-	case HOST_UP:
-		return ("up");
-	};
-	/* NOTREACHED */
-	return ("invalid");
-}
-
-const char *
-table_check(enum table_check check)
-{
-	switch (check) {
-	case CHECK_NOCHECK:
-		return ("none");
-	case CHECK_ICMP:
-		return ("icmp");
-	case CHECK_TCP:
-		return ("tcp");
-	case CHECK_HTTP_CODE:
-		return ("http code");
-	case CHECK_HTTP_DIGEST:
-		return ("http digest");
-	case CHECK_SEND_EXPECT:
-		return ("send expect");
-	case CHECK_SCRIPT:
-		return ("script");
-	};
-	/* NOTREACHED */
-	return ("invalid");
-}
-
-const char *
-print_availability(u_long cnt, u_long up)
-{
-	static char buf[BUFSIZ];
-
-	if (cnt == 0)
-		return ("");
-	bzero(buf, sizeof(buf));
-	snprintf(buf, sizeof(buf), "%.2f%%", (double)up / cnt * 100);
-	return (buf);
-}
-
-const char *
-print_host(struct sockaddr_storage *ss, char *buf, size_t len)
-{
-	if (getnameinfo((struct sockaddr *)ss, ss->ss_len,
-	    buf, len, NULL, 0, NI_NUMERICHOST) != 0) {
-		buf[0] = '\0';
-		return (NULL);
-	}
-	return (buf);
-}
-
-const char *
-print_time(struct timeval *a, struct timeval *b, char *buf, size_t len)
-{
-	struct timeval		tv;
-	u_long			h, sec, min;
-
-	timerclear(&tv);
-	timersub(a, b, &tv);
-	sec = tv.tv_sec % 60;
-	min = tv.tv_sec / 60 % 60;
-	h = tv.tv_sec / 60 / 60;
-
-	snprintf(buf, len, "%.2lu:%.2lu:%.2lu", h, min, sec);
-	return (buf);
-}
-
-const char *
-printb_flags(const u_int32_t v, const char *bits)
-{
-	static char	 buf[2][BUFSIZ];
-	static int	 idx = 0;
-	int		 i, any = 0;
-	char		 c, *p, *r;
-
-	p = r = buf[++idx % 2];
-	bzero(p, BUFSIZ);
-
-	if (bits) {
-		bits++;
-		while ((i = *bits++)) {
-			if (v & (1 << (i - 1))) {
-				if (any) {
-					*p++ = ',';
-					*p++ = ' ';
-				}
-				any = 1;
-				for (; (c = *bits) > 32; bits++) {
-					if (c == '_')
-						*p++ = ' ';
-					else
-						*p++ = tolower((u_char)c);
-				}
-			} else
-				for (; *bits > 32; bits++)
-					;
-		}
-	}
-
-	return (r);
-}
-
-void
-getmonotime(struct timeval *tv)
-{
-	struct timespec	 ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts))
-		fatal("clock_gettime");
-
-	TIMESPEC_TO_TIMEVAL(tv, &ts);
+	va_start(ap, emsg);
+	vfatalc(0, emsg, ap);
+	va_end(ap);
+	exit(1);
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_script.c,v 1.16 2014/06/25 11:05:15 reyk Exp $	*/
+/*	$OpenBSD: check_script.c,v 1.21 2017/05/28 10:39:15 benno Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -16,24 +16,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/param.h>
-#include <sys/queue.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 
-#include <net/if.h>
-
-#include <limits.h>
-#include <event.h>
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <pwd.h>
-#include <err.h>
-
-#include <openssl/ssl.h>
 
 #include "relayd.h"
 
@@ -48,7 +39,7 @@ check_script(struct relayd *env, struct host *host)
 	struct table		*table;
 
 	if ((table = table_find(env, host->conf.tableid)) == NULL)
-		fatalx("check_script: invalid table id");
+		fatalx("%s: invalid table id", __func__);
 
 	host->last_up = host->up;
 	host->flags &= ~(F_CHECK_SENT|F_CHECK_DONE);
@@ -61,8 +52,7 @@ check_script(struct relayd *env, struct host *host)
 		fatalx("invalid script path");
 	memcpy(&scr.timeout, &table->conf.timeout, sizeof(scr.timeout));
 
-	proc_compose_imsg(env->sc_ps, PROC_PARENT, 0, IMSG_SCRIPT,
-	    -1, &scr, sizeof(scr));
+	proc_compose(env->sc_ps, PROC_PARENT, IMSG_SCRIPT, &scr, sizeof(scr));
 }
 
 void
@@ -71,7 +61,7 @@ script_done(struct relayd *env, struct ctl_script *scr)
 	struct host		*host;
 
 	if ((host = host_find(env, scr->host)) == NULL)
-		fatalx("hce_dispatch_parent: invalid host id");
+		fatalx("%s: invalid host id", __func__);
 
 	if (scr->retval < 0)
 		host->up = HOST_UNKNOWN;
@@ -105,7 +95,7 @@ script_exec(struct relayd *env, struct ctl_script *scr)
 	const char		*file, *arg;
 	struct passwd		*pw;
 
-	if ((env->sc_flags & F_SCRIPT) == 0) {
+	if ((env->sc_conf.flags & F_SCRIPT) == 0) {
 		log_warnx("%s: script disabled", __func__);
 		return (-1);
 	}
@@ -131,13 +121,13 @@ script_exec(struct relayd *env, struct ctl_script *scr)
 		signal(SIGCHLD, SIG_DFL);
 
 		if ((pw = getpwnam(RELAYD_USER)) == NULL)
-			fatal("script_exec: getpwnam");
+			fatal("%s: getpwnam", __func__);
 		if (chdir("/") == -1)
-			fatal("script_exec: chdir(\"/\")");
+			fatal("%s: chdir(\"/\")", __func__);
 		if (setgroups(1, &pw->pw_gid) ||
 		    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
 		    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
-			fatal("script_exec: can't drop privileges");
+			fatal("%s: can't drop privileges", __func__);
 
 		/*
 		 * close fds before executing an external program, to

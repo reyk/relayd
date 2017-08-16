@@ -1,7 +1,7 @@
-/*	$OpenBSD: http.h,v 1.5 2014/08/14 10:30:52 reyk Exp $	*/
+/*	$OpenBSD: http.h,v 1.9 2016/08/01 21:14:45 benno Exp $	*/
 
 /*
- * Copyright (c) 2012 - 2014 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2012 - 2015 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,8 +16,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef _HTTP_H
-#define _HTTP_H
+#ifndef HTTP_H
+#define HTTP_H
 
 #define HTTP_PORT	80
 #define HTTPS_PORT	443
@@ -43,6 +43,32 @@ enum httpmethod {
 	HTTP_METHOD_MOVE,
 	HTTP_METHOD_LOCK,
 	HTTP_METHOD_UNLOCK,
+
+	/* WebDAV Versioning Extension, RFC 3253 */
+	HTTP_METHOD_VERSION_CONTROL,
+	HTTP_METHOD_REPORT,
+	HTTP_METHOD_CHECKOUT,
+	HTTP_METHOD_CHECKIN,
+	HTTP_METHOD_UNCHECKOUT,
+	HTTP_METHOD_MKWORKSPACE,
+	HTTP_METHOD_UPDATE,
+	HTTP_METHOD_LABEL,
+	HTTP_METHOD_MERGE,
+	HTTP_METHOD_BASELINE_CONTROL,
+	HTTP_METHOD_MKACTIVITY,
+
+	/* WebDAV Ordered Collections, RFC 3648 */
+	HTTP_METHOD_ORDERPATCH,
+
+	/* WebDAV Access Control, RFC 3744 */
+	HTTP_METHOD_ACL,
+
+	/* WebDAV Redirect Reference Resources, RFC 4437 */
+	HTTP_METHOD_MKREDIRECTREF,
+	HTTP_METHOD_UPDATEREDIRECTREF,
+
+	/* WebDAV Search, RFC 5323 */
+	HTTP_METHOD_SEARCH,
 
 	/* PATCH, RFC 5789 */
 	HTTP_METHOD_PATCH,
@@ -71,6 +97,22 @@ struct http_method {
 	{ HTTP_METHOD_MOVE,		"MOVE" },	\
 	{ HTTP_METHOD_LOCK,		"LOCK" },	\
 	{ HTTP_METHOD_UNLOCK,		"UNLOCK" },	\
+	{ HTTP_METHOD_VERSION_CONTROL,	"VERSION-CONTROL" }, \
+	{ HTTP_METHOD_REPORT,		"REPORT" },	\
+	{ HTTP_METHOD_CHECKOUT,		"CHECKOUT" },	\
+	{ HTTP_METHOD_CHECKIN,		"CHECKIN" },	\
+	{ HTTP_METHOD_UNCHECKOUT,	"UNCHECKOUT" },	\
+	{ HTTP_METHOD_MKWORKSPACE,	"MKWORKSPACE" }, \
+	{ HTTP_METHOD_UPDATE,		"UPDATE" },	\
+	{ HTTP_METHOD_LABEL,		"LABEL" },	\
+	{ HTTP_METHOD_MERGE,		"MERGE" },	\
+	{ HTTP_METHOD_BASELINE_CONTROL,	"BASELINE-CONTROL" }, \
+	{ HTTP_METHOD_MKACTIVITY,	"MKACTIVITY" },	\
+	{ HTTP_METHOD_ORDERPATCH,	"ORDERPATCH" },	\
+	{ HTTP_METHOD_ACL,		"ACL" },	\
+	{ HTTP_METHOD_MKREDIRECTREF,	"MKREDIRECTREF" }, \
+	{ HTTP_METHOD_UPDATEREDIRECTREF, "UPDATEREDIRECTREF" }, \
+	{ HTTP_METHOD_SEARCH,		"SEARCH" },	\
 	{ HTTP_METHOD_PATCH,		"PATCH" },	\
 	{ HTTP_METHOD_NONE,		NULL }		\
 }
@@ -130,7 +172,8 @@ struct http_error {
 	{ 415,	"Unsupported Media Type" },		\
 	{ 416,	"Range Not Satisfiable" },		\
 	{ 417,	"Expectation Failed" },			\
-	/* 418-421 unassigned */			\
+	{ 418,	"I'm a teapot" },			\
+	/* 419-421 unassigned */			\
 	{ 420,	"Enhance Your Calm" },			\
 	{ 422,	"Unprocessable Entity" },		\
 	{ 423,	"Locked" },				\
@@ -142,7 +185,9 @@ struct http_error {
 	{ 429,	"Too Many Requests" },			\
 	/* 430 unassigned */				\
 	{ 431,	"Request Header Fields Too Large" },	\
-	/* 432-499 unassigned */			\
+	/* 432-450 unassigned */			\
+	{ 451,	"Unavailable For Legal Reasons" },	\
+	/* 452-499 unassigned */			\
 	{ 500,	"Internal Server Error" },		\
 	{ 501,	"Not Implemented" },			\
 	{ 502,	"Bad Gateway" },			\
@@ -176,6 +221,7 @@ struct http_mediatype {
 	{ "jpeg",	"image",	"jpeg" },	\
 	{ "jpg",	"image",	"jpeg" },	\
 	{ "png",	"image",	"png" },	\
+	{ "svg",	"image",	"svg+xml" },	\
 	{ "js",		"application",	"javascript" },	\
 	{ NULL }					\
 }
@@ -195,6 +241,7 @@ struct http_descriptor {
 	enum httpmethod		 http_method;
 	int			 http_chunked;
 	char			*http_version;
+	unsigned int		 http_status;
 
 	/* Rewritten path remains NULL if not used */
 	char			*http_path_alias;
@@ -204,4 +251,4 @@ struct http_descriptor {
 	struct kvtree		 http_headers;
 };
 
-#endif /* _HTTP_H */
+#endif /* HTTP_H */

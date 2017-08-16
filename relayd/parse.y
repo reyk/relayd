@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.199 2014/12/23 13:18:23 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.215 2017/05/27 08:33:25 claudio Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -30,29 +30,29 @@
 #include <sys/stat.h>
 #include <sys/queue.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
+#include <sys/tree.h>
 
-#include <net/if.h>
-#include <net/pfvar.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <net/pfvar.h>
 #include <net/route.h>
 
-#include <ctype.h>
-#include <unistd.h>
-#include <err.h>
-#include <errno.h>
-#include <event.h>
-#include <limits.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <err.h>
+#include <endian.h>
+#include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <string.h>
 #include <ifaddrs.h>
 #include <syslog.h>
 #include <md5.h>
-
-#include <openssl/ssl.h>
 
 #include "relayd.h"
 #include "http.h"
@@ -150,7 +150,7 @@ typedef struct {
 		enum direction		 dir;
 		struct {
 			struct sockaddr_storage	 ss;
-			char			 name[MAXHOSTNAMELEN];
+			char			 name[HOST_NAME_MAX+1];
 		}			 addr;
 		struct {
 			enum digest_type type;
@@ -172,16 +172,15 @@ typedef struct {
 %token	SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TLS TO
 %token	ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE
 %token	MATCH PARAMS RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH
-%token	EDH CURVE
+%token	EDH CURVE TICKETS
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table value optstring
 %type	<v.number>	http_type loglevel quick trap
 %type	<v.number>	dstmode flag forwardmode retry
-%type	<v.number>	opttls opttlsclient tlscache
+%type	<v.number>	opttls opttlsclient
 %type	<v.number>	redirect_proto relay_proto match
 %type	<v.number>	action ruleaf key_option
-%type	<v.number>	tlsdhparams tlsecdhcurve
 %type	<v.port>	port
 %type	<v.host>	host
 %type	<v.addr>	address
@@ -349,6 +348,14 @@ port		: PORT STRING {
 		;
 
 varset		: STRING '=' STRING	{
+			char *s = $1;
+			while (*s++) {
+				if (isspace((unsigned char)*s)) {
+					yyerror("macro name cannot contain "
+					    "whitespace");
+					YYERROR;
+				}
+			}
 			if (symset($1, $3, 0) == -1)
 				fatal("cannot store variable");
 			free($1);
@@ -368,45 +375,43 @@ sendbuf		: NOTHING		{
 		;
 
 main		: INTERVAL NUMBER	{
-			if (loadcfg)
-				break;
-			if ((conf->sc_interval.tv_sec = $2) < 0) {
+			if ((conf->sc_conf.interval.tv_sec = $2) < 0) {
 				yyerror("invalid interval: %d", $2);
 				YYERROR;
 			}
 		}
 		| LOG loglevel		{
-			if (loadcfg)
-				break;
-			conf->sc_opts |= $2;
+			conf->sc_conf.opts |= $2;
 		}
 		| TIMEOUT timeout	{
-			if (loadcfg)
-				break;
-			bcopy(&$2, &conf->sc_timeout, sizeof(struct timeval));
+			bcopy(&$2, &conf->sc_conf.timeout,
+			    sizeof(struct timeval));
 		}
 		| PREFORK NUMBER	{
-			if (loadcfg)
-				break;
-			if ($2 <= 0 || $2 > RELAY_MAXPROC) {
+			if ($2 <= 0 || $2 > PROC_MAX_INSTANCES) {
 				yyerror("invalid number of preforked "
 				    "relays: %d", $2);
 				YYERROR;
 			}
-			conf->sc_prefork_relay = $2;
+			conf->sc_conf.prefork_relay = $2;
 		}
 		| SNMP trap optstring	{
-			if (loadcfg)
-				break;
-			conf->sc_flags |= F_SNMP;
+			conf->sc_conf.flags |= F_SNMP;
 			if ($2)
-				conf->sc_snmp_flags |= FSNMP_TRAPONLY;
-			if ($3)
-				conf->sc_snmp_path = $3;
-			else
-				conf->sc_snmp_path = strdup(AGENTX_SOCKET);
-			if (conf->sc_snmp_path == NULL)
-				fatal("out of memory");
+				conf->sc_conf.flags |= F_SNMP_TRAPONLY;
+			if ($3) {
+				if (strlcpy(conf->sc_conf.snmp_path,
+				    $3, sizeof(conf->sc_conf.snmp_path)) >=
+				    sizeof(conf->sc_conf.snmp_path)) {
+					yyerror("snmp path truncated");
+					free($3);
+					YYERROR;
+				}
+				free($3);
+			} else
+				(void)strlcpy(conf->sc_conf.snmp_path,
+				    AGENTX_SOCKET,
+				    sizeof(conf->sc_conf.snmp_path));
 		}
 		;
 
@@ -420,7 +425,7 @@ loglevel	: UPDATES		{ $$ = RELAYD_OPT_LOGUPDATE; }
 rdr		: REDIRECT STRING	{
 			struct rdr *srv;
 
-			conf->sc_flags |= F_NEEDPF;
+			conf->sc_conf.flags |= F_NEEDPF;
 
 			if (!loadcfg) {
 				free($2);
@@ -531,12 +536,12 @@ rdroptsl	: forwardmode TO tablespec interface	{
 
 			if ($3->conf.check == CHECK_NOCHECK) {
 				yyerror("table %s has no check", $3->conf.name);
-				purge_table(conf->sc_tables, $3);
+				purge_table(conf, conf->sc_tables, $3);
 				YYERROR;
 			}
 			if (rdr->backup) {
 				yyerror("only one backup table is allowed");
-				purge_table(conf->sc_tables, $3);
+				purge_table(conf, conf->sc_tables, $3);
 				YYERROR;
 			}
 			if (rdr->table) {
@@ -573,7 +578,7 @@ rdroptsl	: forwardmode TO tablespec interface	{
 		| DISABLE		{ rdr->conf.flags |= F_DISABLE; }
 		| STICKYADDR		{ rdr->conf.flags |= F_STICKY; }
 		| match PFTAG STRING {
-			conf->sc_flags |= F_NEEDPF;
+			conf->sc_conf.flags |= F_NEEDPF;
 			if (strlcpy(rdr->conf.tag, $3,
 			    sizeof(rdr->conf.tag)) >=
 			    sizeof(rdr->conf.tag)) {
@@ -646,7 +651,7 @@ tabledef	: TABLE table		{
 			free($2);
 
 			tb->conf.id = 0; /* will be set later */
-			bcopy(&conf->sc_timeout, &tb->conf.timeout,
+			bcopy(&conf->sc_conf.timeout, &tb->conf.timeout,
 			    sizeof(struct timeval));
 			TAILQ_INIT(&tb->hosts);
 			table = tb;
@@ -742,14 +747,14 @@ tableopts	: CHECK tablecheck
 			}
 		}
 		| INTERVAL NUMBER	{
-			if ($2 < conf->sc_interval.tv_sec ||
-			    $2 % conf->sc_interval.tv_sec) {
+			if ($2 < conf->sc_conf.interval.tv_sec ||
+			    $2 % conf->sc_conf.interval.tv_sec) {
 				yyerror("table interval must be "
 				    "divisible by global interval");
 				YYERROR;
 			}
 			table->conf.skip_cnt =
-			    ($2 / conf->sc_interval.tv_sec) - 1;
+			    ($2 / conf->sc_conf.interval.tv_sec) - 1;
 		}
 		| MODE dstmode hashkey	{
 			switch ($2) {
@@ -849,12 +854,12 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 		| TCP			{ table->conf.check = CHECK_TCP; }
 		| ssltls		{
 			table->conf.check = CHECK_TCP;
-			conf->sc_flags |= F_TLS;
+			conf->sc_conf.flags |= F_TLS;
 			table->conf.flags |= F_TLS;
 		}
 		| http_type STRING hostname CODE NUMBER {
 			if ($1) {
-				conf->sc_flags |= F_TLS;
+				conf->sc_conf.flags |= F_TLS;
 				table->conf.flags |= F_TLS;
 			}
 			table->conf.check = CHECK_HTTP_CODE;
@@ -875,7 +880,7 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 		}
 		| http_type STRING hostname digest {
 			if ($1) {
-				conf->sc_flags |= F_TLS;
+				conf->sc_conf.flags |= F_TLS;
 				table->conf.flags |= F_TLS;
 			}
 			table->conf.check = CHECK_HTTP_DIGEST;
@@ -900,7 +905,7 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 		| SEND sendbuf EXPECT STRING opttls {
 			table->conf.check = CHECK_SEND_EXPECT;
 			if ($5) {
-				conf->sc_flags |= F_TLS;
+				conf->sc_conf.flags |= F_TLS;
 				table->conf.flags |= F_TLS;
 			}
 			if (strlcpy(table->conf.exbuf, $4,
@@ -922,7 +927,7 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 				free($2);
 				YYERROR;
 			}
-			conf->sc_flags |= F_SCRIPT;
+			conf->sc_conf.flags |= F_SCRIPT;
 			free($2);
 		}
 		;
@@ -988,15 +993,16 @@ proto		: relay_proto PROTO STRING	{
 			free($3);
 			p->id = ++last_proto_id;
 			p->type = $1;
-			p->cache = RELAY_CACHESIZE;
 			p->tcpflags = TCPFLAG_DEFAULT;
 			p->tlsflags = TLSFLAG_DEFAULT;
 			p->tcpbacklog = RELAY_BACKLOG;
 			TAILQ_INIT(&p->rules);
 			(void)strlcpy(p->tlsciphers, TLSCIPHERS_DEFAULT,
 			    sizeof(p->tlsciphers));
-			p->tlsdhparams = TLSDHPARAMS_DEFAULT;
-			p->tlsecdhcurve = TLSECDHCURVE_DEFAULT;
+			(void)strlcpy(p->tlsecdhcurve, TLSECDHCURVE_DEFAULT,
+			    sizeof(p->tlsecdhcurve));
+			(void)strlcpy(p->tlsdhparams, TLSDHPARAM_DEFAULT,
+			    sizeof(p->tlsdhparams));
 			if (last_proto_id == INT_MAX) {
 				yyerror("too many protocols defined");
 				free(p);
@@ -1083,7 +1089,8 @@ tlsflags_l	: tlsflags comma tlsflags_l
 		| tlsflags
 		;
 
-tlsflags	: SESSION CACHE tlscache	{ proto->cache = $3; }
+tlsflags	: SESSION TICKETS { proto->tickets = 1; }
+		| NO SESSION TICKETS { proto->tickets = 0; }
 		| CIPHERS STRING		{
 			if (strlcpy(proto->tlsciphers, $2,
 			    sizeof(proto->tlsciphers)) >=
@@ -1095,16 +1102,68 @@ tlsflags	: SESSION CACHE tlscache	{ proto->cache = $3; }
 			free($2);
 		}
 		| NO EDH			{
-			proto->tlsdhparams = TLSDHPARAMS_NONE;
+			(void)strlcpy(proto->tlsdhparams, "none",
+			    sizeof(proto->tlsdhparams));
 		}
-		| EDH tlsdhparams		{
-			proto->tlsdhparams = $2;
+		| EDH			{
+			(void)strlcpy(proto->tlsdhparams, "auto",
+			    sizeof(proto->tlsdhparams));
+		}
+		| EDH PARAMS STRING		{
+			struct tls_config	*tls_cfg;
+			if ((tls_cfg = tls_config_new()) == NULL) {
+				yyerror("tls_config_new failed");
+				free($3);
+				YYERROR;
+			}
+			if (tls_config_set_dheparams(tls_cfg, $3) != 0) {
+				yyerror("tls edh params %s: %s", $3,
+				    tls_config_error(tls_cfg));
+				tls_config_free(tls_cfg);
+				free($3);
+				YYERROR;
+			}
+			tls_config_free(tls_cfg);
+			if (strlcpy(proto->tlsdhparams, $3,
+			    sizeof(proto->tlsdhparams)) >=
+			    sizeof(proto->tlsdhparams)) {
+				yyerror("tls edh truncated");
+				free($3);
+				YYERROR;
+			}
+			free($3);
 		}
 		| NO ECDH			{
-			proto->tlsecdhcurve = 0;
+			(void)strlcpy(proto->tlsecdhcurve, "none",
+			    sizeof(proto->tlsecdhcurve));
 		}
-		| ECDH tlsecdhcurve		{
-			proto->tlsecdhcurve = $2;
+		| ECDH			{
+			(void)strlcpy(proto->tlsecdhcurve, "auto",
+			    sizeof(proto->tlsecdhcurve));
+		}
+		| ECDH CURVE STRING			{
+			struct tls_config	*tls_cfg;
+			if ((tls_cfg = tls_config_new()) == NULL) {
+				yyerror("tls_config_new failed");
+				free($3);
+				YYERROR;
+			}
+			if (tls_config_set_ecdhecurve(tls_cfg, $3) != 0) {
+				yyerror("tls ecdh curve %s: %s", $3,
+				    tls_config_error(tls_cfg));
+				tls_config_free(tls_cfg);
+				free($3);
+				YYERROR;
+			}
+			tls_config_free(tls_cfg);
+			if (strlcpy(proto->tlsecdhcurve, $3,
+			    sizeof(proto->tlsecdhcurve)) >=
+			    sizeof(proto->tlsecdhcurve)) {
+				yyerror("tls ecdh truncated");
+				free($3);
+				YYERROR;
+			}
+			free($3);
 		}
 		| CA FILENAME STRING		{
 			if (strlcpy(proto->tlsca, $3,
@@ -1170,16 +1229,6 @@ flag		: STRING			{
 			}
 			free($1);
 		}
-		;
-
-tlscache	: NUMBER			{
-			if ($1 < 0) {
-				yyerror("invalid tlscache value: %d", $1);
-				YYERROR;
-			}
-			$$ = $1;
-		}
-		| DISABLE			{ $$ = -2; }
 		;
 
 filterrule	: action dir quick ruleaf rulesrc ruledst {
@@ -1553,29 +1602,6 @@ key_option	: /* empty */		{ $$ = KEY_OPTION_NONE; }
 		| LOG			{ $$ = KEY_OPTION_LOG; }
 		;
 
-tlsdhparams	: /* empty */		{ $$ = TLSDHPARAMS_MIN; }
-		| PARAMS NUMBER		{
-			if ($2 < TLSDHPARAMS_MIN) {
-				yyerror("EDH params not supported: %d", $2);
-				YYERROR;
-			}
-			$$ = $2;
-		}
-		;
-
-tlsecdhcurve	: /* empty */		{ $$ = TLSECDHCURVE_DEFAULT; }
-		| CURVE STRING		{
-			if (strcmp("none", $2) == 0)
-				$$ = 0;
-			else if ((proto->tlsecdhcurve = OBJ_sn2nid($2)) == 0) {
-				yyerror("ECDH curve not supported");
-				free($2);
-				YYERROR;
-			}
-			free($2);
-		}
-		;
-
 relay		: RELAY STRING	{
 			struct relay *r;
 
@@ -1702,7 +1728,7 @@ relayoptsl	: LISTEN ON STRING port opttls {
 			r->rl_conf.port = h->port.val[0];
 			if ($5) {
 				r->rl_conf.flags |= F_TLS;
-				conf->sc_flags |= F_TLS;
+				conf->sc_conf.flags |= F_TLS;
 			}
 			tableport = h->port.val[0];
 			host_free(&al);
@@ -1715,7 +1741,7 @@ relayoptsl	: LISTEN ON STRING port opttls {
 			}
 			if ($2) {
 				rlay->rl_conf.flags |= F_TLSCLIENT;
-				conf->sc_flags |= F_TLSCLIENT;
+				conf->sc_conf.flags |= F_TLSCLIENT;
 			}
 		}
 		| SESSION TIMEOUT NUMBER		{
@@ -1779,12 +1805,12 @@ forwardspec	: STRING port retry	{
 			host_free(&al);
 		}
 		| NAT LOOKUP retry	{
-			conf->sc_flags |= F_NEEDPF;
+			conf->sc_conf.flags |= F_NEEDPF;
 			rlay->rl_conf.flags |= F_NATLOOK;
 			rlay->rl_conf.dstretry = $3;
 		}
 		| DESTINATION retry		{
-			conf->sc_flags |= F_NEEDPF;
+			conf->sc_conf.flags |= F_NEEDPF;
 			rlay->rl_conf.flags |= F_DIVERT;
 			rlay->rl_conf.dstretry = $2;
 		}
@@ -1833,7 +1859,7 @@ router		: ROUTER STRING		{
 				YYACCEPT;
 			}
 
-			conf->sc_flags |= F_NEEDRT;
+			conf->sc_conf.flags |= F_NEEDRT;
 			TAILQ_FOREACH(rt, conf->sc_rts, rt_entry)
 				if (!strcmp(rt->rt_conf.name, $2))
 					break;
@@ -1930,7 +1956,7 @@ routeoptsl	: ROUTE address '/' NUMBER {
 			if (router->rt_gwtable) {
 				yyerror("router %s table already specified",
 				    router->rt_conf.name);
-				purge_table(conf->sc_tables, $3);
+				purge_table(conf, conf->sc_tables, $3);
 				YYERROR;
 			}
 			router->rt_gwtable = $3;
@@ -2249,6 +2275,7 @@ lookup(char *s)
 		{ "tag",		TAG },
 		{ "tagged",		TAGGED },
 		{ "tcp",		TCP },
+		{ "tickets",		TICKETS },
 		{ "timeout",		TIMEOUT },
 		{ "tls",		TLS },
 		{ "to",			TO },
@@ -2609,8 +2636,7 @@ parse_config(const char *filename, struct relayd *x_conf)
 	endprotoent();
 
 	/* Free macros */
-	for (sym = TAILQ_FIRST(&symhead); sym != NULL; sym = next) {
-		next = TAILQ_NEXT(sym, entry);
+	TAILQ_FOREACH_SAFE(sym, &symhead, entry, next) {
 		if (!sym->persist) {
 			free(sym->nam);
 			free(sym->val);
@@ -2631,7 +2657,7 @@ load_config(const char *filename, struct relayd *x_conf)
 	struct relay_table	*rlt;
 
 	conf = x_conf;
-	conf->sc_flags = 0;
+	conf->sc_conf.flags = 0;
 
 	loadcfg = 1;
 	errors = 0;
@@ -2660,7 +2686,7 @@ load_config(const char *filename, struct relayd *x_conf)
 	/* Free macros and check which have not been used. */
 	for (sym = TAILQ_FIRST(&symhead); sym != NULL; sym = next) {
 		next = TAILQ_NEXT(sym, entry);
-		if ((conf->sc_opts & RELAYD_OPT_VERBOSE) && !sym->used)
+		if ((conf->sc_conf.opts & RELAYD_OPT_VERBOSE) && !sym->used)
 			fprintf(stderr, "warning: macro '%s' not "
 			    "used\n", sym->nam);
 		if (!sym->persist) {
@@ -2688,7 +2714,7 @@ load_config(const char *filename, struct relayd *x_conf)
 		free(rlay);
 	}
 
-	if (timercmp(&conf->sc_timeout, &conf->sc_interval, >=)) {
+	if (timercmp(&conf->sc_conf.timeout, &conf->sc_conf.interval, >=)) {
 		log_warnx("global timeout exceeds interval");
 		errors++;
 	}
@@ -2732,7 +2758,8 @@ load_config(const char *filename, struct relayd *x_conf)
 			log_warnx("unused table: %s", table->conf.name);
 			errors++;
 		}
-		if (timercmp(&table->conf.timeout, &conf->sc_interval, >=)) {
+		if (timercmp(&table->conf.timeout,
+		    &conf->sc_conf.interval, >=)) {
 			log_warnx("table timeout exceeds interval: %s",
 			    table->conf.name);
 			errors++;
@@ -2754,9 +2781,10 @@ symset(const char *nam, const char *val, int persist)
 {
 	struct sym	*sym;
 
-	for (sym = TAILQ_FIRST(&symhead); sym && strcmp(nam, sym->nam);
-	    sym = TAILQ_NEXT(sym, entry))
-		;	/* nothing */
+	TAILQ_FOREACH(sym, &symhead, entry) {
+		if (strcmp(nam, sym->nam) == 0)
+			break;
+	}
 
 	if (sym != NULL) {
 		if (sym->persist == 1)
@@ -2815,11 +2843,12 @@ symget(const char *nam)
 {
 	struct sym	*sym;
 
-	TAILQ_FOREACH(sym, &symhead, entry)
+	TAILQ_FOREACH(sym, &symhead, entry) {
 		if (strcmp(nam, sym->nam) == 0) {
 			sym->used = 1;
 			return (sym->val);
 		}
+	}
 	return (NULL);
 }
 
@@ -2835,7 +2864,7 @@ host_v4(const char *s)
 		return (NULL);
 
 	if ((h = calloc(1, sizeof(*h))) == NULL)
-		fatal(NULL);
+		fatal(__func__);
 	sain = (struct sockaddr_in *)&h->ss;
 	sain->sin_len = sizeof(struct sockaddr_in);
 	sain->sin_family = AF_INET;
@@ -2857,7 +2886,7 @@ host_v6(const char *s)
 	hints.ai_flags = AI_NUMERICHOST;
 	if (getaddrinfo(s, "0", &hints, &res) == 0) {
 		if ((h = calloc(1, sizeof(*h))) == NULL)
-			fatal(NULL);
+			fatal(__func__);
 		sa_in6 = (struct sockaddr_in6 *)&h->ss;
 		sa_in6->sin6_len = sizeof(struct sockaddr_in6);
 		sa_in6->sin6_family = AF_INET6;
@@ -2889,6 +2918,7 @@ host_dns(const char *s, struct addresslist *al, int max,
 	bzero(&hints, sizeof(hints));
 	hints.ai_family = PF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM; /* DUMMY */
+	hints.ai_flags = AI_ADDRCONFIG;
 	error = getaddrinfo(s, NULL, &hints, &res0);
 	if (error == EAI_AGAIN || error == EAI_NODATA || error == EAI_NONAME)
 		return (0);
@@ -2903,7 +2933,7 @@ host_dns(const char *s, struct addresslist *al, int max,
 		    res->ai_family != AF_INET6)
 			continue;
 		if ((h = calloc(1, sizeof(*h))) == NULL)
-			fatal(NULL);
+			fatal(__func__);
 
 		if (port != NULL)
 			bcopy(port, &h->port, sizeof(h->port));
@@ -3090,7 +3120,7 @@ table_inherit(struct table *tb)
 		goto fail;
 	}
 	if ((oldtb = table_findbyconf(conf, tb)) != NULL) {
-		purge_table(NULL, tb);
+		purge_table(conf, NULL, tb);
 		return (oldtb);
 	}
 
@@ -3133,7 +3163,7 @@ table_inherit(struct table *tb)
 	return (tb);
 
  fail:
-	purge_table(NULL, tb);
+	purge_table(conf, NULL, tb);
 	return (NULL);
 }
 
@@ -3265,9 +3295,8 @@ is_if_in_group(const char *ifname, const char *groupname)
 	}
 
 	len = ifgr.ifgr_len;
-	ifgr.ifgr_groups =
-	    (struct ifg_req *)calloc(len / sizeof(struct ifg_req),
-		sizeof(struct ifg_req));
+	ifgr.ifgr_groups = calloc(len / sizeof(struct ifg_req),
+	    sizeof(struct ifg_req));
 	if (ifgr.ifgr_groups == NULL)
 		err(1, "getifgroups");
 	if (ioctl(s, SIOCGIFGROUP, (caddr_t)&ifgr) == -1)

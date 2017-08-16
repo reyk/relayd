@@ -1,6 +1,6 @@
-#	$OpenBSD: Relayd.pm,v 1.13 2014/12/14 20:30:51 bluhm Exp $
+#	$OpenBSD: Relayd.pm,v 1.16 2015/07/20 05:34:16 bluhm Exp $
 
-# Copyright (c) 2010-2014 Alexander Bluhm <bluhm@openbsd.org>
+# Copyright (c) 2010-2015 Alexander Bluhm <bluhm@openbsd.org>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -20,6 +20,8 @@ use warnings;
 package Relayd;
 use parent 'Proc';
 use Carp;
+use Cwd;
+use Sys::Hostname;
 use File::Basename;
 
 sub new {
@@ -52,11 +54,15 @@ sub new {
 	open(my $fh, '>', $self->{conffile})
 	    or die ref($self), " conf file $self->{conffile} create failed: $!";
 	print $fh "log all\n";
+	print $fh "prefork 1\n";  # only crashes of first child are observed
 	print $fh "table <table-$test> { $self->{connectaddr} }\n"
 	    if defined($self->{table});
 
 	# substitute variables in config file
 	my $curdir = dirname($0) || ".";
+	my $objdir = getcwd();
+	my $hostname = hostname();
+	(my $host = $hostname) =~ s/\..*//;
 	my $connectport = $self->{connectport};
 	my $connectaddr = $self->{connectaddr};
 	my $listenaddr = $self->{listenaddr};
@@ -71,6 +77,11 @@ sub new {
 	    die ref($self), " invalid forward $self->{forward}"
 	    unless grep { /splice/ } @protocol;
 	print $fh "${proto}protocol proto-$test {";
+	if ($self->{inspectssl}) {
+		$self->{listenssl} = $self->{forwardssl} = 1;
+		print $fh "\n\ttls ca cert ca.crt";
+		print $fh "\n\ttls ca key ca.key password ''";
+	}
 	# substitute variables in config file
 	foreach (@protocol) {
 		s/(\$[a-z]+)/$1/eeg;

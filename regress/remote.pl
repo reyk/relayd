@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-#	$OpenBSD: remote.pl,v 1.7 2014/08/18 22:58:19 bluhm Exp $
+#	$OpenBSD: remote.pl,v 1.9 2016/08/25 22:56:13 bluhm Exp $
 
 # Copyright (c) 2010-2014 Alexander Bluhm <bluhm@openbsd.org>
 #
@@ -56,7 +56,7 @@ my $mode =
 	@ARGV == 4 && $ARGV[1] !~ /^\d+$/ && $ARGV[3] !~ /^\d+$/ ? "auto"   :
 	usage();
 
-my $r;
+my($s, $r, $c);
 if ($mode eq "relay") {
 	my($rport) = find_ports(num => 1);
 	$r = Relayd->new(
@@ -98,7 +98,7 @@ if ($mode eq "relay") {
 
 my $redo = $args{lengths} && @{$args{lengths}};
 $redo = 0 if $args{client}{http_vers};  # run only one persistent connection
-my $s = Server->new(
+$s = Server->new(
     forward             => $ARGV[0],
     func                => \&read_char,
     redo                => $redo,
@@ -107,6 +107,7 @@ my $s = Server->new(
     listenaddr          => ($mode eq "auto" ? $ARGV[1] : undef),
     listenport          => ($mode eq "manual" ? $ARGV[0] : undef),
     testfile            => $testfile,
+    client              => \$c,
 ) unless $args{server}{noserver};
 if ($mode eq "auto") {
 	$r = Remote->new(
@@ -121,7 +122,7 @@ if ($mode eq "auto") {
 	);
 	$r->run->up;
 }
-my $c = Client->new(
+$c = Client->new(
     forward             => $ARGV[0],
     func                => \&write_char,
     %{$args{client}},
@@ -129,6 +130,7 @@ my $c = Client->new(
     connectaddr         => ($mode eq "manual" ? $ARGV[1] : $r->{listenaddr}),
     connectport         => ($mode eq "manual" ? $ARGV[2] : $r->{listenport}),
     testfile            => $testfile,
+    server              => \$s,
 ) unless $args{client}{noclient};
 
 $s->run unless $args{server}{noserver};

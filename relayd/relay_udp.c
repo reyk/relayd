@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_udp.c,v 1.37 2014/12/21 00:54:49 guenther Exp $	*/
+/*	$OpenBSD: relay_udp.c,v 1.47 2017/07/04 19:59:51 benno Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -19,35 +19,26 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/time.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/tree.h>
 
-#include <net/if.h>
 #include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
+#include <arpa/inet.h>
 
+#include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <err.h>
-#include <pwd.h>
 #include <event.h>
-#include <fnmatch.h>
-
-#include <openssl/ssl.h>
+#include <imsg.h>
 
 #include "relayd.h"
 
 extern volatile sig_atomic_t relay_sessions;
 extern objid_t relay_conid;
-extern int proc_id;
-extern int debug;
 
 static struct relayd *env = NULL;
 struct shuffle relay_shuffle;
@@ -67,20 +58,20 @@ void		 relay_dns_result(struct rsession *, u_int8_t *, size_t);
 int		 relay_dns_cmp(struct rsession *, struct rsession *);
 
 void
-relay_udp_privinit(struct relayd *x_env, struct relay *rlay)
+relay_udp_privinit(struct relay *rlay)
 {
-	if (env == NULL)
-		env = x_env;
-
 	if (rlay->rl_conf.flags & F_TLS)
 		fatalx("tls over udp is not supported");
 	rlay->rl_conf.flags |= F_UDP;
 }
 
 void
-relay_udp_init(struct relay *rlay)
+relay_udp_init(struct relayd *x_env, struct relay *rlay)
 {
 	struct protocol		*proto = rlay->rl_proto;
+
+	if (env == NULL)
+		env = x_env;
 
 	switch (proto->type) {
 	case RELAY_PROTO_DNS:
@@ -123,14 +114,13 @@ relay_udp_socket(struct sockaddr_storage *ss, in_port_t port,
 	if (relay_socket_af(ss, port) == -1)
 		goto bad;
 
-	if ((s = socket(ss->ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1)
+	if ((s = socket(ss->ss_family, SOCK_DGRAM | SOCK_NONBLOCK,
+	    IPPROTO_UDP)) == -1)
 		goto bad;
 
 	/*
 	 * Socket options
 	 */
-	if (fcntl(s, F_SETFL, O_NONBLOCK) == -1)
-		goto bad;
 	if (proto->tcpflags & TCPFLAG_BUFSIZ) {
 		val = proto->tcpbufsiz;
 		if (setsockopt(s, SOL_SOCKET, SO_RCVBUF,
@@ -147,15 +137,33 @@ relay_udp_socket(struct sockaddr_storage *ss, in_port_t port,
 	 */
 	if (proto->tcpflags & TCPFLAG_IPTTL) {
 		val = (int)proto->tcpipttl;
-		if (setsockopt(s, IPPROTO_IP, IP_TTL,
-		    &val, sizeof(val)) == -1)
-			goto bad;
+		switch (ss->ss_family) {
+		case AF_INET:
+			if (setsockopt(s, IPPROTO_IP, IP_TTL,
+			    &val, sizeof(val)) == -1)
+				goto bad;
+			break;
+		case AF_INET6:
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS,
+			    &val, sizeof(val)) == -1)
+				goto bad;
+			break;
+		}
 	}
 	if (proto->tcpflags & TCPFLAG_IPMINTTL) {
 		val = (int)proto->tcpipminttl;
-		if (setsockopt(s, IPPROTO_IP, IP_MINTTL,
-		    &val, sizeof(val)) == -1)
-			goto bad;
+		switch (ss->ss_family) {
+		case AF_INET:
+			if (setsockopt(s, IPPROTO_IP, IP_MINTTL,
+			    &val, sizeof(val)) == -1)
+				goto bad;
+			break;
+		case AF_INET6:
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_MINHOPCOUNT,
+			    &val, sizeof(val)) == -1)
+				goto bad;
+			break;
+		}
 	}
 
 	return (s);
@@ -198,13 +206,13 @@ relay_udp_response(int fd, short sig, void *arg)
 		return;
 
 	relay_close(con, "unknown response");
-	if (priv != NULL)
-		free(priv);
+	free(priv);
 }
 
 void
 relay_udp_server(int fd, short sig, void *arg)
 {
+	struct privsep *ps = env->sc_ps;
 	struct relay *rlay = arg;
 	struct protocol *proto = rlay->rl_proto;
 	struct rsession *con = NULL;
@@ -270,7 +278,7 @@ relay_udp_server(int fd, short sig, void *arg)
 	relay_session_publish(con);
 
 	/* Increment the per-relay session counter */
-	rlay->rl_stats[proc_id].last++;
+	rlay->rl_stats[ps->ps_instance].last++;
 
 	/* Pre-allocate output buffer */
 	con->se_out.output = evbuffer_new();
@@ -297,8 +305,7 @@ relay_udp_server(int fd, short sig, void *arg)
 	/* Save the received data */
 	if (evbuffer_add(con->se_out.output, buf, len) == -1) {
 		relay_close(con, "failed to store buffer");
-		if (cnl != NULL)
-			free(cnl);
+		free(cnl);
 		return;
 	}
 
@@ -307,12 +314,12 @@ relay_udp_server(int fd, short sig, void *arg)
 		bzero(cnl, sizeof(*cnl));
 		cnl->in = -1;
 		cnl->id = con->se_id;
-		cnl->proc = proc_id;
+		cnl->proc = ps->ps_instance;
 		cnl->proto = IPPROTO_UDP;
 		bcopy(&con->se_in.ss, &cnl->src, sizeof(cnl->src));
 		bcopy(&rlay->rl_conf.ss, &cnl->dst, sizeof(cnl->dst));
-		proc_compose_imsg(env->sc_ps, PROC_PFE, -1,
-		    IMSG_NATLOOK, -1, cnl, sizeof(*cnl));
+		proc_compose(env->sc_ps, PROC_PFE,
+		    IMSG_NATLOOK, cnl, sizeof(*cnl));
 
 		/* Schedule timeout */
 		evtimer_set(&con->se_ev, relay_natlook, con);
@@ -459,7 +466,7 @@ relay_dns_request(struct rsession *con)
 
 	if (buf == NULL || priv == NULL || len < 1)
 		return (-1);
-	if (debug)
+	if (log_getverbose() > 1)
 		relay_dns_log(con, buf, len);
 
 	getmonotime(&con->se_tv_start);
@@ -512,9 +519,9 @@ relay_dns_result(struct rsession *con, u_int8_t *buf, size_t len)
 	socklen_t		 slen;
 
 	if (priv == NULL)
-		fatalx("relay_dns_result: response to invalid session");
+		fatalx("%s: response to invalid session", __func__);
 
-	if (debug)
+	if (log_getverbose() > 1)
 		relay_dns_log(con, buf, len);
 
 	/*
@@ -540,7 +547,7 @@ relay_dns_cmp(struct rsession *a, struct rsession *b)
 	struct relay_dns_priv	*bp = b->se_priv;
 
 	if (ap == NULL || bp == NULL)
-		fatalx("relay_dns_cmp: invalid session");
+		fatalx("%s: invalid session", __func__);
 
 	return (memcmp(&ap->dp_inkey, &bp->dp_inkey, sizeof(u_int16_t)));
 }

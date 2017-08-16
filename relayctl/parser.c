@@ -1,4 +1,4 @@
-/*	$OpenBSD: parser.c,v 1.25 2011/05/19 08:56:49 reyk Exp $	*/
+/*	$OpenBSD: parser.c,v 1.27 2015/01/22 17:42:09 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -19,25 +19,13 @@
  */
 
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/queue.h>
 
-#include <net/if.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-
-#include <err.h>
-#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <event.h>
-
-#include <openssl/ssl.h>
 
 #include "relayd.h"
-
 #include "parser.h"
 
 enum token_type {
@@ -129,14 +117,14 @@ static const struct token t_host_id[] = {
 };
 
 static const struct token t_log[] = {
-	{KEYWORD,	"verbose",	LOG_VERBOSE, 	NULL},
-	{KEYWORD,	"brief",	LOG_BRIEF, 	NULL},
-	{ENDTOKEN, 	"",		NONE,		NULL}
+	{KEYWORD,	"verbose",	LOG_VERBOSE,	NULL},
+	{KEYWORD,	"brief",	LOG_BRIEF,	NULL},
+	{ENDTOKEN,	"",		NONE,		NULL}
 };
 
 static const struct token t_load[] = {
 	{PATH,		"",		NONE,		NULL},
-	{ENDTOKEN, 	"",		NONE,		NULL}
+	{ENDTOKEN,	"",		NONE,		NULL}
 };
 
 static const struct token *match_token(const char *, const struct token *,
@@ -208,7 +196,8 @@ match_token(const char *word, const struct token *table,
 				break;
 			res->id.id = strtonum(word, 0, UINT_MAX, &errstr);
 			if (errstr) {
-				strlcpy(res->id.name, word, sizeof(res->id.name));
+				strlcpy(res->id.name, word,
+				    sizeof(res->id.name));
 				res->id.id = EMPTY_ID;
 			}
 			t = &table[i];
@@ -219,7 +208,8 @@ match_token(const char *word, const struct token *table,
 				break;
 			res->id.id = strtonum(word, 0, UINT_MAX, &errstr);
 			if (errstr) {
-				strlcpy(res->id.name, word, sizeof(res->id.name));
+				strlcpy(res->id.name, word,
+				    sizeof(res->id.name));
 				res->id.id = EMPTY_ID;
 			}
 			t = &table[i];
@@ -230,7 +220,8 @@ match_token(const char *word, const struct token *table,
 				break;
 			res->id.id = strtonum(word, 0, UINT_MAX, &errstr);
 			if (errstr) {
-				strlcpy(res->id.name, word, sizeof(res->id.name));
+				strlcpy(res->id.name, word,
+				    sizeof(res->id.name));
 				res->id.id = EMPTY_ID;
 			}
 			t = &table[i];

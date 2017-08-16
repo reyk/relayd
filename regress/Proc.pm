@@ -1,6 +1,6 @@
-#	$OpenBSD: Proc.pm,v 1.10 2014/08/18 22:58:19 bluhm Exp $
+#	$OpenBSD: Proc.pm,v 1.12 2016/08/25 22:56:13 bluhm Exp $
 
-# Copyright (c) 2010-2014 Alexander Bluhm <bluhm@openbsd.org>
+# Copyright (c) 2010-2016 Alexander Bluhm <bluhm@openbsd.org>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -70,6 +70,7 @@ sub new {
 	    or die "$class log file $self->{logfile} create failed: $!";
 	$fh->autoflush;
 	$self->{log} = $fh;
+	$self->{ppid} = $$;
 	return bless $self, $class;
 }
 
@@ -128,6 +129,9 @@ sub wait {
 	my $self = shift;
 	my $flags = shift;
 
+	# if we a not the parent process, assume the child is still running
+	return 0 unless $self->{ppid} == $$;
+
 	my $pid = $self->{pid}
 	    or croak ref($self), " no child pid";
 	my $kid = waitpid($pid, $flags);
@@ -147,7 +151,8 @@ sub loggrep {
 	my $self = shift;
 	my($regex, $timeout) = @_;
 
-	my $end = time() + $timeout if $timeout;
+	my $end;
+	$end = time() + $timeout if $timeout;
 
 	do {
 		my($kid, $status, $code) = $self->wait(WNOHANG);

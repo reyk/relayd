@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_filter.c,v 1.54 2014/12/23 13:18:23 reyk Exp $	*/
+/*	$OpenBSD: pfe_filter.c,v 1.62 2017/05/28 10:39:15 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -19,62 +19,30 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 
 #include <net/if.h>
-#include <net/pfvar.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <net/pfvar.h>
 
 #include <limits.h>
-#include <fcntl.h>
-#include <event.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
 
-#include <openssl/ssl.h>
+#define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
 
 #include "relayd.h"
-
-struct pfdata {
-	int			 dev;
-	struct pf_anchor	*anchor;
-	struct pfioc_trans	 pft;
-	struct pfioc_trans_e	 pfte;
-	u_int8_t		 pfused;
-};
 
 int	 transaction_init(struct relayd *, const char *);
 int	 transaction_commit(struct relayd *);
 void	 kill_tables(struct relayd *);
 int	 kill_srcnodes(struct relayd *, struct table *);
-
-void
-init_filter(struct relayd *env, int s)
-{
-	struct pf_status	status;
-
-	if (!(env->sc_flags & F_NEEDPF))
-		return;
-
-	if (s == -1)
-		fatalx("init_filter: invalid socket");
-	if (env->sc_pf == NULL) {
-		if ((env->sc_pf = calloc(1, sizeof(*(env->sc_pf)))) == NULL)
-			fatal("calloc");
-	} else
-		close(env->sc_pf->dev);
-	env->sc_pf->dev = s;
-	if (ioctl(env->sc_pf->dev, DIOCGETSTATUS, &status) == -1)
-		fatal("init_filter: DIOCGETSTATUS");
-	if (!status.running)
-		fatalx("init_filter: pf is disabled");
-	log_debug("%s: filter init done", __func__);
-}
 
 void
 init_tables(struct relayd *env)
@@ -84,7 +52,7 @@ init_tables(struct relayd *env)
 	struct pfr_table	*tables;
 	struct pfioc_table	 io;
 
-	if (!(env->sc_flags & F_NEEDPF))
+	if (!(env->sc_conf.flags & F_NEEDPF))
 		return;
 
 	if ((tables = calloc(env->sc_rdrcount, sizeof(*tables))) == NULL)
@@ -106,7 +74,7 @@ init_tables(struct relayd *env)
 		i++;
 	}
 	if (i != env->sc_rdrcount)
-		fatalx("init_tables: table count modified");
+		fatalx("%s: table count modified", __func__);
 
 	memset(&io, 0, sizeof(io));
 	io.pfrio_size = env->sc_rdrcount;
@@ -114,7 +82,7 @@ init_tables(struct relayd *env)
 	io.pfrio_buffer = tables;
 
 	if (ioctl(env->sc_pf->dev, DIOCRADDTABLES, &io) == -1)
-		fatal("init_tables: cannot create tables");
+		fatal("%s: cannot create tables", __func__);
 	log_debug("%s: created %d tables", __func__, io.pfrio_nadd);
 
 	free(tables);
@@ -131,7 +99,7 @@ init_tables(struct relayd *env)
 	return;
 
  toolong:
-	fatal("init_tables: name too long");
+	fatal("%s: name too long", __func__);
 }
 
 void
@@ -141,7 +109,7 @@ kill_tables(struct relayd *env)
 	struct rdr		*rdr;
 	int			 cnt = 0;
 
-	if (!(env->sc_flags & F_NEEDPF))
+	if (!(env->sc_conf.flags & F_NEEDPF))
 		return;
 
 	TAILQ_FOREACH(rdr, env->sc_rdrs, entry) {
@@ -153,14 +121,14 @@ kill_tables(struct relayd *env)
 		    sizeof(io.pfrio_table.pfrt_anchor)) >= PF_ANCHOR_NAME_SIZE)
 			goto toolong;
 		if (ioctl(env->sc_pf->dev, DIOCRCLRTABLES, &io) == -1)
-			fatal("kill_tables: ioctl failed");
+			fatal("%s: ioctl failed", __func__);
 		cnt += io.pfrio_ndel;
 	}
 	log_debug("%s: deleted %d tables", __func__, cnt);
 	return;
 
  toolong:
-	fatal("kill_tables: name too long");
+	fatal("%s: name too long", __func__);
 }
 
 void
@@ -173,7 +141,7 @@ sync_table(struct relayd *env, struct rdr *rdr, struct table *table)
 	struct sockaddr_in6	*sain6;
 	struct host		*host;
 
-	if (!(env->sc_flags & F_NEEDPF))
+	if (!(env->sc_conf.flags & F_NEEDPF))
 		return;
 
 	if (table == NULL)
@@ -224,28 +192,28 @@ sync_table(struct relayd *env, struct rdr *rdr, struct table *table)
 			addlist[i].pfra_net = 128;
 			break;
 		default:
-			fatalx("sync_table: unknown address family");
+			fatalx("%s: unknown address family", __func__);
 			break;
 		}
 		i++;
 	}
 	if (i != table->up)
-		fatalx("sync_table: desynchronized");
+		fatalx("%s: desynchronized", __func__);
 
 	if (ioctl(env->sc_pf->dev, DIOCRSETADDRS, &io) == -1)
-		fatal("sync_table: cannot set address list");
+		fatal("%s: cannot set address list", __func__);
 	if (rdr->conf.flags & F_STICKY)
 		cnt = kill_srcnodes(env, table);
 	free(addlist);
 
-	if (env->sc_opts & RELAYD_OPT_LOGUPDATE)
+	if (env->sc_conf.opts & RELAYD_OPT_LOGUPDATE)
 		log_info("table %s: %d added, %d deleted, "
 		    "%d changed, %d killed", io.pfrio_table.pfrt_name,
 		    io.pfrio_nadd, io.pfrio_ndel, io.pfrio_nchange, cnt);
 	return;
 
  toolong:
-	fatal("sync_table: name too long");
+	fatal("%s: name too long", __func__);
 }
 
 int
@@ -281,7 +249,7 @@ kill_srcnodes(struct relayd *env, struct table *table)
 			    sizeof(psnk.psnk_dst.addr.v.a.addr.v6));
 			break;
 		default:
-			fatalx("kill_srcnodes: unknown address family");
+			fatalx("%s: unknown address family", __func__);
 			break;
 		}
 
@@ -290,7 +258,7 @@ kill_srcnodes(struct relayd *env, struct table *table)
 
 		if (ioctl(env->sc_pf->dev,
 		    DIOCKILLSRCNODES, &psnk) == -1)
-			fatal("kill_srcnodes: cannot kill src nodes");
+			fatal("%s: cannot kill src nodes", __func__);
 		cnt += psnk.psnk_killed;
 	}
 
@@ -302,7 +270,7 @@ flush_table(struct relayd *env, struct rdr *rdr)
 {
 	struct pfioc_table	io;
 
-	if (!(env->sc_flags & F_NEEDPF))
+	if (!(env->sc_conf.flags & F_NEEDPF))
 		return;
 
 	memset(&io, 0, sizeof(io));
@@ -317,19 +285,19 @@ flush_table(struct relayd *env, struct rdr *rdr)
 	    sizeof(io.pfrio_table.pfrt_name))
 		goto toolong;
 	if (ioctl(env->sc_pf->dev, DIOCRCLRADDRS, &io) == -1)
-		fatal("flush_table: cannot flush table addresses");
+		fatal("%s: cannot flush table addresses", __func__);
 
 	io.pfrio_esize = sizeof(io.pfrio_table);
 	io.pfrio_size = 1;
 	io.pfrio_buffer = &io.pfrio_table;
 	if (ioctl(env->sc_pf->dev, DIOCRCLRTSTATS, &io) == -1)
-		fatal("flush_table: cannot flush table stats");
+		fatal("%s: cannot flush table stats", __func__);
 
 	log_debug("%s: flushed table %s", __func__, rdr->conf.name);
 	return;
 
  toolong:
-	fatal("flush_table: name too long");
+	fatal("%s: name too long", __func__);
 }
 
 int
@@ -371,7 +339,7 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 	char			 anchor[PF_ANCHOR_NAME_SIZE];
 	struct table		*t = rdr->table;
 
-	if ((env->sc_flags & F_NEEDPF) == 0)
+	if ((env->sc_conf.flags & F_NEEDPF) == 0)
 		return;
 
 	bzero(anchor, sizeof(anchor));
@@ -425,7 +393,7 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 			rio.rule.rule_flag = PFRULE_STATESLOPPY;
 			break;
 		default:
-			fatalx("sync_ruleset: invalid forward mode");
+			fatalx("%s: invalid forward mode", __func__);
 			/* NOTREACHED */
 		}
 
@@ -439,11 +407,13 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 		rio.rule.dst.port[0] = address->port.val[0];
 		rio.rule.dst.port[1] = address->port.val[1];
 		rio.rule.rtableid = -1; /* stay in the main routing table */
-		rio.rule.onrdomain = getrtable();
+		rio.rule.onrdomain = env->sc_rtable;
+		DPRINTF("%s rtable %d",__func__,env->sc_rtable);
 
 		if (rio.rule.proto == IPPROTO_TCP)
 			rio.rule.timeout[PFTM_TCP_ESTABLISHED] =
-			    (u_int32_t)MIN(rdr->conf.timeout.tv_sec, INT_MAX);
+			    (u_int32_t)MINIMUM(rdr->conf.timeout.tv_sec,
+			    INT_MAX);
 
 		if (strlen(rdr->conf.tag))
 			(void)strlcpy(rio.rule.tagname, rdr->conf.tag,
@@ -475,7 +445,7 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 		if (strlcpy(rio.rule.rdr.addr.v.tblname, rdr->conf.name,
 		    sizeof(rio.rule.rdr.addr.v.tblname)) >=
 		    sizeof(rio.rule.rdr.addr.v.tblname))
-			fatal("sync_ruleset: table name too long");
+			fatal("%s: table name too long", __func__);
 
 		if (address->port.op == PF_OP_EQ ||
 		    rdr->table->conf.flags & F_PORT) {
@@ -498,7 +468,7 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 			rio.rule.rdr.opts = PF_POOL_LEASTSTATES;
 			break;
 		default:
-			fatalx("sync_ruleset: unsupported mode");
+			fatalx("%s: unsupported mode", __func__);
 			/* NOTREACHED */
 		}
 		if (rdr->conf.flags & F_STICKY)
@@ -522,7 +492,7 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 	return;
 
  toolong:
-	fatal("sync_ruleset: name too long");
+	fatal("%s: name too long", __func__);
 }
 
 void
@@ -531,7 +501,7 @@ flush_rulesets(struct relayd *env)
 	struct rdr	*rdr;
 	char		 anchor[PF_ANCHOR_NAME_SIZE];
 
-	if (!(env->sc_flags & F_NEEDPF))
+	if (!(env->sc_conf.flags & F_NEEDPF))
 		return;
 
 	kill_tables(env);
@@ -558,7 +528,7 @@ flush_rulesets(struct relayd *env)
 	return;
 
  toolong:
-	fatal("flush_rulesets: name too long");
+	fatal("%s: name too long", __func__);
 }
 
 int
@@ -569,13 +539,13 @@ natlook(struct relayd *env, struct ctl_natlook *cnl)
 	struct sockaddr_in6	*in6, *out6;
 	char			 ibuf[BUFSIZ], obuf[BUFSIZ];
 
-	if (!(env->sc_flags & F_NEEDPF))
+	if (!(env->sc_conf.flags & F_NEEDPF))
 		return (0);
 
 	bzero(&pnl, sizeof(pnl));
 
 	if ((pnl.af = cnl->src.ss_family) != cnl->dst.ss_family)
-		fatalx("natlook: illegal address families");
+		fatalx("%s: illegal address families", __func__);
 	switch (pnl.af) {
 	case AF_INET:
 		in = (struct sockaddr_in *)&cnl->src;
@@ -662,11 +632,11 @@ check_table(struct relayd *env, struct rdr *rdr, struct table *table)
 		goto toolong;
 
 	if (ioctl(env->sc_pf->dev, DIOCRGETTSTATS, &io) == -1)
-		fatal("check_table: cannot get table stats");
+		fatal("%s: cannot get table stats", __func__);
 
 	return (tstats.pfrts_match);
 
  toolong:
-	fatal("check_table: name too long");
+	fatal("%s: name too long", __func__);
 	return (0);
 }

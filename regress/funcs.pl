@@ -1,6 +1,6 @@
-#	$OpenBSD: funcs.pl,v 1.17 2014/08/18 22:58:19 bluhm Exp $
+#	$OpenBSD: funcs.pl,v 1.23 2017/07/14 14:41:03 bluhm Exp $
 
-# Copyright (c) 2010-2014 Alexander Bluhm <bluhm@openbsd.org>
+# Copyright (c) 2010-2017 Alexander Bluhm <bluhm@openbsd.org>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -48,10 +48,76 @@ sub find_ports {
 # Client funcs
 ########################################################################
 
+sub write_syswrite {
+	my $self = shift;
+	my $buf = shift;
+
+	IO::Handle::flush(\*STDOUT);
+	my $size = length($buf);
+	my $len = 0;
+	while ($len < $size) {
+		my $n = syswrite(STDOUT, $buf, $size, $len);
+		if (!defined($n)) {
+			$!{EWOULDBLOCK}
+			    or die ref($self), " syswrite failed: $!";
+			print STDERR "blocked write at $len of $size: $!\n";
+			next;
+		}
+		if ($len + $n != $size) {
+			print STDERR "short write $n at $len of $size\n";
+		}
+		$len += $n;
+	}
+	return $len;
+}
+
+sub write_block {
+	my $self = shift;
+	my $len = shift;
+
+	my $data;
+	my $outb = 0;
+	my $blocks = int($len / 1000);
+	my $rest = $len % 1000;
+
+	for (my $i = 1; $i <= 100 ; $i++) {
+		$data .= "012345678\n";
+	}
+
+	my $opct = 0;
+	for (my $i = 1; $i <= $blocks; $i++) {
+		$outb += write_syswrite($self, $data);
+		my $pct = ($outb / $len) * 100.0;
+		if ($pct >= $opct + 1) {
+			printf(STDERR "%.2f%% $outb/$len\n", $pct);
+			$opct = $pct;
+		}
+	}
+
+	if ($rest>0) {
+		for (my $i = 1; $i < $rest-1 ; $i++) {
+		    $outb += write_syswrite($self, 'r');
+		    my $pct = ($outb / $len) * 100.0;
+		    if ($pct >= $opct + 1) {
+			    printf(STDERR "%.2f%% $outb/$len\n", $pct);
+			    $opct = $pct;
+		    }
+		}
+	}
+	$outb += write_syswrite($self, "\n\n");
+	IO::Handle::flush(\*STDOUT);
+	print STDERR "LEN: ", $outb, "\n";
+}
+
 sub write_char {
 	my $self = shift;
 	my $len = shift // $self->{len} // 251;
 	my $sleep = $self->{sleep};
+
+	if ($self->{fast}) {
+		write_block($self, $len);
+		return;
+	}
 
 	my $ctx = Digest::MD5->new();
 	my $char = '0';
@@ -92,6 +158,7 @@ sub http_client {
 		my $len = shift // $self->{len} // 251;
 		my $cookie = $self->{cookie};
 		http_request($self, $len, "1.0", $cookie);
+		http_response($self, $len);
 		return;
 	}
 
@@ -101,7 +168,10 @@ sub http_client {
 	my @cookies = @{$self->{redo}{cookies} || $self->{cookies} || []};
 	while (defined (my $len = shift @lengths)) {
 		my $cookie = shift @cookies || $self->{cookie};
-		eval { http_request($self, $len, $vers, $cookie) };
+		eval {
+			http_request($self, $len, $vers, $cookie);
+			http_response($self, $len);
+		};
 		warn $@ if $@;
 		if (@lengths && ($@ || $vers eq "1.0")) {
 			# reconnect and redo the outstanding requests
@@ -136,9 +206,15 @@ sub http_request {
 	}
 	my @request = ("$method /$path HTTP/$vers");
 	push @request, "Host: foo.bar" unless defined $header{Host};
-	push @request, "Content-Length: $len"
-	    if $vers eq "1.1" && $method eq "PUT" &&
-	    !defined $header{'Content-Length'};
+	if ($vers eq "1.1" && $method eq "PUT") {
+		if (ref($len) eq 'ARRAY') {
+			push @request, "Transfer-Encoding: chunked"
+			    if !defined $header{'Transfer-Encoding'};
+		} else {
+			push @request, "Content-Length: $len"
+			    if !defined $header{'Content-Length'};
+		}
+	}
 	foreach my $key (sort keys %header) {
 		my $val = $header{$key};
 		if (ref($val) eq 'ARRAY') {
@@ -152,13 +228,29 @@ sub http_request {
 	push @request, "";
 	print STDERR map { ">>> $_\n" } @request;
 	print map { "$_\r\n" } @request;
-	write_char($self, $len) if $method eq "PUT";
+	if ($method eq "PUT") {
+		if (ref($len) eq 'ARRAY') {
+			if ($vers eq "1.1") {
+				write_chunked($self, @$len);
+			} else {
+				write_char($self, $_) foreach (@$len);
+			}
+		} else {
+			write_char($self, $len);
+		}
+	}
 	IO::Handle::flush(\*STDOUT);
 	# XXX client shutdown seems to be broken in relayd
 	#shutdown(\*STDOUT, SHUT_WR)
 	#    or die ref($self), " shutdown write failed: $!"
 	#    if $vers ne "1.1";
+}
 
+sub http_response {
+	my ($self, $len) = @_;
+	my $method = $self->{method} || "GET";
+
+	my $vers;
 	my $chunked = 0;
 	{
 		local $/ = "\r\n";
@@ -167,16 +259,21 @@ sub http_request {
 		    or die ref($self), " missing http $len response";
 		chomp;
 		print STDERR "<<< $_\n";
-		m{^HTTP/$vers 200 OK$}
+		m{^HTTP/(\d\.\d) 200 OK$}
 		    or die ref($self), " http response not ok"
 		    unless $self->{httpnok};
+		$vers = $1;
 		while (<STDIN>) {
 			chomp;
 			print STDERR "<<< $_\n";
 			last if /^$/;
 			if (/^Content-Length: (.*)/) {
-				$1 == $len or die ref($self),
-				    " bad content length $1";
+				if ($self->{httpnok}) {
+					$len = $1;
+				} else {
+					$1 == $len or die ref($self),
+					    " bad content length $1";
+				}
 			}
 			if (/^Transfer-Encoding: chunked$/) {
 				$chunked = 1;
@@ -186,7 +283,8 @@ sub http_request {
 	if ($chunked) {
 		read_chunked($self);
 	} else {
-		read_char($self, $vers eq "1.1" ? $len : undef)
+		undef $len unless defined($vers) && $vers eq "1.1";
+		read_char($self, $len)
 		    if $method eq "GET";
 	}
 }
@@ -240,12 +338,17 @@ sub errignore {
 }
 
 ########################################################################
-# Server funcs
+# Common funcs
 ########################################################################
 
 sub read_char {
 	my $self = shift;
 	my $max = shift // $self->{max};
+
+	if ($self->{fast}) {
+		read_block($self, $max);
+		return;
+	}
 
 	my $ctx = Digest::MD5->new();
 	my $len = 0;
@@ -267,6 +370,42 @@ sub read_char {
 	print STDERR "LEN: ", $len, "\n";
 	print STDERR "MD5: ", $ctx->hexdigest, "\n";
 }
+
+sub read_block {
+	my $self = shift;
+	my $max = shift // $self->{max};
+
+	my $opct = 0;
+	my $ctx = Digest::MD5->new();
+	my $len = 0;
+	for (;;) {
+		if (defined($max) && $len >= $max) {
+			print STDERR "Max\n";
+			last;
+		}
+		my $rlen = POSIX::BUFSIZ;
+		if (defined($max) && $rlen > $max - $len) {
+			$rlen = $max - $len;
+		}
+		defined(my $n = read(STDIN, my $buf, $rlen))
+		    or die ref($self), " read failed: $!";
+		$n or last;
+		$len += $n;
+		$ctx->add($buf);
+		my $pct = ($len / $max) * 100.0;
+		if ($pct >= $opct + 1) {
+			printf(STDERR "%.2f%% $len/$max\n", $pct);
+			$opct = $pct;
+		}
+	}
+
+	print STDERR "LEN: ", $len, "\n";
+	print STDERR "MD5: ", $ctx->hexdigest, "\n";
+}
+
+########################################################################
+# Server funcs
+########################################################################
 
 sub http_server {
 	my $self = shift;
@@ -300,19 +439,22 @@ sub http_server {
 				$cookie ||= $1 if /^Cookie: (.*)/;
 			}
 		}
-		# XXX reading to EOF does not work with relayd
-		#read_char($self, $vers eq "1.1" ? $len : undef)
-		read_char($self, $len)
-		    if $method eq "PUT";
+		if ($method eq "PUT" ) {
+			if (ref($len) eq 'ARRAY') {
+				read_chunked($self);
+			} else {
+				read_char($self, $len);
+			}
+		}
 
 		my @response = ("HTTP/$vers 200 OK");
 		$len = defined($len) ? $len : scalar(split /|/,$url);
-		if (ref($len) eq 'ARRAY') {
-			push @response, "Transfer-Encoding: chunked"
-			    if $vers eq "1.1";
-		} else {
-			push @response, "Content-Length: $len"
-			    if $vers eq "1.1" && $method eq "GET";
+		if ($vers eq "1.1" && $method eq "GET") {
+			if (ref($len) eq 'ARRAY') {
+				push @response, "Transfer-Encoding: chunked";
+			} else {
+				push @response, "Content-Length: $len";
+			}
 		}
 		foreach my $key (sort keys %header) {
 			my $val = $header{$key};
@@ -329,14 +471,16 @@ sub http_server {
 		print STDERR map { ">>> $_\n" } @response;
 		print map { "$_\r\n" } @response;
 
-		if (ref($len) eq 'ARRAY') {
-			if ($vers eq "1.1") {
-				write_chunked($self, @$len);
+		if ($method eq "GET") {
+			if (ref($len) eq 'ARRAY') {
+				if ($vers eq "1.1") {
+					write_chunked($self, @$len);
+				} else {
+					write_char($self, $_) foreach (@$len);
+				}
 			} else {
-				write_char($self, $_) foreach (@$len);
+				write_char($self, $len);
 			}
-		} else {
-			write_char($self, $len) if $method eq "GET";
 		}
 		IO::Handle::flush(\*STDOUT);
 	} while ($vers eq "1.1");
@@ -371,6 +515,8 @@ sub check_logs {
 	check_len($c, $r, $s, %args);
 	check_md5($c, $r, $s, %args);
 	check_loggrep($c, $r, $s, %args);
+	$r->loggrep("lost child")
+	    and die "relayd lost child";
 }
 
 sub check_len {
@@ -378,9 +524,10 @@ sub check_len {
 
 	$args{len} ||= 251 unless $args{lengths};
 
-	my @clen = $c->loggrep(qr/^LEN: /) or die "no client len"
+	my (@clen, @slen);
+	@clen = $c->loggrep(qr/^LEN: /) or die "no client len"
 	    unless $args{client}{nocheck};
-	my @slen = $s->loggrep(qr/^LEN: /) or die "no server len"
+	@slen = $s->loggrep(qr/^LEN: /) or die "no server len"
 	    unless $args{server}{nocheck};
 	!@clen || !@slen || @clen ~~ @slen
 	    or die "client: @clen", "server: @slen", "len mismatch";
@@ -407,8 +554,9 @@ sub check_len {
 sub check_md5 {
 	my ($c, $r, $s, %args) = @_;
 
-	my @cmd5 = $c->loggrep(qr/^MD5: /) unless $args{client}{nocheck};
-	my @smd5 = $s->loggrep(qr/^MD5: /) unless $args{server}{nocheck};
+	my (@cmd5, @smd5);
+	@cmd5 = $c->loggrep(qr/^MD5: /) unless $args{client}{nocheck};
+	@smd5 = $s->loggrep(qr/^MD5: /) unless $args{server}{nocheck};
 	!@cmd5 || !@smd5 || $cmd5[0] eq $smd5[0]
 	    or die "client: $cmd5[0]", "server: $smd5[0]", "md5 mismatch";
 

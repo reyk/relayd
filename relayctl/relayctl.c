@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayctl.c,v 1.51 2014/07/09 16:42:05 reyk Exp $	*/
+/*	$OpenBSD: relayctl.c,v 1.57 2016/09/03 14:44:21 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -22,25 +22,21 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/queue.h>
 #include <sys/un.h>
 
-#include <net/if.h>
-#include <net/if_media.h>
-#include <net/if_types.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <err.h>
 #include <errno.h>
 #include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <event.h>
-
-#include <openssl/ssl.h>
+#include <time.h>
+#include <imsg.h>
 
 #include "relayd.h"
 #include "parser.h"
@@ -53,7 +49,7 @@ char		*print_rdr_status(int);
 char		*print_host_status(int, int);
 char		*print_table_status(int, int);
 char		*print_relay_status(int);
-void		 print_statistics(struct ctl_stats[RELAY_MAXPROC + 1]);
+void		 print_statistics(struct ctl_stats[PROC_MAX_INSTANCES + 1]);
 
 struct imsgname {
 	int type;
@@ -127,6 +123,9 @@ main(int argc, char *argv[])
 		}
 		err(1, "connect: %s", RELAYD_SOCKET);
 	}
+
+	if (pledge("stdio", NULL) == -1)
+		err(1, "pledge");
 
 	if ((ibuf = malloc(sizeof(struct imsgbuf))) == NULL)
 		err(1, NULL);
@@ -208,7 +207,7 @@ main(int argc, char *argv[])
 			err(1, "write error");
 
 	while (!done) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			errx(1, "imsg_read error");
 		if (n == 0)
 			errx(1, "pipe closed");
@@ -331,8 +330,8 @@ show_summary_msg(struct imsg *imsg, int type)
 	struct relay		*rlay;
 	struct router		*rt;
 	struct netroute		*nr;
-	struct ctl_stats	 stats[RELAY_MAXPROC];
-	char			 name[MAXHOSTNAMELEN];
+	struct ctl_stats	 stats[PROC_MAX_INSTANCES];
+	char			 name[HOST_NAME_MAX+1];
 
 	switch (imsg->hdr.type) {
 	case IMSG_CTL_RDR:
@@ -537,7 +536,7 @@ print_relay_status(int flags)
 }
 
 void
-print_statistics(struct ctl_stats stats[RELAY_MAXPROC + 1])
+print_statistics(struct ctl_stats stats[PROC_MAX_INSTANCES + 1])
 {
 	struct ctl_stats	 crs;
 	int			 i;

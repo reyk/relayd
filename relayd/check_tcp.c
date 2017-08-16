@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_tcp.c,v 1.44 2014/12/12 10:05:09 reyk Exp $	*/
+/*	$OpenBSD: check_tcp.c,v 1.55 2017/07/04 20:27:09 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -16,11 +16,10 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/param.h>
-#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 
-#include <net/if.h>
 #include <netinet/in.h>
 
 #include <limits.h>
@@ -32,8 +31,7 @@
 #include <errno.h>
 #include <fnmatch.h>
 #include <sha1.h>
-
-#include <openssl/ssl.h>
+#include <imsg.h>
 
 #include "relayd.h"
 
@@ -69,7 +67,8 @@ check_tcp(struct ctl_tcp_event *cte)
 
 	len = ((struct sockaddr *)&cte->host->conf.ss)->sa_len;
 
-	if ((s = socket(cte->host->conf.ss.ss_family, SOCK_STREAM, 0)) == -1) {
+	if ((s = socket(cte->host->conf.ss.ss_family,
+	    SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1) {
 		if (errno == EMFILE || errno == ENFILE)
 			he = HCE_TCP_SOCKET_LIMIT;
 		else
@@ -83,14 +82,19 @@ check_tcp(struct ctl_tcp_event *cte)
 	if (setsockopt(s, SOL_SOCKET, SO_LINGER, &lng, sizeof(lng)) == -1)
 		goto bad;
 
-	if (cte->host->conf.ttl > 0) {
-		if (setsockopt(s, IPPROTO_IP, IP_TTL,
-		    &cte->host->conf.ttl, sizeof(int)) == -1)
-			goto bad;
-	}
-
-	if (fcntl(s, F_SETFL, O_NONBLOCK) == -1)
-		goto bad;
+	if (cte->host->conf.ttl > 0)
+		switch (cte->host->conf.ss.ss_family) {
+		case AF_INET:
+			if (setsockopt(s, IPPROTO_IP, IP_TTL,
+			    &cte->host->conf.ttl, sizeof(int)) == -1)
+				goto bad;
+			break;
+		case AF_INET6:
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS,
+			    &cte->host->conf.ttl, sizeof(int)) == -1)
+				goto bad;
+			break;
+		}
 
 	bcopy(&cte->table->conf.timeout, &tv, sizeof(tv));
 	if (connect(s, (struct sockaddr *)&cte->host->conf.ss, len) == -1) {
@@ -127,7 +131,7 @@ tcp_write(int s, short event, void *arg)
 
 	len = sizeof(err);
 	if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len))
-		fatal("tcp_write: getsockopt");
+		fatal("%s: getsockopt", __func__);
 	if (err != 0) {
 		tcp_close(cte, HOST_DOWN);
 		hce_notify_done(cte->host, HCE_TCP_CONNECT_FAIL);
@@ -145,10 +149,8 @@ tcp_close(struct ctl_tcp_event *cte, int status)
 	cte->s = -1;
 	if (status != 0)
 		cte->host->up = status;
-	if (cte->buf) {
-		ibuf_free(cte->buf);
-		cte->buf = NULL;
-	}
+	ibuf_free(cte->buf);
+	cte->buf = NULL;
 }
 
 void
@@ -176,7 +178,7 @@ tcp_host_up(struct ctl_tcp_event *cte)
 	}
 
 	if (cte->table->conf.flags & F_TLS) {
-		ssl_transaction(cte);
+		check_tls(cte);
 		return;
 	}
 
@@ -188,7 +190,7 @@ tcp_host_up(struct ctl_tcp_event *cte)
 	}
 
 	if ((cte->buf = ibuf_dynamic(SMALL_READ_BUF_SIZE, UINT_MAX)) == NULL)
-		fatalx("tcp_host_up: cannot create dynamic buffer");
+		fatalx("%s: cannot create dynamic buffer", __func__);
 	event_again(&cte->ev, cte->s, EV_TIMEOUT|EV_READ, tcp_read_buf,
 	    &cte->tv_start, &cte->table->conf.timeout, cte);
 }
@@ -221,7 +223,7 @@ tcp_send_req(int s, short event, void *arg)
 	} while (len > 0);
 
 	if ((cte->buf = ibuf_dynamic(SMALL_READ_BUF_SIZE, UINT_MAX)) == NULL)
-		fatalx("tcp_send_req: cannot create dynamic buffer");
+		fatalx("%s: cannot create dynamic buffer", __func__);
 	event_again(&cte->ev, s, EV_TIMEOUT|EV_READ, tcp_read_buf,
 	    &cte->tv_start, &cte->table->conf.timeout, cte);
 	return;
@@ -239,8 +241,12 @@ tcp_read_buf(int s, short event, void *arg)
 	struct ctl_tcp_event	*cte = arg;
 
 	if (event == EV_TIMEOUT) {
-		tcp_close(cte, HOST_DOWN);
-		hce_notify_done(cte->host, HCE_TCP_READ_TIMEOUT);
+		if (ibuf_size(cte->buf))
+			(void)cte->validate_close(cte);
+		else
+			cte->host->he = HCE_TCP_READ_TIMEOUT;
+		tcp_close(cte, cte->host->up == HOST_UP ? 0 : HOST_DOWN);
+		hce_notify_done(cte->host, cte->host->he);
 		return;
 	}
 
@@ -261,7 +267,7 @@ tcp_read_buf(int s, short event, void *arg)
 		return;
 	default:
 		if (ibuf_add(cte->buf, rbuf, br) == -1)
-			fatal("tcp_read_buf: buf_add error");
+			fatal("%s: buf_add error", __func__);
 		if (cte->validate_read != NULL) {
 			if (cte->validate_read(cte) != 0)
 				goto retry;
@@ -324,6 +330,7 @@ check_http_code(struct ctl_tcp_event *cte)
 	head = cte->buf->buf;
 	host = cte->host;
 	host->he = HCE_HTTP_CODE_ERROR;
+	host->code = 0;
 
 	if (strncmp(head, "HTTP/1.1 ", strlen("HTTP/1.1 ")) &&
 	    strncmp(head, "HTTP/1.0 ", strlen("HTTP/1.0 "))) {
@@ -346,10 +353,11 @@ check_http_code(struct ctl_tcp_event *cte)
 		return (1);
 	}
 	if (code != cte->table->conf.retcode) {
-		log_debug("%s: %s failed (invalid HTTP code returned)",
-		    __func__, host->conf.name);
+		log_debug("%s: %s failed (invalid HTTP code %d returned)",
+		    __func__, host->conf.name, code);
 		host->he = HCE_HTTP_CODE_FAIL;
 		host->up = HOST_DOWN;
+		host->code = code;
 	} else {
 		host->he = HCE_HTTP_CODE_OK;
 		host->up = HOST_UP;
