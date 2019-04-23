@@ -76,7 +76,7 @@ script_done(struct relayd *env, struct ctl_script *scr)
 }
 
 void
-script_sig_alarm(int sig)
+script_sig_alarm(int)
 {
 	int save_errno = errno;
 
