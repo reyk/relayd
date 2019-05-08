@@ -28,5 +28,3 @@ The official relayd page can be found at [bsd.plumbing](http://bsd.plumbing/).
 
 See [`LICENSE.md`](https://github.com/reyk/relayd/blob/master/LICENSE.md)
 for information about copyright and licensing.
-
-[![Flattr this git repo](http://api.flattr.com/button/flattr-badge-large.png)](https://flattr.com/thing/1094377/OpenBSD-relayd)

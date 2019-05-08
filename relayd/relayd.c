@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.169 2017/05/31 04:14:34 jsg Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.175 2019/04/24 19:13:49 mestre Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -184,6 +184,7 @@ main(int argc, char *argv[])
 	TAILQ_INIT(&env->sc_hosts);
 	TAILQ_INIT(&env->sc_sessions);
 	env->sc_rtable = getrtable();
+	env->sc_snmp = -1;
 	/* initialize the TLS session id to a random key for all relay procs */
 	arc4random_buf(env->sc_conf.tls_sid, sizeof(env->sc_conf.tls_sid));
 
@@ -199,9 +200,6 @@ main(int argc, char *argv[])
 	if ((ps->ps_pw =  getpwnam(RELAYD_USER)) == NULL)
 		errx(1, "unknown user %s", RELAYD_USER);
 
-	/* Configure the control socket */
-	ps->ps_csock.cs_name = RELAYD_SOCKET;
-
 	log_init(debug, LOG_DAEMON);
 	log_setverbose(verbose);
 
@@ -215,7 +213,7 @@ main(int argc, char *argv[])
 		ps->ps_title[proc_id] = title;
 
 	/* only the parent returns */
-	proc_init(ps, procs, nitems(procs), argc0, argv, proc_id);
+	proc_init(ps, procs, nitems(procs), debug, argc0, argv, proc_id);
 
 	log_procinit("parent");
 	if (!debug && daemon(1, 0) == -1)
@@ -223,6 +221,11 @@ main(int argc, char *argv[])
 
 	if (ps->ps_noaction == 0)
 		log_info("startup");
+
+	if (unveil("/", "r") == -1)
+		err(1, "unveil");
+	if (unveil(NULL, NULL) == -1)
+		err(1, "unveil");
 
 	event_init();
 
@@ -294,9 +297,7 @@ parent_configure(struct relayd *env)
 	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry) {
 		/* Check for TLS Inspection */
 		if ((rlay->rl_conf.flags & (F_TLS|F_TLSCLIENT)) ==
-		    (F_TLS|F_TLSCLIENT) &&
-		    rlay->rl_conf.tls_cacert_len &&
-		    rlay->rl_conf.tls_cakey_len)
+		    (F_TLS|F_TLSCLIENT) && rlay->rl_tls_cacert_fd != -1)
 			rlay->rl_conf.flags |= F_TLSINSPECT;
 
 		config_setrelay(env, rlay);
@@ -563,7 +564,7 @@ purge_relay(struct relayd *env, struct relay *rlay)
 	/* cleanup sessions */
 	while ((con =
 	    SPLAY_ROOT(&rlay->rl_sessions)) != NULL)
-		relay_close(con, NULL);
+		relay_close(con, NULL, 0);
 
 	/* cleanup relay */
 	if (rlay->rl_bev != NULL)
@@ -571,9 +572,7 @@ purge_relay(struct relayd *env, struct relay *rlay)
 	if (rlay->rl_dstbev != NULL)
 		bufferevent_free(rlay->rl_dstbev);
 
-	purge_key(&rlay->rl_tls_cert, rlay->rl_conf.tls_cert_len);
 	purge_key(&rlay->rl_tls_key, rlay->rl_conf.tls_key_len);
-	purge_key(&rlay->rl_tls_ca, rlay->rl_conf.tls_ca_len);
 	purge_key(&rlay->rl_tls_cakey, rlay->rl_conf.tls_cakey_len);
 
 	if (rlay->rl_tls_pkey != NULL) {

@@ -1,4 +1,4 @@
-/*	$OpenBSD: hce.c,v 1.77 2017/05/28 10:39:15 benno Exp $	*/
+/*	$OpenBSD: hce.c,v 1.79 2018/08/06 17:31:31 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -80,8 +80,7 @@ hce_setup_events(void)
 	struct timeval	 tv;
 	struct table	*table;
 
-	if (!(TAILQ_EMPTY(env->sc_tables) ||
-	    event_initialized(&env->sc_ev))) {
+	if (!event_initialized(&env->sc_ev)) {
 		evtimer_set(&env->sc_ev, hce_launch_checks, env);
 		bzero(&tv, sizeof(tv));
 		evtimer_add(&env->sc_ev, &tv);
@@ -198,7 +197,7 @@ hce_notify_done(struct host *host, enum host_error he)
 	struct ctl_status	 st;
 	struct timeval		 tv_now, tv_dur;
 	u_long			 duration;
-	u_int			 logopt;
+	u_int			 logopt = RELAYD_OPT_LOGHOSTCHECK;
 	struct host		*h, *hostnst;
 	int			 hostup;
 	const char		*msg;
@@ -249,8 +248,6 @@ hce_notify_done(struct host *host, enum host_error he)
 	proc_compose(env->sc_ps, PROC_PFE, IMSG_HOST_STATUS, &st, sizeof(st));
 	if (host->up != host->last_up)
 		logopt = RELAYD_OPT_LOGUPDATE;
-	else
-		logopt = RELAYD_OPT_LOGNOTIFY;
 
 	getmonotime(&tv_now);
 	timersub(&tv_now, &host->cte.tv_start, &tv_dur);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.215 2017/05/27 08:33:25 claudio Exp $	*/
+/*	$OpenBSD: parse.y,v 1.233 2019/03/13 23:29:32 benno Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -63,6 +63,10 @@ static struct file {
 	TAILQ_ENTRY(file)	 entry;
 	FILE			*stream;
 	char			*name;
+	size_t			 ungetpos;
+	size_t			 ungetsize;
+	u_char			*ungetbuf;
+	int			 eof_reached;
 	int			 lineno;
 	int			 errors;
 } *file, *topfile;
@@ -74,8 +78,9 @@ int		 yylex(void);
 int		 yyerror(const char *, ...);
 int		 kw_cmp(const void *, const void *);
 int		 lookup(char *);
+int		 igetc(void);
 int		 lgetc(int);
-int		 lungetc(int);
+void		 lungetc(int);
 int		 findeol(void);
 
 TAILQ_HEAD(symhead, sym)	 symhead = TAILQ_HEAD_INITIALIZER(symhead);
@@ -99,7 +104,6 @@ objid_t			 last_relay_id = 0;
 objid_t			 last_proto_id = 0;
 objid_t			 last_rt_id = 0;
 objid_t			 last_nr_id = 0;
-objid_t			 last_key_id = 0;
 
 static struct rdr	*rdr = NULL;
 static struct table	*table = NULL;
@@ -119,8 +123,7 @@ static enum direction	 dir = RELAY_DIR_ANY;
 static char		*rulefile = NULL;
 static union hashkey	*hashkey = NULL;
 
-struct address	*host_v4(const char *);
-struct address	*host_v6(const char *);
+struct address	*host_ip(const char *);
 int		 host_dns(const char *, struct addresslist *,
 		    int, struct portrange *, const char *, int);
 int		 host_if(const char *, struct addresslist *,
@@ -164,15 +167,16 @@ typedef struct {
 
 %token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK CIPHERS CODE
 %token	COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK EXTERNAL FILENAME
-%token	FORWARD FROM HASH HEADER HOST ICMP INCLUDE INET INET6 INTERFACE
-%token	INTERVAL IP LABEL LISTEN VALUE LOADBALANCE LOG LOOKUP METHOD MODE NAT
-%token	NO DESTINATION NODELAY NOTHING ON PARENT PATH PFTAG PORT PREFORK
-%token	PRIORITY PROTO QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST RESPONSE
-%token	RETRY QUICK RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SNMP
-%token	SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TLS TO
-%token	ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE
-%token	MATCH PARAMS RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH
-%token	EDH CURVE TICKETS
+%token	FORWARD FROM HASH HEADER HEADERLEN HOST HTTP ICMP INCLUDE INET INET6
+%token	INTERFACE INTERVAL IP LABEL LISTEN VALUE LOADBALANCE LOG LOOKUP METHOD
+%token	MODE NAT NO DESTINATION NODELAY NOTHING ON PARENT PATH PFTAG PORT
+%token	PREFORK PRIORITY PROTO QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST
+%token	RESPONSE RETRY QUICK RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION
+%token	SNMP SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TLS
+%token	TO ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL WITH TTL RTABLE
+%token	MATCH PARAMS RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDHE
+%token	EDH TICKETS CONNECTION CONNECTIONS ERRORS STATE CHANGES CHECKS
+%token	WEBSOCKETS
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table value optstring
@@ -237,11 +241,10 @@ opttlsclient	: /*empty*/	{ $$ = 0; }
 		| WITH ssltls	{ $$ = 1; }
 		;
 
-http_type	: STRING	{
+http_type	: HTTP		{ $$ = 0; }
+		| STRING	{
 			if (strcmp("https", $1) == 0) {
 				$$ = 1;
-			} else if (strcmp("http", $1) == 0) {
-				$$ = 0;
 			} else {
 				yyerror("invalid check type: %s", $1);
 				free($1);
@@ -265,10 +268,9 @@ hostname	: /* empty */		{
 
 relay_proto	: /* empty */			{ $$ = RELAY_PROTO_TCP; }
 		| TCP				{ $$ = RELAY_PROTO_TCP; }
+		| HTTP				{ $$ = RELAY_PROTO_HTTP; }
 		| STRING			{
-			if (strcmp("http", $1) == 0) {
-				$$ = RELAY_PROTO_HTTP;
-			} else if (strcmp("dns", $1) == 0) {
+			if (strcmp("dns", $1) == 0) {
 				$$ = RELAY_PROTO_DNS;
 			} else {
 				yyerror("invalid protocol type: %s", $1);
@@ -311,7 +313,15 @@ eflags		: STYLE STRING
 		}
 		;
 
-port		: PORT STRING {
+port		: PORT HTTP {
+			int p = 0;
+			$$.op = PF_OP_EQ;
+			if ((p = getservice("http")) == -1)
+				YYERROR;
+			$$.val[0] = p;
+			$$.val[1] = 0;
+		}
+		| PORT STRING {
 			char		*a, *b;
 			int		 p[2];
 
@@ -338,7 +348,7 @@ port		: PORT STRING {
 			free($2);
 		}
 		| PORT NUMBER {
-			if ($2 <= 0 || $2 >= (int)USHRT_MAX) {
+			if ($2 <= 0 || $2 > (int)USHRT_MAX) {
 				yyerror("invalid port: %d", $2);
 				YYERROR;
 			}
@@ -353,6 +363,8 @@ varset		: STRING '=' STRING	{
 				if (isspace((unsigned char)*s)) {
 					yyerror("macro name cannot contain "
 					    "whitespace");
+					free($1);
+					free($3);
 					YYERROR;
 				}
 			}
@@ -413,13 +425,31 @@ main		: INTERVAL NUMBER	{
 				    AGENTX_SOCKET,
 				    sizeof(conf->sc_conf.snmp_path));
 		}
+		| SOCKET STRING {
+			conf->sc_ps->ps_csock.cs_name = $2;
+		}
 		;
 
 trap		: /* nothing */		{ $$ = 0; }
 		| TRAP			{ $$ = 1; }
 
-loglevel	: UPDATES		{ $$ = RELAYD_OPT_LOGUPDATE; }
-		| ALL			{ $$ = RELAYD_OPT_LOGALL; }
+loglevel	: UPDATES		{ /* remove 6.4-current */
+					  $$ = RELAYD_OPT_LOGUPDATE;
+					  log_warnx("log updates deprecated, "
+					      "update configuration");
+					}
+		| STATE CHANGES		{ $$ = RELAYD_OPT_LOGUPDATE; }
+		| HOST CHECKS		{ $$ = RELAYD_OPT_LOGHOSTCHECK; }
+		| ALL			{ /* remove 6.4-current */
+					  $$ = (RELAYD_OPT_LOGHOSTCHECK|
+						RELAYD_OPT_LOGCON|
+						RELAYD_OPT_LOGCONERR);
+					  log_warnx("log all deprecated, "
+					      "update configuration");
+					}
+		| CONNECTION		{ $$ = (RELAYD_OPT_LOGCON |
+						RELAYD_OPT_LOGCONERR); }
+		| CONNECTION ERRORS	{ $$ = RELAYD_OPT_LOGCONERR; }
 		;
 
 rdr		: REDIRECT STRING	{
@@ -996,11 +1026,12 @@ proto		: relay_proto PROTO STRING	{
 			p->tcpflags = TCPFLAG_DEFAULT;
 			p->tlsflags = TLSFLAG_DEFAULT;
 			p->tcpbacklog = RELAY_BACKLOG;
+			p->httpheaderlen = RELAY_DEFHEADERLENGTH;
 			TAILQ_INIT(&p->rules);
 			(void)strlcpy(p->tlsciphers, TLSCIPHERS_DEFAULT,
 			    sizeof(p->tlsciphers));
-			(void)strlcpy(p->tlsecdhcurve, TLSECDHCURVE_DEFAULT,
-			    sizeof(p->tlsecdhcurve));
+			(void)strlcpy(p->tlsecdhecurves, TLSECDHECURVES_DEFAULT,
+			    sizeof(p->tlsecdhecurves));
 			(void)strlcpy(p->tlsdhparams, TLSDHPARAM_DEFAULT,
 			    sizeof(p->tlsdhparams));
 			if (last_proto_id == INT_MAX) {
@@ -1034,10 +1065,40 @@ protoptsl	: ssltls tlsflags
 		| ssltls '{' tlsflags_l '}'
 		| TCP tcpflags
 		| TCP '{' tcpflags_l '}'
+		| HTTP {
+			if (proto->type != RELAY_PROTO_HTTP) {
+				yyerror("can set http options only for "
+				    "http protocol");
+				YYERROR;
+			}
+		} httpflags
+		| HTTP  {
+			if (proto->type != RELAY_PROTO_HTTP) {
+				yyerror("can set http options only for "
+				    "http protocol");
+				YYERROR;
+			}
+		} '{' httpflags_l '}'
 		| RETURN ERROR opteflags	{ proto->flags |= F_RETURN; }
 		| RETURN ERROR '{' eflags_l '}'	{ proto->flags |= F_RETURN; }
 		| filterrule
 		| include
+		;
+
+
+httpflags_l	: httpflags comma httpflags_l
+		| httpflags
+		;
+
+httpflags	: HEADERLEN NUMBER	{
+			if ($2 < 0 || $2 > RELAY_MAXHEADERLENGTH) {
+				yyerror("invalid headerlen: %d", $2);
+				YYERROR;
+			}
+			proto->httpheaderlen = $2;
+		}
+		| WEBSOCKETS	{ proto->httpflags |= HTTPFLAG_WEBSOCKETS; }
+		| NO WEBSOCKETS	{ proto->httpflags &= ~HTTPFLAG_WEBSOCKETS; }
 		;
 
 tcpflags_l	: tcpflags comma tcpflags_l
@@ -1051,7 +1112,7 @@ tcpflags	: SACK			{ proto->tcpflags |= TCPFLAG_SACK; }
 		| SPLICE		{ /* default */ }
 		| NO SPLICE		{ proto->tcpflags |= TCPFLAG_NSPLICE; }
 		| BACKLOG NUMBER	{
-			if ($2 < 0 || $2 > RELAY_MAX_SESSIONS) {
+			if ($2 < 0 || $2 > RELAY_MAX_BACKLOG) {
 				yyerror("invalid backlog: %d", $2);
 				YYERROR;
 			}
@@ -1133,37 +1194,29 @@ tlsflags	: SESSION TICKETS { proto->tickets = 1; }
 			}
 			free($3);
 		}
-		| NO ECDH			{
-			(void)strlcpy(proto->tlsecdhcurve, "none",
-			    sizeof(proto->tlsecdhcurve));
-		}
-		| ECDH			{
-			(void)strlcpy(proto->tlsecdhcurve, "auto",
-			    sizeof(proto->tlsecdhcurve));
-		}
-		| ECDH CURVE STRING			{
+		| ECDHE STRING			{
 			struct tls_config	*tls_cfg;
 			if ((tls_cfg = tls_config_new()) == NULL) {
 				yyerror("tls_config_new failed");
-				free($3);
+				free($2);
 				YYERROR;
 			}
-			if (tls_config_set_ecdhecurve(tls_cfg, $3) != 0) {
-				yyerror("tls ecdh curve %s: %s", $3,
+			if (tls_config_set_ecdhecurves(tls_cfg, $2) != 0) {
+				yyerror("tls ecdhe %s: %s", $2,
 				    tls_config_error(tls_cfg));
 				tls_config_free(tls_cfg);
-				free($3);
+				free($2);
 				YYERROR;
 			}
 			tls_config_free(tls_cfg);
-			if (strlcpy(proto->tlsecdhcurve, $3,
-			    sizeof(proto->tlsecdhcurve)) >=
-			    sizeof(proto->tlsecdhcurve)) {
-				yyerror("tls ecdh truncated");
-				free($3);
+			if (strlcpy(proto->tlsecdhecurves, $2,
+			    sizeof(proto->tlsecdhecurves)) >=
+			    sizeof(proto->tlsecdhecurves)) {
+				yyerror("tls ecdhe curves truncated");
+				free($2);
 				YYERROR;
 			}
-			free($3);
+			free($2);
 		}
 		| CA FILENAME STRING		{
 			if (strlcpy(proto->tlsca, $3,
@@ -1641,6 +1694,9 @@ relay		: RELAY STRING	{
 			r->rl_proto = NULL;
 			r->rl_conf.proto = EMPTY_ID;
 			r->rl_conf.dstretry = 0;
+			r->rl_tls_cert_fd = -1;
+			r->rl_tls_ca_fd = -1;
+			r->rl_tls_cacert_fd = -1;
 			TAILQ_INIT(&r->rl_tables);
 			if (last_relay_id == INT_MAX) {
 				yyerror("too many relays defined");
@@ -2191,18 +2247,21 @@ lookup(char *s)
 		{ "ca",			CA },
 		{ "cache",		CACHE },
 		{ "cert",		CERTIFICATE },
+		{ "changes",		CHANGES },
 		{ "check",		CHECK },
+		{ "checks",		CHECKS },
 		{ "ciphers",		CIPHERS },
 		{ "code",		CODE },
+		{ "connection",		CONNECTION },
 		{ "cookie",		COOKIE },
-		{ "curve",		CURVE },
 		{ "demote",		DEMOTE },
 		{ "destination",	DESTINATION },
 		{ "digest",		DIGEST },
 		{ "disable",		DISABLE },
-		{ "ecdh",		ECDH },
+		{ "ecdhe",		ECDHE },
 		{ "edh",		EDH },
 		{ "error",		ERROR },
+		{ "errors",		ERRORS },
 		{ "expect",		EXPECT },
 		{ "external",		EXTERNAL },
 		{ "file",		FILENAME },
@@ -2210,7 +2269,9 @@ lookup(char *s)
 		{ "from",		FROM },
 		{ "hash",		HASH },
 		{ "header",		HEADER },
+		{ "headerlen",		HEADERLEN },
 		{ "host",		HOST },
+		{ "http",		HTTP },
 		{ "icmp",		ICMP },
 		{ "include",		INCLUDE },
 		{ "inet",		INET },
@@ -2269,6 +2330,7 @@ lookup(char *s)
 		{ "source-hash",	SRCHASH },
 		{ "splice",		SPLICE },
 		{ "ssl",		SSL },
+		{ "state",		STATE },
 		{ "sticky-address",	STICKYADDR },
 		{ "style",		STYLE },
 		{ "table",		TABLE },
@@ -2285,7 +2347,7 @@ lookup(char *s)
 		{ "updates",		UPDATES },
 		{ "url",		URL },
 		{ "value",		VALUE },
-		{ "virtual",		VIRTUAL },
+		{ "websockets",		WEBSOCKETS },
 		{ "with",		WITH }
 	};
 	const struct keywords	*p;
@@ -2299,34 +2361,39 @@ lookup(char *s)
 		return (STRING);
 }
 
-#define MAXPUSHBACK	128
 
-u_char	*parsebuf;
-int	 parseindex;
-u_char	 pushback_buffer[MAXPUSHBACK];
-int	 pushback_index = 0;
+#define START_EXPAND	1
+#define DONE_EXPAND	2
+
+static int	expanding;
+
+int
+igetc(void)
+{
+	int	c;
+
+	while (1) {
+		if (file->ungetpos > 0)
+			c = file->ungetbuf[--file->ungetpos];
+		else c = getc(file->stream);
+
+		if (c == START_EXPAND)
+			expanding = 1;
+		else if (c == DONE_EXPAND)
+			expanding = 0;
+		else
+			break;
+	}
+	return (c);
+}
 
 int
 lgetc(int quotec)
 {
 	int		c, next;
 
-	if (parsebuf) {
-		/* Read character from the parsebuffer instead of input. */
-		if (parseindex >= 0) {
-			c = parsebuf[parseindex++];
-			if (c != '\0')
-				return (c);
-			parsebuf = NULL;
-		} else
-			parseindex++;
-	}
-
-	if (pushback_index)
-		return (pushback_buffer[--pushback_index]);
-
 	if (quotec) {
-		if ((c = getc(file->stream)) == EOF) {
+		if ((c = igetc()) == EOF) {
 			yyerror("reached end of file while parsing "
 			    "quoted string");
 			if (file == topfile || popfile() == EOF)
@@ -2336,8 +2403,8 @@ lgetc(int quotec)
 		return (c);
 	}
 
-	while ((c = getc(file->stream)) == '\\') {
-		next = getc(file->stream);
+	while ((c = igetc()) == '\\') {
+		next = igetc();
 		if (next != '\n') {
 			c = next;
 			break;
@@ -2346,28 +2413,39 @@ lgetc(int quotec)
 		file->lineno++;
 	}
 
-	while (c == EOF) {
-		if (file == topfile || popfile() == EOF)
-			return (EOF);
-		c = getc(file->stream);
+	if (c == EOF) {
+		/*
+		 * Fake EOL when hit EOF for the first time. This gets line
+		 * count right if last line in included file is syntactically
+		 * invalid and has no newline.
+		 */
+		if (file->eof_reached == 0) {
+			file->eof_reached = 1;
+			return ('\n');
+		}
+		while (c == EOF) {
+			if (file == topfile || popfile() == EOF)
+				return (EOF);
+			c = igetc();
+		}
 	}
 	return (c);
 }
 
-int
+void
 lungetc(int c)
 {
 	if (c == EOF)
-		return (EOF);
-	if (parsebuf) {
-		parseindex--;
-		if (parseindex >= 0)
-			return (c);
+		return;
+
+	if (file->ungetpos >= file->ungetsize) {
+		void *p = reallocarray(file->ungetbuf, file->ungetsize, 2);
+		if (p == NULL)
+			err(1, "%s", __func__);
+		file->ungetbuf = p;
+		file->ungetsize *= 2;
 	}
-	if (pushback_index < MAXPUSHBACK-1)
-		return (pushback_buffer[pushback_index++] = c);
-	else
-		return (EOF);
+	file->ungetbuf[file->ungetpos++] = c;
 }
 
 int
@@ -2375,14 +2453,9 @@ findeol(void)
 {
 	int	c;
 
-	parsebuf = NULL;
-
 	/* skip to either EOF or the first real EOL */
 	while (1) {
-		if (pushback_index)
-			c = pushback_buffer[--pushback_index];
-		else
-			c = lgetc(0);
+		c = lgetc(0);
 		if (c == '\n') {
 			file->lineno++;
 			break;
@@ -2410,7 +2483,7 @@ top:
 	if (c == '#')
 		while ((c = lgetc(0)) != '\n' && c != EOF)
 			; /* nothing */
-	if (c == '$' && parsebuf == NULL) {
+	if (c == '$' && !expanding) {
 		while (1) {
 			if ((c = lgetc(0)) == EOF)
 				return (0);
@@ -2432,8 +2505,13 @@ top:
 			yyerror("macro '%s' not defined", buf);
 			return (findeol());
 		}
-		parsebuf = val;
-		parseindex = 0;
+		p = val + strlen(val) - 1;
+		lungetc(DONE_EXPAND);
+		while (p >= val) {
+			lungetc(*p);
+			p--;
+		}
+		lungetc(START_EXPAND);
 		goto top;
 	}
 
@@ -2450,7 +2528,8 @@ top:
 			} else if (c == '\\') {
 				if ((next = lgetc(quotec)) == EOF)
 					return (0);
-				if (next == quotec || c == ' ' || c == '\t')
+				if (next == quotec || next == ' ' ||
+				    next == '\t')
 					c = next;
 				else if (next == '\n') {
 					file->lineno++;
@@ -2472,7 +2551,7 @@ top:
 		}
 		yylval.v.string = strdup(buf);
 		if (yylval.v.string == NULL)
-			err(1, "yylex: strdup");
+			err(1, "%s", __func__);
 		return (STRING);
 	}
 
@@ -2482,7 +2561,7 @@ top:
 	if (c == '-' || isdigit(c)) {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -2521,7 +2600,7 @@ nodigits:
 	if (isalnum(c) || c == ':' || c == '_') {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -2530,7 +2609,7 @@ nodigits:
 		*p = '\0';
 		if ((token = lookup(buf)) == STRING)
 			if ((yylval.v.string = strdup(buf)) == NULL)
-				err(1, "yylex: strdup");
+				err(1, "%s", __func__);
 		return (token);
 	}
 	if (c == '\n') {
@@ -2568,11 +2647,11 @@ pushfile(const char *name, int secret)
 	struct file	*nfile;
 
 	if ((nfile = calloc(1, sizeof(struct file))) == NULL) {
-		log_warn("%s: malloc", __func__);
+		log_warn("%s", __func__);
 		return (NULL);
 	}
 	if ((nfile->name = strdup(name)) == NULL) {
-		log_warn("%s: malloc", __func__);
+		log_warn("%s", __func__);
 		free(nfile);
 		return (NULL);
 	}
@@ -2588,7 +2667,16 @@ pushfile(const char *name, int secret)
 		free(nfile);
 		return (NULL);
 	}
-	nfile->lineno = 1;
+	nfile->lineno = TAILQ_EMPTY(&files) ? 1 : 0;
+	nfile->ungetsize = 16;
+	nfile->ungetbuf = malloc(nfile->ungetsize);
+	if (nfile->ungetbuf == NULL) {
+		log_warn("%s", __func__);
+		fclose(nfile->stream);
+		free(nfile->name);
+		free(nfile);
+		return (NULL);
+	}
 	TAILQ_INSERT_TAIL(&files, nfile, entry);
 	return (nfile);
 }
@@ -2604,6 +2692,7 @@ popfile(void)
 	TAILQ_REMOVE(&files, file, entry);
 	fclose(file->stream);
 	free(file->name);
+	free(file->ungetbuf);
 	free(file);
 	file = prev;
 	return (file ? 0 : EOF);
@@ -2630,7 +2719,8 @@ parse_config(const char *filename, struct relayd *x_conf)
 
 	yyparse();
 	errors = file->errors;
-	popfile();
+	while (popfile() != EOF)
+		;
 
 	endservent();
 	endprotoent();
@@ -2678,7 +2768,8 @@ load_config(const char *filename, struct relayd *x_conf)
 
 	yyparse();
 	errors = file->errors;
-	popfile();
+	while (popfile() != EOF)
+		;
 
 	endservent();
 	endprotoent();
@@ -2821,17 +2912,12 @@ cmdline_symset(char *s)
 {
 	char	*sym, *val;
 	int	ret;
-	size_t	len;
 
 	if ((val = strrchr(s, '=')) == NULL)
 		return (-1);
-
-	len = strlen(s) - strlen(val) + 1;
-	if ((sym = malloc(len)) == NULL)
-		errx(1, "cmdline_symset: malloc");
-
-	(void)strlcpy(sym, s, len);
-
+	sym = strndup(s, val - s);
+	if (sym == NULL)
+		errx(1, "%s: strndup", __func__);
 	ret = symset(sym, val + 1, 1);
 	free(sym);
 
@@ -2853,49 +2939,22 @@ symget(const char *nam)
 }
 
 struct address *
-host_v4(const char *s)
+host_ip(const char *s)
 {
-	struct in_addr		 ina;
-	struct sockaddr_in	*sain;
-	struct address		*h;
+	struct addrinfo	 hints, *res;
+	struct address	*h = NULL;
 
-	bzero(&ina, sizeof(ina));
-	if (inet_pton(AF_INET, s, &ina) != 1)
-		return (NULL);
-
-	if ((h = calloc(1, sizeof(*h))) == NULL)
-		fatal(__func__);
-	sain = (struct sockaddr_in *)&h->ss;
-	sain->sin_len = sizeof(struct sockaddr_in);
-	sain->sin_family = AF_INET;
-	sain->sin_addr.s_addr = ina.s_addr;
-
-	return (h);
-}
-
-struct address *
-host_v6(const char *s)
-{
-	struct addrinfo		 hints, *res;
-	struct sockaddr_in6	*sa_in6;
-	struct address		*h = NULL;
-
-	bzero(&hints, sizeof(hints));
-	hints.ai_family = AF_INET6;
-	hints.ai_socktype = SOCK_DGRAM; /* dummy */
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM; /*dummy*/
 	hints.ai_flags = AI_NUMERICHOST;
 	if (getaddrinfo(s, "0", &hints, &res) == 0) {
-		if ((h = calloc(1, sizeof(*h))) == NULL)
-			fatal(__func__);
-		sa_in6 = (struct sockaddr_in6 *)&h->ss;
-		sa_in6->sin6_len = sizeof(struct sockaddr_in6);
-		sa_in6->sin6_family = AF_INET6;
-		memcpy(&sa_in6->sin6_addr,
-		    &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
-		    sizeof(sa_in6->sin6_addr));
-		sa_in6->sin6_scope_id =
-		    ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
-
+		if (res->ai_family == AF_INET ||
+		    res->ai_family == AF_INET6) {
+			if ((h = calloc(1, sizeof(*h))) == NULL)
+				fatal(NULL);
+			memcpy(&h->ss, res->ai_addr, res->ai_addrlen);
+		}
 		freeaddrinfo(res);
 	}
 
@@ -2908,15 +2967,13 @@ host_dns(const char *s, struct addresslist *al, int max,
 {
 	struct addrinfo		 hints, *res0, *res;
 	int			 error, cnt = 0;
-	struct sockaddr_in	*sain;
-	struct sockaddr_in6	*sin6;
 	struct address		*h;
 
 	if ((cnt = host_if(s, al, max, port, ifname, ipproto)) != 0)
 		return (cnt);
 
 	bzero(&hints, sizeof(hints));
-	hints.ai_family = PF_UNSPEC;
+	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM; /* DUMMY */
 	hints.ai_flags = AI_ADDRCONFIG;
 	error = getaddrinfo(s, NULL, &hints, &res0);
@@ -2948,19 +3005,8 @@ host_dns(const char *s, struct addresslist *al, int max,
 		}
 		if (ipproto != -1)
 			h->ipproto = ipproto;
-		h->ss.ss_family = res->ai_family;
 
-		if (res->ai_family == AF_INET) {
-			sain = (struct sockaddr_in *)&h->ss;
-			sain->sin_len = sizeof(struct sockaddr_in);
-			sain->sin_addr.s_addr = ((struct sockaddr_in *)
-			    res->ai_addr)->sin_addr.s_addr;
-		} else {
-			sin6 = (struct sockaddr_in6 *)&h->ss;
-			sin6->sin6_len = sizeof(struct sockaddr_in6);
-			memcpy(&sin6->sin6_addr, &((struct sockaddr_in6 *)
-			    res->ai_addr)->sin6_addr, sizeof(struct in6_addr));
-		}
+		memcpy(&h->ss, res->ai_addr, res->ai_addrlen);
 
 		TAILQ_INSERT_HEAD(al, h, entry);
 		cnt++;
@@ -3047,34 +3093,27 @@ int
 host(const char *s, struct addresslist *al, int max,
     struct portrange *port, const char *ifname, int ipproto)
 {
-	struct address *h;
+	struct address	*h;
 
-	h = host_v4(s);
+	if ((h = host_ip(s)) == NULL)
+		return (host_dns(s, al, max, port, ifname, ipproto));
 
-	/* IPv6 address? */
-	if (h == NULL)
-		h = host_v6(s);
-
-	if (h != NULL) {
-		if (port != NULL)
-			bcopy(port, &h->port, sizeof(h->port));
-		if (ifname != NULL) {
-			if (strlcpy(h->ifname, ifname, sizeof(h->ifname)) >=
-			    sizeof(h->ifname)) {
-				log_warnx("%s: interface name truncated",
-				    __func__);
-				free(h);
-				return (-1);
-			}
+	if (port != NULL)
+		bcopy(port, &h->port, sizeof(h->port));
+	if (ifname != NULL) {
+		if (strlcpy(h->ifname, ifname, sizeof(h->ifname)) >=
+		    sizeof(h->ifname)) {
+			log_warnx("%s: interface name truncated",
+			    __func__);
+			free(h);
+			return (-1);
 		}
-		if (ipproto != -1)
-			h->ipproto = ipproto;
-
-		TAILQ_INSERT_HEAD(al, h, entry);
-		return (1);
 	}
+	if (ipproto != -1)
+		h->ipproto = ipproto;
 
-	return (host_dns(s, al, max, port, ifname, ipproto));
+	TAILQ_INSERT_HEAD(al, h, entry);
+	return (1);
 }
 
 void
@@ -3171,10 +3210,8 @@ int
 relay_id(struct relay *rl)
 {
 	rl->rl_conf.id = ++last_relay_id;
-	rl->rl_conf.tls_keyid = ++last_key_id;
-	rl->rl_conf.tls_cakeyid = ++last_key_id;
 
-	if (last_relay_id == INT_MAX || last_key_id == INT_MAX)
+	if (last_relay_id == INT_MAX)
 		return (-1);
 
 	return (0);
@@ -3194,8 +3231,9 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	rb->rl_conf.flags =
 	    (ra->rl_conf.flags & ~F_TLS) | (rc.flags & F_TLS);
 	if (!(rb->rl_conf.flags & F_TLS)) {
-		rb->rl_tls_cert = NULL;
-		rb->rl_conf.tls_cert_len = 0;
+		rb->rl_tls_cert_fd = -1;
+		rb->rl_tls_cacert_fd = -1;
+		rb->rl_tls_ca_fd = -1;
 		rb->rl_tls_key = NULL;
 		rb->rl_conf.tls_key_len = 0;
 	}
