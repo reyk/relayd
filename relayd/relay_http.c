@@ -1020,8 +1020,9 @@ void
 relay_abort_http(struct rsession *con, u_int code, const char *msg,
     u_int16_t labelid)
 {
+	struct ctl_relay_event	*in = &con->se_in;
 	struct relay		*rlay = con->se_relay;
-	struct bufferevent	*bev = con->se_in.bev;
+	struct bufferevent	*bev = in->bev;
 	const char		*httperr = NULL, *text = "";
 	char			*httpmsg, *body = NULL;
 	char			 tmbuf[32], hbuf[128];
@@ -1100,7 +1101,7 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 		goto done;
 
 	/* Dump the message without checking for success */
-	relay_dump(&con->se_in, httpmsg, strlen(httpmsg));
+	relay_dump(in, httpmsg, strlen(httpmsg));
 	free(httpmsg);
 
  done:
@@ -1116,10 +1117,12 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 void
 relay_close_http(struct rsession *con)
 {
-	relay_httpdesc_free(con->se_in.desc);
-	free(con->se_in.desc);
-	relay_httpdesc_free(con->se_out.desc);
-	free(con->se_out.desc);
+	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
+
+	relay_httpdesc_free(in->desc);
+	free(in->desc);
+	relay_httpdesc_free(out->desc);
+	free(out->desc);
 }
 
 char *
@@ -1534,6 +1537,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
     struct relay_table *tbl)
 {
 	struct rsession		*con = cre->con;
+	struct ctl_relay_event	*out = &con->se_out;
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*host = NULL;
 	const char		*value;
@@ -1724,7 +1728,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
 	 * This only works in the request direction.
 	 */
 	if (cre->dir == RELAY_DIR_REQUEST && con->se_table != tbl) {
-		relay_reset_event(con, &con->se_out);
+		relay_reset_event(con, out);
 		con->se_table = tbl;
 		con->se_haslog = 1;
 	}

@@ -211,17 +211,18 @@ relay_udp_response(int fd, short sig, void *arg)
 void
 relay_udp_server(int fd, short sig, void *arg)
 {
-	struct privsep *ps = env->sc_ps;
-	struct relay *rlay = arg;
-	struct protocol *proto = rlay->rl_proto;
-	struct rsession *con = NULL;
-	struct ctl_natlook *cnl = NULL;
-	socklen_t slen;
-	struct timeval tv;
-	struct sockaddr_storage ss;
-	u_int8_t buf[IBUF_READ_SIZE];
-	void *priv = NULL;
-	ssize_t len;
+	u_int8_t		 buf[IBUF_READ_SIZE];
+	struct privsep		*ps = env->sc_ps;
+	struct relay		*rlay = arg;
+	struct protocol		*proto = rlay->rl_proto;
+	struct rsession		*con = NULL;
+	struct ctl_relay_event	*in, *out;
+	struct ctl_natlook	*cnl = NULL;
+	socklen_t		 slen;
+	struct timeval		 tv;
+	struct sockaddr_storage	 ss;
+	void			*priv = NULL;
+	ssize_t			 len;
 
 	event_add(&rlay->rl_ev, NULL);
 
@@ -245,28 +246,33 @@ relay_udp_server(int fd, short sig, void *arg)
 	/*
 	 * Replace the DNS request Id with a random Id.
 	 */
-	con->se_priv = priv;
-	con->se_in.s = -1;
-	con->se_out.s = -1;
-	con->se_in.dst = &con->se_out;
-	con->se_out.dst = &con->se_in;
-	con->se_in.con = con;
-	con->se_out.con = con;
-	con->se_relay = rlay;
-	con->se_id = ++relay_conid;
-	con->se_in.dir = RELAY_DIR_REQUEST;
-	con->se_out.dir = RELAY_DIR_RESPONSE;
-	con->se_retry = rlay->rl_conf.dstretry;
-	con->se_out.port = rlay->rl_conf.dstport;
+	in = &con->se_in;
+	out = &con->se_out;
+
+	in->s = -1;
+	out->s = -1;
+	in->dst = &con->se_out;
+	out->dst = &con->se_in;
+	in->con = con;
+	out->con = con;
+	in->dir = RELAY_DIR_REQUEST;
+	out->dir = RELAY_DIR_RESPONSE;
+
+	bcopy(&ss, &in->ss, sizeof(in->ss));
 	switch (ss.ss_family) {
 	case AF_INET:
-		con->se_in.port = ((struct sockaddr_in *)&ss)->sin_port;
+		in->port = ((struct sockaddr_in *)&ss)->sin_port;
 		break;
 	case AF_INET6:
-		con->se_in.port = ((struct sockaddr_in6 *)&ss)->sin6_port;
+		in->port = ((struct sockaddr_in6 *)&ss)->sin6_port;
 		break;
 	}
-	bcopy(&ss, &con->se_in.ss, sizeof(con->se_in.ss));
+	out->port = rlay->rl_conf.dstport;
+
+	con->se_relay = rlay;
+	con->se_id = ++relay_conid;
+	con->se_retry = rlay->rl_conf.dstretry;
+	con->se_priv = priv;
 
 	getmonotime(&con->se_tv_start);
 	bcopy(&con->se_tv_start, &con->se_tv_last, sizeof(con->se_tv_last));
@@ -279,8 +285,8 @@ relay_udp_server(int fd, short sig, void *arg)
 	rlay->rl_stats[ps->ps_instance].last++;
 
 	/* Pre-allocate output buffer */
-	con->se_out.output = evbuffer_new();
-	if (con->se_out.output == NULL) {
+	out->output = evbuffer_new();
+	if (out->output == NULL) {
 		relay_close(con, "failed to allocate output buffer", 1);
 		return;
 	}
@@ -301,7 +307,7 @@ relay_udp_server(int fd, short sig, void *arg)
 	}
 
 	/* Save the received data */
-	if (evbuffer_add(con->se_out.output, buf, len) == -1) {
+	if (evbuffer_add(out->output, buf, len) == -1) {
 		relay_close(con, "failed to store buffer", 1);
 		free(cnl);
 		return;
@@ -314,7 +320,7 @@ relay_udp_server(int fd, short sig, void *arg)
 		cnl->id = con->se_id;
 		cnl->proc = ps->ps_instance;
 		cnl->proto = IPPROTO_UDP;
-		bcopy(&con->se_in.ss, &cnl->src, sizeof(cnl->src));
+		bcopy(&in->ss, &cnl->src, sizeof(cnl->src));
 		bcopy(&rlay->rl_conf.ss, &cnl->dst, sizeof(cnl->dst));
 		proc_compose(env->sc_ps, PROC_PFE,
 		    IMSG_NATLOOK, cnl, sizeof(*cnl));
@@ -401,6 +407,7 @@ void *
 relay_dns_validate(struct rsession *con, struct relay *rlay,
     struct sockaddr_storage *ss, u_int8_t *buf, size_t len)
 {
+	struct ctl_relay_event	*out = &con->se_out;
 	struct relay_dnshdr	*hdr = (struct relay_dnshdr *)buf;
 	struct rsession		 lookup;
 	u_int16_t		 key;
@@ -435,7 +442,7 @@ relay_dns_validate(struct rsession *con, struct relay *rlay,
 		if ((con = SPLAY_FIND(session_tree,
 		    &rlay->rl_sessions, &lookup)) != NULL &&
 		    con->se_priv != NULL &&
-		    relay_cmp_af(ss, &con->se_out.ss) == 0)
+		    relay_cmp_af(ss, &out->ss) == 0)
 			relay_dns_result(con, buf, len);
 	} else {
 		priv = con->se_priv;
@@ -455,10 +462,11 @@ relay_dns_validate(struct rsession *con, struct relay *rlay,
 int
 relay_dns_request(struct rsession *con)
 {
+	struct ctl_relay_event	*out = &con->se_out;
 	struct relay		*rlay = con->se_relay;
 	struct relay_dns_priv	*priv = con->se_priv;
-	u_int8_t		*buf = EVBUFFER_DATA(con->se_out.output);
-	size_t			 len = EVBUFFER_LENGTH(con->se_out.output);
+	u_int8_t		*buf = EVBUFFER_DATA(out->output);
+	size_t			 len = EVBUFFER_LENGTH(out->output);
 	struct relay_dnshdr	*hdr;
 	socklen_t		 slen;
 
@@ -472,23 +480,23 @@ relay_dns_request(struct rsession *con)
 	if (!TAILQ_EMPTY(&rlay->rl_tables)) {
 		if (relay_from_table(con) != 0)
 			return (-1);
-	} else if (con->se_out.ss.ss_family == AF_UNSPEC) {
-		bcopy(&rlay->rl_conf.dstss, &con->se_out.ss,
-		    sizeof(con->se_out.ss));
-		con->se_out.port = rlay->rl_conf.dstport;
+	} else if (out->ss.ss_family == AF_UNSPEC) {
+		bcopy(&rlay->rl_conf.dstss, &out->ss,
+		    sizeof(out->ss));
+		out->port = rlay->rl_conf.dstport;
 	}
 
-	if ((con->se_out.s = relay_udp_socket(&con->se_out.ss,
-	    con->se_out.port, rlay->rl_proto)) == -1)
+	if ((out->s = relay_udp_socket(&out->ss,
+	    out->port, rlay->rl_proto)) == -1)
 		return (-1);
-	slen = con->se_out.ss.ss_len;
+	slen = out->ss.ss_len;
 
 	hdr = (struct relay_dnshdr *)buf;
 	hdr->dns_id = htons(priv->dp_inkey);
 
  retry:
-	if (sendto(con->se_out.s, buf, len, 0,
-	    (struct sockaddr *)&con->se_out.ss, slen) == -1) {
+	if (sendto(out->s, buf, len, 0,
+	    (struct sockaddr *)&out->ss, slen) == -1) {
 		if (con->se_retry) {
 			con->se_retry--;
 			log_debug("%s: session %d: "
@@ -502,7 +510,7 @@ relay_dns_request(struct rsession *con)
 		return (-1);
 	}
 
-	event_again(&con->se_ev, con->se_out.s, EV_TIMEOUT|EV_READ,
+	event_again(&con->se_ev, out->s, EV_TIMEOUT|EV_READ,
 	    relay_udp_response, &con->se_tv_start, &rlay->rl_conf.timeout, con);
 
 	return (0);
@@ -511,6 +519,7 @@ relay_dns_request(struct rsession *con)
 void
 relay_dns_result(struct rsession *con, u_int8_t *buf, size_t len)
 {
+	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
 	struct relay		*rlay = con->se_relay;
 	struct relay_dns_priv	*priv = con->se_priv;
 	struct relay_dnshdr	*hdr;
@@ -528,9 +537,9 @@ relay_dns_result(struct rsession *con, u_int8_t *buf, size_t len)
 	hdr = (struct relay_dnshdr *)buf;
 	hdr->dns_id = htons(priv->dp_outkey);
 
-	slen = con->se_out.ss.ss_len;
+	slen = out->ss.ss_len;
 	if (sendto(rlay->rl_s, buf, len, 0,
-	    (struct sockaddr *)&con->se_in.ss, slen) == -1) {
+	    (struct sockaddr *)&in->ss, slen) == -1) {
 		relay_close(con, "response failed", 1);
 		return;
 	}
