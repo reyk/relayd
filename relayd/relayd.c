@@ -1312,7 +1312,7 @@ relay_load_fd(int fd, off_t *len)
 }
 
 int
-relay_load_certfiles(struct relayd *env, struct relay *rlay)
+relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 {
 	char	 certfile[PATH_MAX];
 	char	 hbuf[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
@@ -1350,7 +1350,11 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay)
 	if ((rlay->rl_conf.flags & F_TLS) == 0)
 		return (0);
 
-	if (print_host(&rlay->rl_conf.ss, hbuf, sizeof(hbuf)) == NULL)
+	if (name == NULL &&
+	    print_host(&rlay->rl_conf.ss, hbuf, sizeof(hbuf)) == NULL)
+		goto fail;
+	else if (name != NULL &&
+	    strlcpy(hbuf, name, sizeof(hbuf)) >= sizeof(hbuf))
 		goto fail;
 
 	if (snprintf(certfile, sizeof(certfile),

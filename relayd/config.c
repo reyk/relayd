@@ -104,6 +104,7 @@ config_init(struct relayd *env)
 		env->sc_proto_default.tcpflags = TCPFLAG_DEFAULT;
 		env->sc_proto_default.tcpbacklog = RELAY_BACKLOG;
 		env->sc_proto_default.tlsflags = TLSFLAG_DEFAULT;
+		TAILQ_INIT(&env->sc_proto_default.tlscerts);
 		(void)strlcpy(env->sc_proto_default.tlsciphers,
 		    TLSCIPHERS_DEFAULT,
 		    sizeof(env->sc_proto_default.tlsciphers));
@@ -146,6 +147,7 @@ config_purge(struct relayd *env, u_int reset)
 	struct netroute		*nr;
 	struct router		*rt;
 	struct ca_pkey		*pkey;
+	struct keyname		*keyname;
 	u_int			 what;
 
 	what = ps->ps_what[privsep_process] & reset;
@@ -191,6 +193,12 @@ config_purge(struct relayd *env, u_int reset)
 			free(proto->style);
 			free(proto->tlscapass);
 			free(proto);
+			while ((keyname =
+			    TAILQ_FIRST(&proto->tlscerts)) != NULL) {
+				TAILQ_REMOVE(&proto->tlscerts, keyname, entry);
+				free(keyname->name);
+				free(keyname);
+			}
 		}
 		env->sc_protocount = 0;
 	}
@@ -696,6 +704,7 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 	}
 
 	TAILQ_INIT(&proto->rules);
+	TAILQ_INIT(&proto->tlscerts);
 	proto->tlscapass = NULL;
 
 	TAILQ_INSERT_TAIL(env->sc_protos, proto, entry);
