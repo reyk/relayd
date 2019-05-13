@@ -895,6 +895,16 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 					    rlay->rl_conf.name);
 					return (-1);
 				}
+				if (id == PROC_RELAY &&
+				    cert->cert_ocsp_fd != -1 &&
+				    config_setrelayfd(ps, id, n,
+				    cert->cert_id, cert->cert_relayid,
+				    RELAY_FD_OCSP, cert->cert_ocsp_fd) == -1) {
+					log_warn("%s: fd passing failed for "
+					    "`%s'", __func__,
+					    rlay->rl_conf.name);
+					return (-1);
+				}
 				if (id == PROC_CA &&
 				    cert->cert_key_fd != -1 &&
 				    config_setrelayfd(ps, id, n,
@@ -983,6 +993,10 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 		if (cert->cert_key_fd != -1) {
 			close(cert->cert_key_fd);
 			cert->cert_key_fd = -1;
+		}
+		if (cert->cert_ocsp_fd != -1) {
+			close(cert->cert_ocsp_fd);
+			cert->cert_ocsp_fd = -1;
 		}
 	}
 
@@ -1105,6 +1119,7 @@ config_getrelayfd(struct relayd *env, struct imsg *imsg)
 	switch (crfd.type) {
 	case RELAY_FD_CERT:
 	case RELAY_FD_KEY:
+	case RELAY_FD_OCSP:
 		if ((cert = cert_find(env, crfd.id)) == NULL) {
 			if ((cert = cert_add(env, crfd.id)) == NULL)
 				return (-1);
@@ -1125,6 +1140,9 @@ config_getrelayfd(struct relayd *env, struct imsg *imsg)
 		break;
 	case RELAY_FD_KEY:
 		cert->cert_key_fd = imsg->fd;
+		break;
+	case RELAY_FD_OCSP:
+		cert->cert_ocsp_fd = imsg->fd;
 		break;
 	case RELAY_FD_CACERT:
 		rlay->rl_tls_ca_fd = imsg->fd;

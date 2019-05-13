@@ -605,6 +605,8 @@ purge_relay(struct relayd *env, struct relay *rlay)
 			close(cert->cert_fd);
 		if (cert->cert_key_fd != -1)
 			close(cert->cert_key_fd);
+		if (cert->cert_ocsp_fd != -1)
+			close(cert->cert_ocsp_fd);
 		if (cert->cert_pkey != NULL)
 			EVP_PKEY_free(cert->cert_pkey);
 		TAILQ_REMOVE(env->sc_certs, cert, cert_entry);
@@ -1264,6 +1266,7 @@ cert_add(struct relayd *env, objid_t id)
 	cert->cert_id = id;
 	cert->cert_fd = -1;
 	cert->cert_key_fd = -1;
+	cert->cert_ocsp_fd = -1;
 
 	TAILQ_INSERT_TAIL(env->sc_certs, cert, cert_entry);
 
@@ -1314,12 +1317,12 @@ relay_load_fd(int fd, off_t *len)
 int
 relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 {
-	char	 certfile[PATH_MAX];
+	char	 certfile[PATH_MAX], ocspfile[PATH_MAX];
 	char	 hbuf[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
 	struct protocol *proto = rlay->rl_proto;
 	struct relay_cert *cert;
 	int	 useport = htons(rlay->rl_conf.port);
-	int	 cert_fd = -1, key_fd = -1;
+	int	 cert_fd = -1, key_fd = -1, ocsp_fd = -1;
 
 	if (rlay->rl_conf.flags & F_TLSCLIENT) {
 		if (strlen(proto->tlsca) && rlay->rl_tls_ca_fd == -1) {
@@ -1372,16 +1375,23 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 
 	if (useport) {
 		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s:%u.key", hbuf, useport) == -1)
+		    "/etc/ssl/private/%s:%u.key", hbuf, useport) == -1 ||
+		    snprintf(ocspfile, sizeof(ocspfile),
+		    "/etc/ssl/private/%s:%u.ocsp", hbuf, useport) == -1)
 			goto fail;
 	} else {
 		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s.key", hbuf) == -1)
+		    "/etc/ssl/private/%s.key", hbuf) == -1 ||
+		    snprintf(ocspfile, sizeof(ocspfile),
+		    "/etc/ssl/private/%s.ocsp", hbuf) == -1)
 			goto fail;
 	}
 	if ((key_fd = open(certfile, O_RDONLY)) == -1)
 		goto fail;
 	log_debug("%s: using private key %s", __func__, certfile);
+
+	if ((ocsp_fd = open(certfile, O_RDONLY)) != -1)
+		log_debug("%s: using OCSP staple file %s", __func__, ocspfile);
 
 	if ((cert = cert_add(env, 0)) == NULL)
 		goto fail;
@@ -1389,6 +1399,7 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 	cert->cert_relayid = rlay->rl_conf.id;
 	cert->cert_fd = cert_fd;
 	cert->cert_key_fd = key_fd;
+	cert->cert_ocsp_fd = ocsp_fd;
 
 	return (0);
 
@@ -1397,6 +1408,8 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 		close(cert_fd);
 	if (key_fd != -1)
 		close(key_fd);
+	if (ocsp_fd != -1)
+		close(ocsp_fd);
 
 	return (-1);
 }

@@ -965,6 +965,15 @@ a keypair will be loaded using the specified IP address of the relay as
 See
 .Xr ssl 8
 for details about SSL/TLS server certificates.
+.Pp
+An optional OCSP staple file will be used during TLS handshakes with
+this server if it is found as a non-empty file in
+.Pa /etc/ssl/name:port.ocsp
+or
+.Pa /etc/ssl/name.ocsp .
+The file should contain a DER-format OCSP response retrieved from an
+OCSP server for the certificate in use, and can be created using
+ocspcheck(8).
 .It Ic no cipher-server-preference
 Prefer the client's cipher list over the server's preferences when
 choosing a cipher for the connection.
@@ -1594,6 +1603,7 @@ router "uplinks" {
 }
 .Ed
 .Sh SEE ALSO
+.Xr ocspcheck 8 ,
 .Xr relayctl 8 ,
 .Xr relayd 8 ,
 .Xr snmpd 8 ,

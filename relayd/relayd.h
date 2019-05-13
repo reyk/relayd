@@ -141,7 +141,8 @@ enum fd_type {
 	RELAY_FD_CERT	= 1,
 	RELAY_FD_CACERT	= 2,
 	RELAY_FD_CAFILE	= 3,
-	RELAY_FD_KEY	= 4
+	RELAY_FD_KEY	= 4,
+	RELAY_FD_OCSP	= 5
 };
 
 struct ctl_relayfd {
@@ -781,6 +782,7 @@ struct relay_cert {
 	objid_t			 cert_relayid;
 	int			 cert_fd;
 	int			 cert_key_fd;
+	int			 cert_ocsp_fd;
 	EVP_PKEY		*cert_pkey;
 	TAILQ_ENTRY(relay_cert)	 cert_entry;
 };
