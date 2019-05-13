@@ -1597,14 +1597,14 @@ snmp_session(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 		break;
 	case 3:		/* in address */
 		if (snmp_agentx_varbind(resp, oid,
-		    AGENTX_OCTET_STRING, sstodata(&session->se_in.ss),
-		    sstolen(&session->se_in.ss)) == -1)
+		    AGENTX_OCTET_STRING, sstodata(&session->se_server.ss),
+		    sstolen(&session->se_server.ss)) == -1)
 			return (-1);
 		break;
 	case 4:		/* in address type */
-		if (session->se_in.ss.ss_family == AF_INET)
+		if (session->se_server.ss.ss_family == AF_INET)
 			addrtype = 1;
-		else if (session->se_in.ss.ss_family == AF_INET6)
+		else if (session->se_server.ss.ss_family == AF_INET6)
 			addrtype = 2;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &addrtype,
@@ -1613,14 +1613,14 @@ snmp_session(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 		break;
 	case 5:		/* out address */
 		if (snmp_agentx_varbind(resp, oid,
-		    AGENTX_OCTET_STRING, sstodata(&session->se_out.ss),
-		    sstolen(&session->se_out.ss)) == -1)
+		    AGENTX_OCTET_STRING, sstodata(&session->se_client.ss),
+		    sstolen(&session->se_client.ss)) == -1)
 			return (-1);
 		break;
 	case 6:		/* out address type */
-		if (session->se_out.ss.ss_family == AF_INET)
+		if (session->se_client.ss.ss_family == AF_INET)
 			addrtype = 1;
-		else if (session->se_out.ss.ss_family == AF_INET6)
+		else if (session->se_client.ss.ss_family == AF_INET6)
 			addrtype = 2;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &addrtype,
@@ -1628,14 +1628,14 @@ snmp_session(struct relayd *env, struct snmp_oid *oid, struct agentx_pdu *resp,
 			return (-1);
 		break;
 	case 7:		/* port out */
-		port = session->se_out.port;
+		port = session->se_client.port;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &port,
 		    sizeof(port)) == -1)
 			return (-1);
 		break;
 	case 8:		/* port in */
-		port = session->se_in.port;
+		port = session->se_server.port;
 		if (snmp_agentx_varbind(resp, oid,
 		    AGENTX_INTEGER, &port,
 		    sizeof(port)) == -1)

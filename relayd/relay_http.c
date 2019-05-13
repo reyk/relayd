@@ -40,40 +40,35 @@
 #include "relayd.h"
 #include "http.h"
 
-static int	_relay_lookup_url(struct ctl_relay_event *, char *, char *,
+static int	_relay_lookup_url(struct rstream *, char *, char *,
 		    char *, struct kv *);
-int		 relay_lookup_url(struct ctl_relay_event *,
-		    const char *, struct kv *);
-int		 relay_lookup_query(struct ctl_relay_event *, struct kv *);
-int		 relay_lookup_cookie(struct ctl_relay_event *, const char *,
+int		 relay_lookup_url(struct rstream *, const char *, struct kv *);
+int		 relay_lookup_query(struct rstream *, struct kv *);
+int		 relay_lookup_cookie(struct rstream *, const char *,
 		    struct kv *);
 void		 relay_read_httpcontent(struct bufferevent *, void *);
 void		 relay_read_httpchunks(struct bufferevent *, void *);
-char		*relay_expand_http(struct ctl_relay_event *, char *,
-		    char *, size_t);
-int		 relay_writeheader_kv(struct ctl_relay_event *, struct kv *);
-int		 relay_writeheader_http(struct ctl_relay_event *,
-		    struct ctl_relay_event *);
-int		 relay_writerequest_http(struct ctl_relay_event *,
-		    struct ctl_relay_event *);
-int		 relay_writeresponse_http(struct ctl_relay_event *,
-		    struct ctl_relay_event *);
-void		 relay_reset_http(struct ctl_relay_event *);
+char		*relay_expand_http(struct rstream *, char *, char *, size_t);
+int		 relay_writeheader_kv(struct rpeer *, struct kv *);
+int		 relay_writeheader_http(struct rpeer *, struct rpeer *);
+int		 relay_writerequest_http(struct rpeer *, struct rpeer *);
+int		 relay_writeresponse_http(struct rpeer *, struct rpeer *);
+void		 relay_reset_http(struct rstream *);
 static int	 relay_httpmethod_cmp(const void *, const void *);
 static int	 relay_httperror_cmp(const void *, const void *);
-int		 relay_httpquery_test(struct ctl_relay_event *,
+int		 relay_httpquery_test(struct rstream *,
 		    struct relay_rule *, struct kvlist *);
-int		 relay_httpheader_test(struct ctl_relay_event *,
+int		 relay_httpheader_test(struct rstream *,
 		    struct relay_rule *, struct kvlist *);
-int		 relay_httppath_test(struct ctl_relay_event *,
+int		 relay_httppath_test(struct rstream *,
 		    struct relay_rule *, struct kvlist *);
-int		 relay_httpurl_test(struct ctl_relay_event *,
+int		 relay_httpurl_test(struct rstream *,
 		    struct relay_rule *, struct kvlist *);
-int		 relay_httpcookie_test(struct ctl_relay_event *,
+int		 relay_httpcookie_test(struct rstream *,
 		    struct relay_rule *, struct kvlist *);
-int		 relay_apply_actions(struct ctl_relay_event *, struct kvlist *,
+int		 relay_apply_actions(struct rstream *, struct kvlist *,
 		    struct relay_table *);
-int		 relay_match_actions(struct ctl_relay_event *,
+int		 relay_match_actions(struct rstream *,
 		    struct relay_rule *, struct kvlist *, struct kvlist *,
 		    struct relay_table **);
 void		 relay_httpdesc_free(struct http_descriptor *);
@@ -112,7 +107,7 @@ relay_http_init(struct relay *rlay)
 }
 
 int
-relay_httpdesc_init(struct ctl_relay_event *cre)
+relay_httpdesc_init(struct rstream *cre)
 {
 	struct http_descriptor	*desc;
 
@@ -148,9 +143,10 @@ relay_httpdesc_free(struct http_descriptor *desc)
 void
 relay_read_http(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = arg;
+	struct rpeer		*peer = arg;
+	struct rstream		*cre = peer->stream;
 	struct http_descriptor	*desc = cre->desc;
-	struct rsession		*con = cre->con;
+	struct rsession		*con = peer->con;
 	struct relay		*rlay = con->se_relay;
 	struct protocol		*proto = rlay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
@@ -163,13 +159,13 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	struct kv		*upgrade = NULL, *upgrade_ws = NULL;
 
 	getmonotime(&con->se_tv_last);
-	cre->timedout = 0;
+	peer->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld",
 	    __func__, con->se_id, size, cre->toread);
 	if (size == 0) {
-		if (cre->dir == RELAY_DIR_RESPONSE)
+		if (peer->dir == RELAY_DIR_RESPONSE)
 			return;
 		cre->toread = TOREAD_HTTP_HEADER;
 		goto done;
@@ -241,7 +237,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		/*
 		 * Identify and handle specific HTTP request methods
 		 */
-		if (cre->line == 1 && cre->dir == RELAY_DIR_RESPONSE) {
+		if (cre->line == 1 && peer->dir == RELAY_DIR_RESPONSE) {
 			desc->http_method = HTTP_METHOD_RESPONSE;
 			/*
 			 * Decode response path and query
@@ -280,7 +276,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			    "http_resmesg %s", desc->http_version,
 			    desc->http_rescode, desc->http_resmesg);
 			goto lookup;
-		} else if (cre->line == 1 && cre->dir == RELAY_DIR_REQUEST) {
+		} else if (cre->line == 1 && peer->dir == RELAY_DIR_REQUEST) {
 			if ((desc->http_method = relay_httpmethod_byname(key))
 			    == HTTP_METHOD_NONE) {
 				free(line);
@@ -432,7 +428,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		    "Connection", "upgrade", ",");
 		upgrade_ws = kv_find_value(&desc->http_headers,
 		    "Upgrade", "websocket", ",");
-		if (cre->dir == RELAY_DIR_REQUEST && upgrade_ws != NULL) {
+		if (peer->dir == RELAY_DIR_REQUEST && upgrade_ws != NULL) {
 			if ((proto->httpflags & HTTPFLAG_WEBSOCKETS) == 0) {
 				relay_abort_http(con, 403,
 				    "Websocket Forbidden", 0);
@@ -446,12 +442,12 @@ relay_read_http(struct bufferevent *bev, void *arg)
 				    "Websocket Method Not Allowed", 0);
 				return;
 			}
-		} else if (cre->dir == RELAY_DIR_RESPONSE &&
+		} else if (peer->dir == RELAY_DIR_RESPONSE &&
 		    desc->http_status == 101) {
 			if (upgrade_ws != NULL && upgrade != NULL &&
 			    (proto->httpflags & HTTPFLAG_WEBSOCKETS)) {
 				cre->dst->toread = TOREAD_UNLIMITED;
-				cre->dst->bev->readcb = relay_read;
+				peer->dst->bev->readcb = relay_read;
 			} else {
 				relay_abort_http(con, 502,
 				    "Bad Websocket Gateway", 0);
@@ -531,22 +527,22 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			    "close", 0) == NULL)
 				goto fail;
 
-		if (cre->dir == RELAY_DIR_REQUEST) {
-			if (relay_writerequest_http(cre->dst, cre) == -1)
+		if (peer->dir == RELAY_DIR_REQUEST) {
+			if (relay_writerequest_http(peer->dst, peer) == -1)
 			    goto fail;
 		} else {
-			if (relay_writeresponse_http(cre->dst, cre) == -1)
+			if (relay_writeresponse_http(peer->dst, peer) == -1)
 			    goto fail;
 		}
-		if (relay_bufferevent_print(cre->dst, "\r\n") == -1 ||
-		    relay_writeheader_http(cre->dst, cre) == -1 ||
-		    relay_bufferevent_print(cre->dst, "\r\n") == -1)
+		if (relay_bufferevent_print(peer->dst, "\r\n") == -1 ||
+		    relay_writeheader_http(peer->dst, peer) == -1 ||
+		    relay_bufferevent_print(peer->dst, "\r\n") == -1)
 			goto fail;
 
 		relay_reset_http(cre);
  done:
-		if (cre->dir == RELAY_DIR_REQUEST && cre->toread <= 0 &&
-		    cre->dst->state != STATE_CONNECTED) {
+		if (peer->dir == RELAY_DIR_REQUEST && cre->toread <= 0 &&
+		    peer->dst->state != STATE_CONNECTED) {
 			if (rlay->rl_conf.fwdmode == FWD_TRANS) {
 				relay_bindanyreq(con, 0, IPPROTO_TCP);
 				return;
@@ -561,7 +557,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		relay_close(con, "last http read (done)", 0);
 		return;
 	}
-	switch (relay_splice(cre)) {
+	switch (relay_splice(peer)) {
 	case -1:
 		relay_close(con, strerror(errno), 1);
 	case 1:
@@ -584,34 +580,36 @@ relay_read_http(struct bufferevent *bev, void *arg)
 void
 relay_read_httpcontent(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = arg;
-	struct rsession		*con = cre->con;
+	struct rpeer		*peer = arg;
+	struct rstream		*cre = peer->stream;
+	struct rsession		*con = peer->con;
 	struct protocol		*proto = con->se_relay->rl_proto;
 
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	size_t			 size;
 
 	getmonotime(&con->se_tv_last);
-	cre->timedout = 0;
+	peer->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
 	    con->se_id, size, cre->toread);
 	if (!size)
 		return;
-	if (relay_spliceadjust(cre) == -1)
+	if (relay_spliceadjust(peer) == -1)
 		goto fail;
 
 	if (cre->toread > 0) {
 		/* Read content data */
 		if ((off_t)size > cre->toread) {
 			size = cre->toread;
-			if (relay_bufferevent_write_chunk(cre->dst, src, size)
+			if (relay_bufferevent_write_chunk(peer->dst, src, size)
 			    == -1)
 				goto fail;
 			cre->toread = 0;
 		} else {
-			if (relay_bufferevent_write_buffer(cre->dst, src) == -1)
+			if (relay_bufferevent_write_buffer(peer->dst,
+			    src) == -1)
 				goto fail;
 			cre->toread -= size;
 		}
@@ -626,9 +624,9 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 		goto done;
 	bufferevent_enable(bev, EV_READ);
 
-	if (cre->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(cre->dst->bev)) >
+	if (peer->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(peer->dst->bev)) >
 	    (size_t)RELAY_MAX_PREFETCH * proto->tcpbufsiz)
-		bufferevent_disable(cre->bev, EV_READ);
+		bufferevent_disable(peer->bev, EV_READ);
 
 	if (bev->readcb != relay_read_httpcontent)
 		bev->readcb(bev, arg);
@@ -644,8 +642,9 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 void
 relay_read_httpchunks(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = arg;
-	struct rsession		*con = cre->con;
+	struct rpeer		*peer = arg;
+	struct rstream		*cre = peer->stream;
+	struct rsession		*con = peer->con;
 	struct protocol		*proto = con->se_relay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	char			*line;
@@ -653,26 +652,27 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	size_t			 size, linelen;
 
 	getmonotime(&con->se_tv_last);
-	cre->timedout = 0;
+	peer->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
 	    con->se_id, size, cre->toread);
 	if (!size)
 		return;
-	if (relay_spliceadjust(cre) == -1)
+	if (relay_spliceadjust(peer) == -1)
 		goto fail;
 
 	if (cre->toread > 0) {
 		/* Read chunk data */
 		if ((off_t)size > cre->toread) {
 			size = cre->toread;
-			if (relay_bufferevent_write_chunk(cre->dst, src, size)
+			if (relay_bufferevent_write_chunk(peer->dst, src, size)
 			    == -1)
 				goto fail;
 			cre->toread = 0;
 		} else {
-			if (relay_bufferevent_write_buffer(cre->dst, src) == -1)
+			if (relay_bufferevent_write_buffer(peer->dst,
+			    src) == -1)
 				goto fail;
 			cre->toread -= size;
 		}
@@ -702,8 +702,8 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 			return;
 		}
 
-		if (relay_bufferevent_print(cre->dst, line) == -1 ||
-		    relay_bufferevent_print(cre->dst, "\r\n") == -1) {
+		if (relay_bufferevent_print(peer->dst, line) == -1 ||
+		    relay_bufferevent_print(peer->dst, "\r\n") == -1) {
 			free(line);
 			goto fail;
 		}
@@ -722,8 +722,8 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 			bufferevent_enable(bev, EV_READ);
 			return;
 		}
-		if (relay_bufferevent_print(cre->dst, line) == -1 ||
-		    relay_bufferevent_print(cre->dst, "\r\n") == -1) {
+		if (relay_bufferevent_print(peer->dst, line) == -1 ||
+		    relay_bufferevent_print(peer->dst, "\r\n") == -1) {
 			free(line);
 			goto fail;
 		}
@@ -738,7 +738,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		/* Chunk is terminated by an empty newline */
 		line = evbuffer_readln(src, &linelen, EVBUFFER_EOL_CRLF);
 		free(line);
-		if (relay_bufferevent_print(cre->dst, "\r\n") == -1)
+		if (relay_bufferevent_print(peer->dst, "\r\n") == -1)
 			goto fail;
 		cre->toread = TOREAD_HTTP_CHUNK_LENGTH;
 		break;
@@ -749,9 +749,9 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		goto done;
 	bufferevent_enable(bev, EV_READ);
 
-	if (cre->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(cre->dst->bev)) >
+	if (peer->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(peer->dst->bev)) >
 	    (size_t)RELAY_MAX_PREFETCH * proto->tcpbufsiz)
-		bufferevent_disable(cre->bev, EV_READ);
+		bufferevent_disable(peer->bev, EV_READ);
 
 	if (EVBUFFER_LENGTH(src))
 		bev->readcb(bev, arg);
@@ -766,7 +766,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 }
 
 void
-relay_reset_http(struct ctl_relay_event *cre)
+relay_reset_http(struct rstream *cre)
 {
 	struct http_descriptor	*desc = cre->desc;
 
@@ -779,7 +779,7 @@ relay_reset_http(struct ctl_relay_event *cre)
 }
 
 static int
-_relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
+_relay_lookup_url(struct rstream *cre, char *host, char *path,
     char *query, struct kv *kv)
 {
 	struct rsession		*con = cre->con;
@@ -827,7 +827,7 @@ _relay_lookup_url(struct ctl_relay_event *cre, char *host, char *path,
 }
 
 int
-relay_lookup_url(struct ctl_relay_event *cre, const char *host, struct kv *kv)
+relay_lookup_url(struct rstream *cre, const char *host, struct kv *kv)
 {
 	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
 	int			 i, j, dots;
@@ -903,7 +903,7 @@ relay_lookup_url(struct ctl_relay_event *cre, const char *host, struct kv *kv)
 }
 
 int
-relay_lookup_cookie(struct ctl_relay_event *cre, const char *str,
+relay_lookup_cookie(struct rstream *cre, const char *str,
     struct kv *kv)
 {
 	char			*val, *ptr, *key, *value;
@@ -957,7 +957,7 @@ relay_lookup_cookie(struct ctl_relay_event *cre, const char *str,
 }
 
 int
-relay_lookup_query(struct ctl_relay_event *cre, struct kv *kv)
+relay_lookup_query(struct rstream *cre, struct kv *kv)
 {
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*match = &desc->http_matchquery;
@@ -1020,9 +1020,9 @@ void
 relay_abort_http(struct rsession *con, u_int code, const char *msg,
     u_int16_t labelid)
 {
-	struct ctl_relay_event	*in = &con->se_in;
+	struct rpeer		*server = &con->se_server;
 	struct relay		*rlay = con->se_relay;
-	struct bufferevent	*bev = in->bev;
+	struct bufferevent	*bev = server->bev;
 	const char		*httperr = NULL, *text = "";
 	char			*httpmsg, *body = NULL;
 	char			 tmbuf[32], hbuf[128];
@@ -1101,7 +1101,7 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 		goto done;
 
 	/* Dump the message without checking for success */
-	relay_dump(in, httpmsg, strlen(httpmsg));
+	relay_dump(server, httpmsg, strlen(httpmsg));
 	free(httpmsg);
 
  done:
@@ -1117,7 +1117,7 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 void
 relay_close_http(struct rsession *con)
 {
-	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
+	struct rstream	*in = &con->se_in, *out = &con->se_out;
 
 	relay_httpdesc_free(in->desc);
 	free(in->desc);
@@ -1126,10 +1126,10 @@ relay_close_http(struct rsession *con)
 }
 
 char *
-relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf,
-    size_t len)
+relay_expand_http(struct rstream *cre, char *val, char *buf, size_t len)
 {
-	struct rsession	*con = cre->con;
+	struct rpeer	*peer = cre->peer;
+	struct rsession	*con = peer->con;
 	struct relay	*rlay = con->se_relay;
 	char		 ibuf[128];
 
@@ -1138,14 +1138,14 @@ relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf,
 
 	if (strstr(val, "$REMOTE_") != NULL) {
 		if (strstr(val, "$REMOTE_ADDR") != NULL) {
-			if (print_host(&cre->ss, ibuf, sizeof(ibuf)) == NULL)
+			if (print_host(&peer->ss, ibuf, sizeof(ibuf)) == NULL)
 				return (NULL);
 			if (expand_string(buf, len,
 			    "$REMOTE_ADDR", ibuf) != 0)
 				return (NULL);
 		}
 		if (strstr(val, "$REMOTE_PORT") != NULL) {
-			snprintf(ibuf, sizeof(ibuf), "%u", ntohs(cre->port));
+			snprintf(ibuf, sizeof(ibuf), "%u", ntohs(peer->port));
 			if (expand_string(buf, len,
 			    "$REMOTE_PORT", ibuf) != 0)
 				return (NULL);
@@ -1184,10 +1184,9 @@ relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf,
 }
 
 int
-relay_writerequest_http(struct ctl_relay_event *dst,
-    struct ctl_relay_event *cre)
+relay_writerequest_http(struct rpeer *dst, struct rpeer *peer)
 {
-	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
+	struct http_descriptor	*desc = peer->stream->desc;
 	const char		*name = NULL;
 
 	if ((name = relay_httpmethod_byid(desc->http_method)) == NULL)
@@ -1207,10 +1206,9 @@ relay_writerequest_http(struct ctl_relay_event *dst,
 }
 
 int
-relay_writeresponse_http(struct ctl_relay_event *dst,
-    struct ctl_relay_event *cre)
+relay_writeresponse_http(struct rpeer *dst, struct rpeer *peer)
 {
-	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
+	struct http_descriptor	*desc = peer->stream->desc;
 
 	DPRINTF("version: %s rescode: %s resmsg: %s", desc->http_version,
 	    desc->http_rescode, desc->http_resmesg);
@@ -1226,7 +1224,7 @@ relay_writeresponse_http(struct ctl_relay_event *dst,
 }
 
 int
-relay_writeheader_kv(struct ctl_relay_event *dst, struct kv *hdr)
+relay_writeheader_kv(struct rpeer *dst, struct kv *hdr)
 {
 	char			*ptr;
 	const char		*key;
@@ -1254,11 +1252,10 @@ relay_writeheader_kv(struct ctl_relay_event *dst, struct kv *hdr)
 }
 
 int
-relay_writeheader_http(struct ctl_relay_event *dst, struct ctl_relay_event
-    *cre)
+relay_writeheader_http(struct rpeer *dst, struct rpeer *peer)
 {
 	struct kv		*hdr, *kv;
-	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
+	struct http_descriptor	*desc = peer->stream->desc;
 
 	RB_FOREACH(hdr, kvtree, &desc->http_headers) {
 		if (relay_writeheader_kv(dst, hdr) == -1)
@@ -1342,15 +1339,16 @@ relay_httperror_cmp(const void *a, const void *b)
 }
 
 int
-relay_httpquery_test(struct ctl_relay_event *cre, struct relay_rule *rule,
+relay_httpquery_test(struct rstream *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
+	struct rpeer		*peer = cre->peer;
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*match = &desc->http_matchquery;
 	struct kv		*kv = &rule->rule_kv[KEY_TYPE_QUERY];
 	int			 res = 0;
 
-	if (cre->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_QUERY)
+	if (peer->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_QUERY)
 		return (0);
 	else if (kv->kv_key == NULL)
 		return (0);
@@ -1363,7 +1361,7 @@ relay_httpquery_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 }
 
 int
-relay_httpheader_test(struct ctl_relay_event *cre, struct relay_rule *rule,
+relay_httpheader_test(struct rstream *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
 	struct http_descriptor	*desc = cre->desc;
@@ -1397,15 +1395,16 @@ relay_httpheader_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 }
 
 int
-relay_httppath_test(struct ctl_relay_event *cre, struct relay_rule *rule,
+relay_httppath_test(struct rstream *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
+	struct rpeer		*peer = cre->peer;
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*kv = &rule->rule_kv[KEY_TYPE_PATH];
 	struct kv		*match = &desc->http_pathquery;
 	const char		*query;
 
-	if (cre->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_PATH)
+	if (peer->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_PATH)
 		return (0);
 	else if (kv->kv_key == NULL)
 		return (0);
@@ -1423,16 +1422,17 @@ relay_httppath_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 }
 
 int
-relay_httpurl_test(struct ctl_relay_event *cre, struct relay_rule *rule,
+relay_httpurl_test(struct rstream *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
+	struct rpeer		*peer = cre->peer;
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*host, key;
 	struct kv		*kv = &rule->rule_kv[KEY_TYPE_URL];
 	struct kv		*match = &desc->http_pathquery;
 	int			 res;
 
-	if (cre->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_URL ||
+	if (peer->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_URL ||
 	    kv->kv_key == NULL)
 		return (0);
 
@@ -1453,9 +1453,10 @@ relay_httpurl_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 }
 
 int
-relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
+relay_httpcookie_test(struct rstream *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
+	struct rpeer		*peer = cre->peer;
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*kv = &rule->rule_kv[KEY_TYPE_COOKIE], key;
 	struct kv		*match = NULL;
@@ -1464,7 +1465,7 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 	if (kv->kv_type != KEY_TYPE_COOKIE)
 		return (0);
 
-	switch (cre->dir) {
+	switch (peer->dir) {
 	case RELAY_DIR_REQUEST:
 		key.kv_key = "Cookie";
 		break;
@@ -1497,7 +1498,7 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 }
 
 int
-relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
+relay_match_actions(struct rstream *cre, struct relay_rule *rule,
     struct kvlist *matches, struct kvlist *actions, struct relay_table **tbl)
 {
 	struct rsession		*con = cre->con;
@@ -1533,11 +1534,11 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
 }
 
 int
-relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
+relay_apply_actions(struct rstream *cre, struct kvlist *actions,
     struct relay_table *tbl)
 {
 	struct rsession		*con = cre->con;
-	struct ctl_relay_event	*out = &con->se_out;
+	struct rpeer		*peer = cre->peer, *client = &con->se_client;
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*host = NULL;
 	const char		*value;
@@ -1586,7 +1587,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
 				if (kv_set(kp, "%s=%s;", kp->kv_key,
 				    kp->kv_value) == -1)
 					goto fail;
-				if (kv_setkey(kp, "%s", cre->dir ==
+				if (kv_setkey(kp, "%s", peer->dir ==
 				    RELAY_DIR_REQUEST ?
 				    "Cookie" : "Set-Cookie") == -1)
 					goto fail;
@@ -1706,7 +1707,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
 			default:
 				break;
 			}
-			if (kv_log(con, mp, con->se_label, cre->dir)
+			if (kv_log(con, mp, con->se_label, peer->dir)
 			    == -1)
 				goto fail;
 			break;
@@ -1727,8 +1728,8 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
 	 * Change the backend if the forward table has been changed.
 	 * This only works in the request direction.
 	 */
-	if (cre->dir == RELAY_DIR_REQUEST && con->se_table != tbl) {
-		relay_reset_event(con, out);
+	if (peer->dir == RELAY_DIR_REQUEST && con->se_table != tbl) {
+		relay_reset_event(con, client);
 		con->se_table = tbl;
 		con->se_haslog = 1;
 	}
@@ -1742,7 +1743,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
 	    (asprintf(&msg, " %s", meth) != -1))
 		evbuffer_add(con->se_log, msg, strlen(msg));
 	free(msg);
-	relay_log(con, cre->dir == RELAY_DIR_REQUEST ? "" : ";");
+	relay_log(con, peer->dir == RELAY_DIR_REQUEST ? "" : ";");
 	ret = 0;
  fail:
 	kv_free(&kvcopy);
@@ -1764,9 +1765,10 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
 	} while (0)
 
 int
-relay_test(struct protocol *proto, struct ctl_relay_event *cre)
+relay_test(struct protocol *proto, struct rstream *cre)
 {
 	struct rsession		*con;
+	struct rpeer		*peer = cre->peer;
 	struct http_descriptor	*desc = cre->desc;
 	struct relay_rule	*r = NULL, *rule = NULL;
 	struct relay_table	*tbl = NULL;
@@ -1786,14 +1788,14 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 		TAILQ_INIT(&matches);
 		TAILQ_INIT(&r->rule_kvlist);
 
-		if (r->rule_dir && r->rule_dir != cre->dir)
+		if (r->rule_dir && r->rule_dir != peer->dir)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_DIR);
 		else if (proto->type != r->rule_proto)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_PROTO);
-		else if (RELAY_AF_NEQ(r->rule_af, cre->ss.ss_family) ||
-		     RELAY_AF_NEQ(r->rule_af, cre->dst->ss.ss_family))
+		else if (RELAY_AF_NEQ(r->rule_af, peer->ss.ss_family) ||
+		     RELAY_AF_NEQ(r->rule_af, peer->dst->ss.ss_family))
 			RELAY_GET_SKIP_STEP(RULE_SKIP_AF);
-		else if (RELAY_ADDR_CMP(&r->rule_src, &cre->ss) != 0)
+		else if (RELAY_ADDR_CMP(&r->rule_src, &peer->ss) != 0)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_SRC);
 		else if (RELAY_ADDR_CMP(&r->rule_dst, &con->se_sockname) != 0)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_DST);

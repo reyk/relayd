@@ -73,16 +73,15 @@ void		 relay_input(struct rsession *);
 void		 relay_hash_addr(SIPHASH_CTX *, struct sockaddr_storage *, int);
 
 int		 relay_tls_ctx_create(struct relay *);
-void		 relay_tls_transaction(struct rsession *,
-		    struct ctl_relay_event *);
+void		 relay_tls_transaction(struct rsession *, struct rpeer *);
 void		 relay_tls_handshake(int, short, void *);
-void		 relay_tls_connected(struct ctl_relay_event *);
+void		 relay_tls_connected(struct rpeer *);
 void		 relay_tls_readcb(int, short, void *);
 void		 relay_tls_writecb(int, short, void *);
 
 void		 relay_connect_retry(int, short, void *);
-void		 relay_connect_state(struct rsession *,
-		    struct ctl_relay_event *, enum relay_state);
+void		 relay_connect_state(struct rsession *, struct rpeer *,
+		    enum relay_state);
 
 extern void	 bufferevent_read_pressure_cb(struct evbuffer *, size_t,
 		    size_t, void *);
@@ -679,7 +678,9 @@ relay_connected(int fd, short sig, void *arg)
 {
 	char			 obuf[128];
 	struct rsession		*con = arg;
-	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
+	struct rstream		*out = &con->se_out;
+	struct rpeer		*client = &con->se_client;
+	struct rpeer		*server = &con->se_server;
 	struct relay		*rlay = con->se_relay;
 	struct protocol		*proto = rlay->rl_proto;
 	evbuffercb		 outrd = relay_read;
@@ -713,8 +714,8 @@ relay_connected(int fd, short sig, void *arg)
 		}
 	}
 
-	if ((rlay->rl_conf.flags & F_TLSCLIENT) && (out->tls == NULL)) {
-		relay_tls_transaction(con, out);
+	if ((rlay->rl_conf.flags & F_TLSCLIENT) && (client->tls == NULL)) {
+		relay_tls_transaction(con, client);
 		return;
 	}
 
@@ -725,9 +726,9 @@ relay_connected(int fd, short sig, void *arg)
 	    (env->sc_conf.opts & (RELAYD_OPT_LOGCON|RELAYD_OPT_LOGCONERR))) {
 		con->se_table0 = con->se_table;
 		memset(&obuf, 0, sizeof(obuf));
-		(void)print_host(&out->ss, obuf, sizeof(obuf));
+		(void)print_host(&client->ss, obuf, sizeof(obuf));
 		if (asprintf(&msg, " -> %s:%d",
-		    obuf, ntohs(out->port)) == -1) {
+		    obuf, ntohs(client->port)) == -1) {
 			relay_abort_http(con, 500,
 			    "connection changed and asprintf failed", 0);
 			return;
@@ -756,39 +757,40 @@ relay_connected(int fd, short sig, void *arg)
 	/*
 	 * Relay <-> Server
 	 */
-	bev = bufferevent_new(fd, outrd, outwr, relay_error, out);
+	bev = bufferevent_new(fd, outrd, outwr, relay_error, client);
 	if (bev == NULL) {
 		relay_abort_http(con, 500,
 		    "failed to allocate output buffer event", 0);
 		return;
 	}
 	/* write pending output buffer now */
-	if (bufferevent_write_buffer(bev, out->output)) {
+	if (bufferevent_write_buffer(bev, client->output)) {
 		relay_abort_http(con, 500, strerror(errno), 0);
 		return;
 	}
-	out->bev = bev;
+	client->bev = bev;
 
 	/* Initialize the TLS wrapper */
-	if ((rlay->rl_conf.flags & F_TLSCLIENT) && (out->tls != NULL))
-		relay_tls_connected(out);
+	if ((rlay->rl_conf.flags & F_TLSCLIENT) && (client->tls != NULL))
+		relay_tls_connected(client);
 
 	bufferevent_settimeout(bev,
 	    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
 	bufferevent_setwatermark(bev, EV_WRITE,
 		RELAY_MIN_PREFETCHED * proto->tcpbufsiz, 0);
 	bufferevent_enable(bev, EV_READ|EV_WRITE);
-	if (in->bev)
-		bufferevent_enable(in->bev, EV_READ);
+	if (server->bev != NULL)
+		bufferevent_enable(server->bev, EV_READ);
 
-	if (relay_splice(out) == -1)
+	if (relay_splice(client) == -1)
 		relay_close(con, strerror(errno), 1);
 }
 
 void
 relay_input(struct rsession *con)
 {
-	struct ctl_relay_event	*in = &con->se_in;
+	struct rstream		*in = &con->se_in;
+	struct rpeer		*server = &con->se_server;
 	struct relay		*rlay = con->se_relay;
 	struct protocol		*proto = rlay->rl_proto;
 	evbuffercb		 inrd = relay_read;
@@ -812,42 +814,42 @@ relay_input(struct rsession *con)
 	}
 
 	/*
-	 * Client <-> Relay
+	 * Client <-> Relay Server
 	 */
-	in->bev = bufferevent_new(in->s, inrd, inwr,
-	    relay_error, in);
-	if (in->bev == NULL) {
+	server->bev = bufferevent_new(server->s, inrd, inwr,
+	    relay_error, server);
+	if (server->bev == NULL) {
 		relay_close(con, "failed to allocate input buffer event", 1);
 		return;
 	}
 
 	/* Initialize the TLS wrapper */
-	if ((rlay->rl_conf.flags & F_TLS) && in->tls != NULL)
-		relay_tls_connected(in);
+	if ((rlay->rl_conf.flags & F_TLS) && server->tls != NULL)
+		relay_tls_connected(server);
 
-	bufferevent_settimeout(in->bev,
+	bufferevent_settimeout(server->bev,
 	    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
-	bufferevent_setwatermark(in->bev, EV_WRITE,
+	bufferevent_setwatermark(server->bev, EV_WRITE,
 		RELAY_MIN_PREFETCHED * proto->tcpbufsiz, 0);
-	bufferevent_enable(in->bev, EV_READ|EV_WRITE);
+	bufferevent_enable(server->bev, EV_READ|EV_WRITE);
 
-	if (relay_splice(in) == -1)
+	if (relay_splice(server) == -1)
 		relay_close(con, strerror(errno), 1);
 }
 
 void
 relay_write(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = arg;
-	struct rsession		*con = cre->con;
+	struct rpeer		*peer = arg;
+	struct rsession		*con = peer->con;
 
 	getmonotime(&con->se_tv_last);
 
 	if (con->se_done && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(bev)) == 0)
 		goto done;
-	if (cre->dst->bev)
-		bufferevent_enable(cre->dst->bev, EV_READ);
-	if (relay_splice(cre->dst) == -1)
+	if (peer->dst->bev)
+		bufferevent_enable(peer->dst->bev, EV_READ);
+	if (relay_splice(peer->dst) == -1)
 		goto fail;
 
 	return;
@@ -859,7 +861,7 @@ relay_write(struct bufferevent *bev, void *arg)
 }
 
 void
-relay_dump(struct ctl_relay_event *cre, const void *buf, size_t len)
+relay_dump(struct rpeer *peer, const void *buf, size_t len)
 {
 	if (!len)
 		return;
@@ -870,32 +872,32 @@ relay_dump(struct ctl_relay_event *cre, const void *buf, size_t len)
 	 * of non-blocking events etc. This is useful to print an
 	 * error message before gracefully closing the session.
 	 */
-	if (cre->tls != NULL)
-		(void)tls_write(cre->tls, buf, len);
+	if (peer->tls != NULL)
+		(void)tls_write(peer->tls, buf, len);
 	else
-		(void)write(cre->s, buf, len);
+		(void)write(peer->s, buf, len);
 }
 
 void
 relay_read(struct bufferevent *bev, void *arg)
 {
-	struct ctl_relay_event	*cre = arg;
-	struct rsession		*con = cre->con;
+	struct rpeer		*peer = arg;
+	struct rsession		*con = peer->con;
 	struct protocol		*proto = con->se_relay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 
 	getmonotime(&con->se_tv_last);
-	cre->timedout = 0;
+	peer->timedout = 0;
 
 	if (!EVBUFFER_LENGTH(src))
 		return;
-	if (relay_bufferevent_write_buffer(cre->dst, src) == -1)
+	if (relay_bufferevent_write_buffer(peer->dst, src) == -1)
 		goto fail;
 	if (con->se_done)
 		goto done;
-	if (cre->dst->bev)
-		bufferevent_enable(cre->dst->bev, EV_READ);
-	if (cre->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(cre->dst->bev)) >
+	if (peer->dst->bev)
+		bufferevent_enable(peer->dst->bev, EV_READ);
+	if (peer->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(peer->dst->bev)) >
 	    (size_t)RELAY_MAX_PREFETCH * proto->tcpbufsiz)
 		bufferevent_disable(bev, EV_READ);
 
@@ -914,9 +916,10 @@ relay_read(struct bufferevent *bev, void *arg)
  * 1 socket splicing was successful
  */
 int
-relay_splice(struct ctl_relay_event *cre)
+relay_splice(struct rpeer *peer)
 {
-	struct rsession		*con = cre->con;
+	struct rsession		*con = peer->con;
+	struct rstream		*cre = peer->stream;
 	struct relay		*rlay = con->se_relay;
 	struct protocol		*proto = rlay->rl_proto;
 	struct splice		 sp;
@@ -925,70 +928,70 @@ relay_splice(struct ctl_relay_event *cre)
 	    (proto->tcpflags & TCPFLAG_NSPLICE))
 		return (0);
 
-	if (cre->splicelen >= 0)
+	if (peer->splicelen >= 0)
 		return (0);
 
 	/* still not connected */
-	if (cre->bev == NULL || cre->dst->bev == NULL)
+	if (peer->bev == NULL || peer->dst->bev == NULL)
 		return (0);
 
 	if (!(cre->toread == TOREAD_UNLIMITED || cre->toread > 0)) {
 		DPRINTF("%s: session %d: splice dir %d, nothing to read %lld",
-		    __func__, con->se_id, cre->dir, cre->toread);
+		    __func__, con->se_id, peer->dir, cre->toread);
 		return (0);
 	}
 
 	/* do not splice before buffers have not been completely flushed */
-	if (EVBUFFER_LENGTH(cre->bev->input) ||
-	    EVBUFFER_LENGTH(cre->dst->bev->output)) {
+	if (EVBUFFER_LENGTH(peer->bev->input) ||
+	    EVBUFFER_LENGTH(peer->dst->bev->output)) {
 		DPRINTF("%s: session %d: splice dir %d, dirty buffer",
-		    __func__, con->se_id, cre->dir);
-		bufferevent_disable(cre->bev, EV_READ);
+		    __func__, con->se_id, peer->dir);
+		bufferevent_disable(peer->bev, EV_READ);
 		return (0);
 	}
 
 	bzero(&sp, sizeof(sp));
-	sp.sp_fd = cre->dst->s;
+	sp.sp_fd = peer->dst->s;
 	sp.sp_max = cre->toread > 0 ? cre->toread : 0;
 	bcopy(&rlay->rl_conf.timeout, &sp.sp_idle, sizeof(sp.sp_idle));
-	if (setsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &sp, sizeof(sp)) == -1) {
+	if (setsockopt(peer->s, SOL_SOCKET, SO_SPLICE, &sp, sizeof(sp)) == -1) {
 		log_debug("%s: session %d: splice dir %d failed: %s",
-		    __func__, con->se_id, cre->dir, strerror(errno));
+		    __func__, con->se_id, peer->dir, strerror(errno));
 		return (-1);
 	}
-	cre->splicelen = 0;
-	bufferevent_enable(cre->bev, EV_READ);
+	peer->splicelen = 0;
+	bufferevent_enable(peer->bev, EV_READ);
 
 	DPRINTF("%s: session %d: splice dir %d, maximum %lld, successful",
-	    __func__, con->se_id, cre->dir, cre->toread);
+	    __func__, con->se_id, peer->dir, cre->toread);
 
 	return (1);
 }
 
 int
-relay_splicelen(struct ctl_relay_event *cre)
+relay_splicelen(struct rpeer *peer)
 {
-	struct rsession		*con = cre->con;
+	struct rsession		*con = peer->con;
 	off_t			 len;
 	socklen_t		 optlen;
 
-	if (cre->splicelen < 0)
+	if (peer->splicelen < 0)
 		return (0);
 
 	optlen = sizeof(len);
-	if (getsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &len, &optlen) == -1) {
+	if (getsockopt(peer->s, SOL_SOCKET, SO_SPLICE, &len, &optlen) == -1) {
 		log_debug("%s: session %d: splice dir %d get length failed: %s",
-		    __func__, con->se_id, cre->dir, strerror(errno));
+		    __func__, con->se_id, peer->dir, strerror(errno));
 		return (-1);
 	}
 
 	DPRINTF("%s: session %d: splice dir %d, length %lld",
-	    __func__, con->se_id, cre->dir, len);
+	    __func__, con->se_id, peer->dir, len);
 
-	if (len > cre->splicelen) {
+	if (len > peer->splicelen) {
 		getmonotime(&con->se_tv_last);
 
-		cre->splicelen = len;
+		peer->splicelen = len;
 		return (1);
 	}
 
@@ -996,15 +999,17 @@ relay_splicelen(struct ctl_relay_event *cre)
 }
 
 int
-relay_spliceadjust(struct ctl_relay_event *cre)
+relay_spliceadjust(struct rpeer *peer)
 {
-	if (cre->splicelen < 0)
+	struct rstream		*cre = peer->stream;
+
+	if (peer->splicelen < 0)
 		return (0);
-	if (relay_splicelen(cre) == -1)
+	if (relay_splicelen(peer) == -1)
 		return (-1);
-	if (cre->splicelen > 0 && cre->toread > 0)
-		cre->toread -= cre->splicelen;
-	cre->splicelen = -1;
+	if (peer->splicelen > 0 && cre->toread > 0)
+		cre->toread -= peer->splicelen;
+	peer->splicelen = -1;
 
 	return (0);
 }
@@ -1012,24 +1017,25 @@ relay_spliceadjust(struct ctl_relay_event *cre)
 void
 relay_error(struct bufferevent *bev, short error, void *arg)
 {
-	struct ctl_relay_event	*cre = arg;
-	struct rsession		*con = cre->con;
+	struct rpeer		*peer = arg;
+	struct rstream		*cre = peer->stream;
+	struct rsession		*con = peer->con;
 	struct evbuffer		*dst;
 
 	DPRINTF("%s: session %d: dir %d state %d to read %lld event error %x",
-		__func__, con->se_id, cre->dir, cre->state, cre->toread, error);
+	    __func__, con->se_id, peer->dir, peer->state, cre->toread, error);
 	if (error & EVBUFFER_TIMEOUT) {
-		if (cre->splicelen >= 0) {
+		if (peer->splicelen >= 0) {
 			bufferevent_enable(bev, EV_READ);
-		} else if (cre->dst->splicelen >= 0) {
-			switch (relay_splicelen(cre->dst)) {
+		} else if (peer->dst->splicelen >= 0) {
+			switch (relay_splicelen(peer->dst)) {
 			case -1:
 				goto fail;
 			case 0:
 				relay_close(con, "buffer event timeout", 1);
 				break;
 			case 1:
-				cre->timedout = 1;
+				peer->timedout = 1;
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
@@ -1039,8 +1045,8 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 		return;
 	}
 	if (error & EVBUFFER_ERROR && errno == ETIMEDOUT) {
-		if (cre->dst->splicelen >= 0) {
-			switch (relay_splicelen(cre->dst)) {
+		if (peer->dst->splicelen >= 0) {
+			switch (relay_splicelen(peer->dst)) {
 			case -1:
 				goto fail;
 			case 0:
@@ -1050,28 +1056,28 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
-		} else if (cre->dst->timedout) {
+		} else if (peer->dst->timedout) {
 			relay_close(con, "splice timeout", 1);
 			return;
 		}
-		if (relay_spliceadjust(cre) == -1)
+		if (relay_spliceadjust(peer) == -1)
 			goto fail;
-		if (relay_splice(cre) == -1)
+		if (relay_splice(peer) == -1)
 			goto fail;
 		return;
 	}
 	if (error & EVBUFFER_ERROR && errno == EFBIG) {
-		if (relay_spliceadjust(cre) == -1)
+		if (relay_spliceadjust(peer) == -1)
 			goto fail;
-		bufferevent_enable(cre->bev, EV_READ);
+		bufferevent_enable(peer->bev, EV_READ);
 		return;
 	}
 	if (error & (EVBUFFER_READ|EVBUFFER_WRITE|EVBUFFER_EOF)) {
 		bufferevent_disable(bev, EV_READ|EV_WRITE);
 
 		con->se_done = 1;
-		if (cre->dst->bev != NULL) {
-			dst = EVBUFFER_OUTPUT(cre->dst->bev);
+		if (peer->dst->bev != NULL) {
+			dst = EVBUFFER_OUTPUT(peer->dst->bev);
 			if (EVBUFFER_LENGTH(dst))
 				return;
 		} else if (cre->toread == TOREAD_UNLIMITED || cre->toread == 0)
@@ -1092,7 +1098,8 @@ relay_accept(int fd, short event, void *arg)
 	struct privsep		*ps = env->sc_ps;
 	struct relay		*rlay = arg;
 	struct rsession		*con = NULL;
-	struct ctl_relay_event	*in, *out;
+	struct rpeer		*server, *client;
+	struct rstream		*in, *out;
 	struct ctl_natlook	*cnl = NULL;
 	socklen_t		 slen;
 	struct timeval		 tv;
@@ -1132,33 +1139,44 @@ relay_accept(int fd, short event, void *arg)
 		goto err;
 
 	in = &con->se_in;
+	server = &con->se_server;
 	out = &con->se_out;
+	client = &con->se_client;
 
-	in->s = s;
-	out->s = -1;
-	in->tls = NULL;
-	out->tls = NULL;
-	in->dst = &con->se_out;
-	out->dst = &con->se_in;
 	in->con = con;
 	out->con = con;
-	in->splicelen = -1;
-	out->splicelen = -1;
+	in->peer = server;
+	out->peer = client;
+	in->dst = out;
+	out->dst = in;
 	in->toread = TOREAD_UNLIMITED;
 	out->toread = TOREAD_UNLIMITED;
-	in->dir = RELAY_DIR_REQUEST;
-	out->dir = RELAY_DIR_RESPONSE;
 
-	memcpy(&in->ss, &ss, sizeof(in->ss));
+	server->con = con;
+	client->con = con;
+	server->s = s;
+	client->s = -1;
+	server->tls = NULL;
+	client->tls = NULL;
+	server->dst = client;
+	client->dst = server;
+	server->stream = in;
+	client->stream = out;
+	server->splicelen = -1;
+	client->splicelen = -1;
+	server->dir = RELAY_DIR_REQUEST;
+	client->dir = RELAY_DIR_RESPONSE;
+
+	memcpy(&server->ss, &ss, sizeof(server->ss));
 	switch (ss.ss_family) {
 	case AF_INET:
-		in->port = ((struct sockaddr_in *)&ss)->sin_port;
+		server->port = ((struct sockaddr_in *)&ss)->sin_port;
 		break;
 	case AF_INET6:
-		in->port = ((struct sockaddr_in6 *)&ss)->sin6_port;
+		server->port = ((struct sockaddr_in6 *)&ss)->sin6_port;
 		break;
 	}
-	out->port = rlay->rl_conf.dstport;
+	client->port = rlay->rl_conf.dstport;
 
 	con->se_relay = rlay;
 	con->se_id = ++relay_conid;
@@ -1189,22 +1207,22 @@ relay_accept(int fd, short event, void *arg)
 	rlay->rl_stats[ps->ps_instance].last++;
 
 	/* Pre-allocate output buffer */
-	out->output = evbuffer_new();
-	if (out->output == NULL) {
+	client->output = evbuffer_new();
+	if (client->output == NULL) {
 		relay_close(con, "failed to allocate output buffer", 1);
 		return;
 	}
 
 	if (rlay->rl_conf.flags & F_DIVERT) {
-		memcpy(&out->ss, &con->se_sockname,
-		    sizeof(out->ss));
-		out->port = relay_socket_getport(&out->ss);
+		memcpy(&client->ss, &con->se_sockname,
+		    sizeof(client->ss));
+		client->port = relay_socket_getport(&client->ss);
 
 		/* Detect loop and fall back to the alternate forward target */
-		if (bcmp(&rlay->rl_conf.ss, &out->ss,
-		    sizeof(out->ss)) == 0 &&
-		    out->port == rlay->rl_conf.port)
-			out->ss.ss_family = AF_UNSPEC;
+		if (bcmp(&rlay->rl_conf.ss, &client->ss,
+		    sizeof(client->ss)) == 0 &&
+		    client->port == rlay->rl_conf.port)
+			client->ss.ss_family = AF_UNSPEC;
 	} else if (rlay->rl_conf.flags & F_NATLOOK) {
 		if ((cnl = calloc(1, sizeof(*cnl))) == NULL) {
 			relay_close(con, "failed to allocate nat lookup", 1);
@@ -1218,7 +1236,7 @@ relay_accept(int fd, short event, void *arg)
 		cnl->proc = ps->ps_instance;
 		cnl->proto = IPPROTO_TCP;
 
-		memcpy(&cnl->src, &in->ss, sizeof(cnl->src));
+		memcpy(&cnl->src, &server->ss, sizeof(cnl->src));
 		memcpy(&cnl->dst, &con->se_sockname, sizeof(cnl->dst));
 
 		proc_compose(env->sc_ps, PROC_PFE, IMSG_NATLOOK,
@@ -1278,7 +1296,8 @@ relay_hash_addr(SIPHASH_CTX *ctx, struct sockaddr_storage *ss, int portset)
 int
 relay_from_table(struct rsession *con)
 {
-	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
+	struct rpeer		*client = &con->se_client;
+	struct rpeer		*server = &con->se_server;
 	struct relay		*rlay = con->se_relay;
 	struct host		*host = NULL;
 	struct relay_table	*rlt = NULL;
@@ -1325,11 +1344,11 @@ relay_from_table(struct rsession *con)
 		break;
 	case RELAY_DSTMODE_SRCHASH:
 		/* Source IP address without port */
-		relay_hash_addr(&con->se_siphashctx, &in->ss, -1);
+		relay_hash_addr(&con->se_siphashctx, &server->ss, -1);
 		break;
 	case RELAY_DSTMODE_LOADBALANCE:
 		/* Source IP address without port */
-		relay_hash_addr(&con->se_siphashctx, &in->ss, -1);
+		relay_hash_addr(&con->se_siphashctx, &server->ss, -1);
 		/* FALLTHROUGH */
 	case RELAY_DSTMODE_HASH:
 		/* Local "destination" IP address and port */
@@ -1394,8 +1413,8 @@ relay_from_table(struct rsession *con)
 	if (rlt->rlt_mode == RELAY_DSTMODE_ROUNDROBIN)
 		rlt->rlt_index = host->idx + 1;
 	con->se_retry = host->conf.retry;
-	out->port = table->conf.port;
-	bcopy(&host->conf.ss, &out->ss, sizeof(out->ss));
+	client->port = table->conf.port;
+	bcopy(&host->conf.ss, &client->ss, sizeof(client->ss));
 
 	return (0);
 }
@@ -1404,22 +1423,22 @@ void
 relay_natlook(int fd, short event, void *arg)
 {
 	struct rsession		*con = arg;
-	struct ctl_relay_event	*out = &con->se_out;
+	struct rpeer		*client = &con->se_client;
 	struct relay		*rlay = con->se_relay;
 	struct ctl_natlook	*cnl = con->se_cnl;
 
 	if (cnl == NULL)
 		fatalx("invalid NAT lookup");
 
-	if (out->ss.ss_family == AF_UNSPEC && cnl->in == -1 &&
+	if (client->ss.ss_family == AF_UNSPEC && cnl->in == -1 &&
 	    rlay->rl_conf.dstss.ss_family == AF_UNSPEC &&
 	    TAILQ_EMPTY(&rlay->rl_tables)) {
 		relay_close(con, "session NAT lookup failed", 1);
 		return;
 	}
 	if (cnl->in != -1) {
-		bcopy(&cnl->rdst, &out->ss, sizeof(out->ss));
-		out->port = cnl->rdport;
+		bcopy(&cnl->rdst, &client->ss, sizeof(client->ss));
+		client->port = cnl->rdport;
 	}
 	free(con->se_cnl);
 	con->se_cnl = NULL;
@@ -1430,11 +1449,12 @@ relay_natlook(int fd, short event, void *arg)
 void
 relay_session(struct rsession *con)
 {
-	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
+	struct rpeer		*client = &con->se_client;
+	struct rpeer		*server = &con->se_server;
 	struct relay		*rlay = con->se_relay;
 
-	if (bcmp(&rlay->rl_conf.ss, &out->ss, sizeof(out->ss)) == 0 &&
-	    out->port == rlay->rl_conf.port) {
+	if (bcmp(&rlay->rl_conf.ss, &client->ss, sizeof(client->ss)) == 0 &&
+	    client->port == rlay->rl_conf.port) {
 		log_debug("%s: session %d: looping", __func__, con->se_id);
 		relay_close(con, "session aborted", 1);
 		return;
@@ -1451,8 +1471,8 @@ relay_session(struct rsession *con)
 		return;
 	}
 
-	if ((rlay->rl_conf.flags & F_TLS) && (in->tls == NULL)) {
-		relay_tls_transaction(con, in);
+	if ((rlay->rl_conf.flags & F_TLS) && (server->tls == NULL)) {
+		relay_tls_transaction(con, server);
 		return;
 	}
 
@@ -1471,7 +1491,7 @@ relay_session(struct rsession *con)
 void
 relay_bindanyreq(struct rsession *con, in_port_t port, int proto)
 {
-	struct ctl_relay_event	*in = &con->se_in;
+	struct rpeer		*server = &con->se_server;
 	struct privsep		*ps = env->sc_ps;
 	struct relay		*rlay = con->se_relay;
 	struct ctl_bindany	 bnd;
@@ -1482,7 +1502,7 @@ relay_bindanyreq(struct rsession *con, in_port_t port, int proto)
 	bnd.bnd_proc = ps->ps_instance;
 	bnd.bnd_port = port;
 	bnd.bnd_proto = proto;
-	bcopy(&in->ss, &bnd.bnd_ss, sizeof(bnd.bnd_ss));
+	bcopy(&server->ss, &bnd.bnd_ss, sizeof(bnd.bnd_ss));
 	proc_compose(env->sc_ps, PROC_PARENT, IMSG_BINDANY,
 	    &bnd, sizeof(bnd));
 
@@ -1506,24 +1526,24 @@ relay_bindany(int fd, short event, void *arg)
 }
 
 void
-relay_connect_state(struct rsession *con, struct ctl_relay_event *cre,
+relay_connect_state(struct rsession *con, struct rpeer *peer,
     enum relay_state new)
 {
 	DPRINTF("%s: session %d: %s state %s -> %s",
 	    __func__, con->se_id,
-	    cre->dir == RELAY_DIR_REQUEST ? "accept" : "connect",
-	    relay_state(cre->state), relay_state(new));
-	cre->state = new;
+	    peer->dir == RELAY_DIR_REQUEST ? "accept" : "connect",
+	    relay_state(peer->state), relay_state(new));
+	peer->state = new;
 }
 
 void
 relay_connect_retry(int fd, short sig, void *arg)
 {
-	struct timeval		 evtpause = { 1, 0 };
 	struct rsession		*con = arg;
+	struct rpeer		*client = &con->se_client;
+	struct timeval		 evtpause = { 1, 0 };
 	struct relay		*rlay = con->se_relay;
 	int			 bnds = -1;
-	struct ctl_relay_event	*out = &con->se_out;
 
 	if (relay_inflight < 1) {
 		log_warnx("%s: no connection in flight", __func__);
@@ -1563,8 +1583,8 @@ relay_connect_retry(int fd, short sig, void *arg)
 	}
 
  retry:
-	if ((out->s = relay_socket_connect(&out->ss,
-	    out->port, rlay->rl_proto, bnds)) == -1) {
+	if ((client->s = relay_socket_connect(&client->ss,
+	    client->port, rlay->rl_proto, bnds)) == -1) {
 		log_debug("%s: session %d: "
 		    "forward failed: %s, %s", __func__,
 		    con->se_id, strerror(errno),
@@ -1586,20 +1606,20 @@ relay_connect_retry(int fd, short sig, void *arg)
 	}
 
 	if (rlay->rl_conf.flags & F_TLSINSPECT)
-		relay_connect_state(con, out, STATE_PRECONNECT);
+		relay_connect_state(con, client, STATE_PRECONNECT);
 	else
-		relay_connect_state(con, out, STATE_CONNECTED);
+		relay_connect_state(con, client, STATE_CONNECTED);
 	relay_inflight--;
 	DPRINTF("%s: inflight decremented, now %d",__func__, relay_inflight);
 
 	event_add(&rlay->rl_ev, NULL);
 
 	if (errno == EINPROGRESS)
-		event_again(&con->se_ev, out->s, EV_WRITE|EV_TIMEOUT,
+		event_again(&con->se_ev, client->s, EV_WRITE|EV_TIMEOUT,
 		    relay_connected, &con->se_tv_start, &rlay->rl_conf.timeout,
 		    con);
 	else
-		relay_connected(out->s, EV_WRITE, con);
+		relay_connected(client->s, EV_WRITE, con);
 
 	return;
 }
@@ -1607,40 +1627,40 @@ relay_connect_retry(int fd, short sig, void *arg)
 int
 relay_preconnect(struct rsession *con)
 {
-	struct ctl_relay_event	*out = &con->se_out;
+	struct rpeer		*client = &con->se_client;
 	int			 rv;
 
 	log_debug("%s: session %d: process %d", __func__,
 	    con->se_id, privsep_process);
 	rv = relay_connect(con);
-	if (out->state == STATE_CONNECTED)
-		relay_connect_state(con, out, STATE_PRECONNECT);
+	if (client->state == STATE_CONNECTED)
+		relay_connect_state(con, client, STATE_PRECONNECT);
 	return (rv);
 }
 
 int
 relay_connect(struct rsession *con)
 {
+	struct rpeer		*client = &con->se_client;
 	struct relay		*rlay = con->se_relay;
 	struct timeval		 evtpause = { 1, 0 };
 	int			 bnds = -1, ret;
-	struct ctl_relay_event	*out = &con->se_out;
 
 	/* relay_connect should only be called once per relay */
-	if (out->state == STATE_CONNECTED) {
+	if (client->state == STATE_CONNECTED) {
 		log_debug("%s: connect already called once", __func__);
 		return (0);
 	}
 
 	/* Connection is already established but session not active */
 	if ((rlay->rl_conf.flags & F_TLSINSPECT) &&
-	    out->state == STATE_PRECONNECT) {
-		if (out->tls == NULL) {
+	    client->state == STATE_PRECONNECT) {
+		if (client->tls == NULL) {
 			log_debug("%s: tls connect failed", __func__);
 			return (-1);
 		}
-		relay_connected(out->s, EV_WRITE, con);
-		relay_connect_state(con, out, STATE_CONNECTED);
+		relay_connected(client->s, EV_WRITE, con);
+		relay_connect_state(con, client, STATE_CONNECTED);
 		return (0);
 	}
 
@@ -1654,10 +1674,10 @@ relay_connect(struct rsession *con)
 	if (!TAILQ_EMPTY(&rlay->rl_tables)) {
 		if (relay_from_table(con) != 0)
 			return (-1);
-	} else if (out->ss.ss_family == AF_UNSPEC) {
-		bcopy(&rlay->rl_conf.dstss, &out->ss,
-		    sizeof(out->ss));
-		out->port = rlay->rl_conf.dstport;
+	} else if (client->ss.ss_family == AF_UNSPEC) {
+		bcopy(&rlay->rl_conf.dstss, &client->ss,
+		    sizeof(client->ss));
+		client->port = rlay->rl_conf.dstport;
 	}
 
 	if (rlay->rl_conf.fwdmode == FWD_TRANS) {
@@ -1670,12 +1690,12 @@ relay_connect(struct rsession *con)
 
 	/* Do the IPv4-to-IPv6 or IPv6-to-IPv4 translation if requested */
 	if (rlay->rl_conf.dstaf.ss_family != AF_UNSPEC) {
-		if (out->ss.ss_family == AF_INET &&
+		if (client->ss.ss_family == AF_INET &&
 		    rlay->rl_conf.dstaf.ss_family == AF_INET6)
-			ret = map4to6(&out->ss, &rlay->rl_conf.dstaf);
-		else if (out->ss.ss_family == AF_INET6 &&
+			ret = map4to6(&client->ss, &rlay->rl_conf.dstaf);
+		else if (client->ss.ss_family == AF_INET6 &&
 		    rlay->rl_conf.dstaf.ss_family == AF_INET)
-			ret = map6to4(&out->ss);
+			ret = map6to4(&client->ss);
 		else
 			ret = 0;
 		if (ret != 0) {
@@ -1685,8 +1705,8 @@ relay_connect(struct rsession *con)
 	}
 
  retry:
-	if ((out->s = relay_socket_connect(&out->ss,
-	    out->port, rlay->rl_proto, bnds)) == -1) {
+	if ((client->s = relay_socket_connect(&client->ss,
+	    client->port, rlay->rl_proto, bnds)) == -1) {
 		if (errno == ENFILE || errno == EMFILE) {
 			log_debug("%s: session %d: forward failed: %s",
 			    __func__, con->se_id, strerror(errno));
@@ -1697,7 +1717,7 @@ relay_connect(struct rsession *con)
 			evtimer_add(&rlay->rl_evt, &evtpause);
 
 			/* this connect is pending */
-			relay_connect_state(con, out, STATE_PENDING);
+			relay_connect_state(con, client, STATE_PENDING);
 			return (0);
 		} else {
 			if (con->se_retry) {
@@ -1715,17 +1735,17 @@ relay_connect(struct rsession *con)
 		}
 	}
 
-	relay_connect_state(con, out, STATE_CONNECTED);
+	relay_connect_state(con, client, STATE_CONNECTED);
 	relay_inflight--;
 	DPRINTF("%s: inflight decremented, now %d",__func__,
 	    relay_inflight);
 
 	if (errno == EINPROGRESS)
-		event_again(&con->se_ev, out->s, EV_WRITE|EV_TIMEOUT,
+		event_again(&con->se_ev, client->s, EV_WRITE|EV_TIMEOUT,
 		    relay_connected, &con->se_tv_start, &rlay->rl_conf.timeout,
 		    con);
 	else
-		relay_connected(out->s, EV_WRITE, con);
+		relay_connected(client->s, EV_WRITE, con);
 
 	return (0);
 }
@@ -1733,10 +1753,10 @@ relay_connect(struct rsession *con)
 void
 relay_close(struct rsession *con, const char *msg, int err)
 {
-	char			 ibuf[128], obuf[128], *ptr = NULL;
-	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
-	struct relay		*rlay = con->se_relay;
-	struct protocol		*proto = rlay->rl_proto;
+	char		 ibuf[128], obuf[128], *ptr = NULL;
+	struct rpeer	*client = &con->se_client, *server = &con->se_server;
+	struct relay	*rlay = con->se_relay;
+	struct protocol	*proto = rlay->rl_proto;
 
 	SPLAY_REMOVE(session_tree, &rlay->rl_sessions, con);
 	relay_session_unpublish(con);
@@ -1747,8 +1767,8 @@ relay_close(struct rsession *con, const char *msg, int err)
 	    msg != NULL) {
 		bzero(&ibuf, sizeof(ibuf));
 		bzero(&obuf, sizeof(obuf));
-		(void)print_host(&in->ss, ibuf, sizeof(ibuf));
-		(void)print_host(&out->ss, obuf, sizeof(obuf));
+		(void)print_host(&server->ss, ibuf, sizeof(ibuf));
+		(void)print_host(&client->ss, obuf, sizeof(obuf));
 		if (EVBUFFER_LENGTH(con->se_log) &&
 		    evbuffer_add_printf(con->se_log, "\r\n") != -1) {
 			ptr = evbuffer_readln(con->se_log, NULL,
@@ -1760,7 +1780,7 @@ relay_close(struct rsession *con, const char *msg, int err)
 			    "%s%s%s", rlay->rl_conf.name, con->se_id,
 			    relay_sessions, con->se_tag != 0 ?
 			    tag_id2name(con->se_tag) : "0", ibuf, obuf,
-			    ntohs(out->port), msg, ptr == NULL ?
+			    ntohs(client->port), msg, ptr == NULL ?
 			    "" : ",", ptr == NULL ? "" : ptr);
 		if (err == 1 && (env->sc_conf.opts & RELAYD_OPT_LOGCONERR))
 			log_warn("relay %s, "
@@ -1768,7 +1788,7 @@ relay_close(struct rsession *con, const char *msg, int err)
 			    "%s%s%s", rlay->rl_conf.name, con->se_id,
 			    relay_sessions, con->se_tag != 0 ?
 			    tag_id2name(con->se_tag) : "0", ibuf, obuf,
-			    ntohs(out->port), msg, ptr == NULL ?
+			    ntohs(client->port), msg, ptr == NULL ?
 			    "" : ",", ptr == NULL ? "" : ptr);
 		free(ptr);
 	}
@@ -1778,9 +1798,9 @@ relay_close(struct rsession *con, const char *msg, int err)
 
 	free(con->se_priv);
 
-	relay_connect_state(con, in, STATE_DONE);
-	if (relay_reset_event(con, in)) {
-		if (out->s == -1) {
+	relay_connect_state(con, server, STATE_DONE);
+	if (relay_reset_event(con, server)) {
+		if (client->s == -1) {
 			/*
 			 * the output was never connected,
 			 * thus this was an inflight session.
@@ -1790,19 +1810,19 @@ relay_close(struct rsession *con, const char *msg, int err)
 			    __func__, relay_inflight);
 		}
 	}
-	if (in->output != NULL)
-		evbuffer_free(in->output);
+	if (server->output != NULL)
+		evbuffer_free(server->output);
 
-	relay_connect_state(con, out, STATE_DONE);
-	if (relay_reset_event(con, out)) {
+	relay_connect_state(con, client, STATE_DONE);
+	if (relay_reset_event(con, client)) {
 		/* Some file descriptors are available again. */
 		if (evtimer_pending(&rlay->rl_evt, NULL)) {
 			evtimer_del(&rlay->rl_evt);
 			event_add(&rlay->rl_ev, NULL);
 		}
 	}
-	if (out->output != NULL)
-		evbuffer_free(out->output);
+	if (client->output != NULL)
+		evbuffer_free(client->output);
 
 	if (con->se_log != NULL)
 		evbuffer_free(con->se_log);
@@ -1820,31 +1840,31 @@ relay_close(struct rsession *con, const char *msg, int err)
 }
 
 int
-relay_reset_event(struct rsession *con, struct ctl_relay_event *cre)
+relay_reset_event(struct rsession *con, struct rpeer *peer)
 {
 	int		 rv = 0;
 
-	if (cre->state != STATE_DONE)
-		relay_connect_state(con, cre, STATE_CLOSED);
-	if (cre->bev != NULL) {
-		bufferevent_disable(cre->bev, EV_READ|EV_WRITE);
-		bufferevent_free(cre->bev);
+	if (peer->state != STATE_DONE)
+		relay_connect_state(con, peer,STATE_CLOSED);
+	if (peer->bev != NULL) {
+		bufferevent_disable(peer->bev, EV_READ|EV_WRITE);
+		bufferevent_free(peer->bev);
 	}
-	if (cre->tls != NULL)
-		tls_close(cre->tls);
-	tls_free(cre->tls);
-	tls_free(cre->tls_ctx);
-	tls_config_free(cre->tls_cfg);
-	free(cre->tlscert);
-	if (cre->s != -1) {
-		close(cre->s);
+	if (peer->tls != NULL)
+		tls_close(peer->tls);
+	tls_free(peer->tls);
+	tls_free(peer->tls_ctx);
+	tls_config_free(peer->tls_cfg);
+	free(peer->tlscert);
+	if (peer->s != -1) {
+		close(peer->s);
 		rv = 1;
 	}
-	cre->bev = NULL;
-	cre->tls = NULL;
-	cre->tls_cfg = NULL;
-	cre->tlscert = NULL;
-	cre->s = -1;
+	peer->bev = NULL;
+	peer->tls = NULL;
+	peer->tls_cfg = NULL;
+	peer->tlscert = NULL;
+	peer->s = -1;
 
 	return (rv);
 }
@@ -2306,7 +2326,7 @@ relay_tls_ctx_create(struct relay *rlay)
 }
 
 static struct tls *
-relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
+relay_tls_inspect_create(struct relay *rlay, struct rpeer *peer)
 {
 	struct tls_config	*tls_cfg;
 	struct tls		*tls = NULL;
@@ -2326,13 +2346,13 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 	tls_config_skip_private_key_check(tls_cfg);
 
 	log_debug("%s: loading intercepted certificate", __func__);
-	if ((fake_keylen = ssl_ctx_fake_private_key(cre->tlscert,
-	    cre->tlscert_len, &fake_key)) == -1) {
+	if ((fake_keylen = ssl_ctx_fake_private_key(peer->tlscert,
+	    peer->tlscert_len, &fake_key)) == -1) {
 		/* error already printed */
 		goto err;
 	}
 	if (tls_config_set_keypair_ocsp_mem(tls_cfg,
-	    cre->tlscert, cre->tlscert_len, fake_key, fake_keylen,
+	    peer->tlscert, peer->tlscert_len, fake_key, fake_keylen,
 	    NULL, 0) != 0) {
 		log_warnx("failed to set tls certificate: %s",
 		    tls_config_error(tls_cfg));
@@ -2351,8 +2371,8 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 		goto err;
 	}
 
-	cre->tls_cfg = tls_cfg;
-	cre->tls_ctx = tls;
+	peer->tls_cfg = tls_cfg;
+	peer->tls_ctx = tls;
 	return (tls);
  err:
 	tls_config_free(tls_cfg);
@@ -2360,16 +2380,16 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 }
 
 void
-relay_tls_transaction(struct rsession *con, struct ctl_relay_event *cre)
+relay_tls_transaction(struct rsession *con, struct rpeer *peer)
 {
 	struct relay		*rlay = con->se_relay;
 	struct tls		*tls_server;
 	const char		*errstr;
 	u_int			 flag;
 
-	if (cre->dir == RELAY_DIR_REQUEST) {
-		if (cre->tlscert != NULL)
-			tls_server = relay_tls_inspect_create(rlay, cre);
+	if (peer->dir == RELAY_DIR_REQUEST) {
+		if (peer->tlscert != NULL)
+			tls_server = relay_tls_inspect_create(rlay, peer);
 		else
 			tls_server = rlay->rl_tls_ctx;
 		if (tls_server == NULL) {
@@ -2377,19 +2397,19 @@ relay_tls_transaction(struct rsession *con, struct ctl_relay_event *cre)
 			goto err;
 		}
 
-		if (tls_accept_socket(tls_server, &cre->tls, cre->s) == -1) {
+		if (tls_accept_socket(tls_server, &peer->tls, peer->s) == -1) {
 			errstr = "could not accept the TLS connection";
 			goto err;
 		}
 		flag = EV_READ;
 	} else {
-		cre->tls = tls_client();
-		if (cre->tls == NULL ||
-		    tls_configure(cre->tls, rlay->rl_tls_client_cfg) == -1) {
+		peer->tls = tls_client();
+		if (peer->tls == NULL ||
+		    tls_configure(peer->tls, rlay->rl_tls_client_cfg) == -1) {
 			errstr = "could not configure the TLS client context";
 			goto err;
 		}
-		if (tls_connect_socket(cre->tls, cre->s, NULL) == -1) {
+		if (tls_connect_socket(peer->tls, peer->s, NULL) == -1) {
 			errstr = "could not connect the TLS connection";
 			goto err;
 		}
@@ -2398,8 +2418,8 @@ relay_tls_transaction(struct rsession *con, struct ctl_relay_event *cre)
 
 	log_debug("%s: session %d: scheduling on %s", __func__, con->se_id,
 	    (flag == EV_READ) ? "EV_READ" : "EV_WRITE");
-	event_again(&con->se_ev, cre->s, EV_TIMEOUT|flag, relay_tls_handshake,
-	    &con->se_tv_start, &rlay->rl_conf.timeout, cre);
+	event_again(&con->se_ev, peer->s, EV_TIMEOUT|flag, relay_tls_handshake,
+	    &con->se_tv_start, &rlay->rl_conf.timeout, peer);
 	return;
 
  err:
@@ -2409,9 +2429,10 @@ relay_tls_transaction(struct rsession *con, struct ctl_relay_event *cre)
 void
 relay_tls_handshake(int fd, short event, void *arg)
 {
-	struct ctl_relay_event	*cre = arg;
-	struct rsession		*con = cre->con;
-	struct ctl_relay_event	*in = &con->se_in, *out = &con->se_out;
+	struct rpeer		*peer = arg;
+	struct rsession		*con = peer->con;
+	struct rpeer		*client = &con->se_client;
+	struct rpeer		*server = &con->se_server;
 	struct relay		*rlay = con->se_relay;
 	int			 retry_flag = 0;
 	int			 ret;
@@ -2422,7 +2443,7 @@ relay_tls_handshake(int fd, short event, void *arg)
 		return;
 	}
 
-	ret = tls_handshake(cre->tls);
+	ret = tls_handshake(peer->tls);
 	if (ret == 0) {
 #ifdef DEBUG
 		log_info(
@@ -2431,10 +2452,10 @@ relay_tls_handshake(int fd, short event, void *arg)
 #endif
 		    "relay %s, tls session %d %s (%d active)",
 		    rlay->rl_conf.name, con->se_id,
-		    cre->dir == RELAY_DIR_REQUEST ? "established" : "connected",
+		    peer->dir == RELAY_DIR_REQUEST ? "established" : "connected",
 		    relay_sessions);
 
-		if (cre->dir == RELAY_DIR_REQUEST) {
+		if (peer->dir == RELAY_DIR_REQUEST) {
 			relay_session(con);
 			return;
 		}
@@ -2443,17 +2464,17 @@ relay_tls_handshake(int fd, short event, void *arg)
 			const uint8_t	*servercert;
 			size_t		 len;
 
-			servercert = tls_peer_cert_chain_pem(out->tls,
+			servercert = tls_peer_cert_chain_pem(client->tls,
 			    &len);
 			if (servercert != NULL) {
-				in->tlscert = ssl_update_certificate(
+				server->tlscert = ssl_update_certificate(
 				    servercert, len,
 				    rlay->rl_tls_pkey, rlay->rl_tls_capkey,
 				    rlay->rl_tls_cacertx509,
-				    &in->tlscert_len);
+				    &server->tlscert_len);
 			} else
-				in->tlscert = NULL;
-			if (in->tlscert == NULL)
+				server->tlscert = NULL;
+			if (server->tlscert == NULL)
 				relay_close(con,
 				    "could not create certificate", 1);
 			else
@@ -2468,7 +2489,7 @@ relay_tls_handshake(int fd, short event, void *arg)
 		retry_flag = EV_WRITE;
 	} else {
 		if (asprintf(&msg, "TLS handshake error: %s",
-		    tls_error(cre->tls)) >= 0) {
+		    tls_error(peer->tls)) >= 0) {
 			relay_close(con, msg, 1);
 			free(msg);
 		} else {
@@ -2480,23 +2501,23 @@ relay_tls_handshake(int fd, short event, void *arg)
 	DPRINTF("%s: session %d: scheduling on %s", __func__, con->se_id,
 	    (retry_flag == EV_READ) ? "EV_READ" : "EV_WRITE");
 	event_again(&con->se_ev, fd, EV_TIMEOUT|retry_flag, relay_tls_handshake,
-	    &con->se_tv_start, &rlay->rl_conf.timeout, cre);
+	    &con->se_tv_start, &rlay->rl_conf.timeout, peer);
 }
 
 void
-relay_tls_connected(struct ctl_relay_event *cre)
+relay_tls_connected(struct rpeer *peer)
 {
 	/*
 	 * Hack libevent - we overwrite the internal bufferevent I/O
 	 * functions to handle the TLS abstraction.
 	 */
-	event_del(&cre->bev->ev_read);
-	event_del(&cre->bev->ev_write);
+	event_del(&peer->bev->ev_read);
+	event_del(&peer->bev->ev_write);
 
-	event_set(&cre->bev->ev_read, cre->s, EV_READ,
-	    relay_tls_readcb, cre->bev);
-	event_set(&cre->bev->ev_write, cre->s, EV_WRITE,
-	    relay_tls_writecb, cre->bev);
+	event_set(&peer->bev->ev_read, peer->s, EV_READ,
+	    relay_tls_readcb, peer->bev);
+	event_set(&peer->bev->ev_write, peer->s, EV_WRITE,
+	    relay_tls_writecb, peer->bev);
 }
 
 void
@@ -2504,7 +2525,7 @@ relay_tls_readcb(int fd, short event, void *arg)
 {
 	char			 rbuf[IBUF_READ_SIZE];
 	struct bufferevent	*bufev = arg;
-	struct ctl_relay_event	*cre = bufev->cbarg;
+	struct rpeer		*peer = bufev->cbarg;
 	short			 what = EVBUFFER_READ;
 	int			 howmuch = IBUF_READ_SIZE;
 	ssize_t			 ret;
@@ -2518,7 +2539,7 @@ relay_tls_readcb(int fd, short event, void *arg)
 	if (bufev->wm_read.high != 0)
 		howmuch = MINIMUM(sizeof(rbuf), bufev->wm_read.high);
 
-	ret = tls_read(cre->tls, rbuf, howmuch);
+	ret = tls_read(peer->tls, rbuf, howmuch);
 	if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 		goto retry;
 	} else if (ret < 0) {
@@ -2565,7 +2586,7 @@ void
 relay_tls_writecb(int fd, short event, void *arg)
 {
 	struct bufferevent	*bufev = arg;
-	struct ctl_relay_event	*cre = bufev->cbarg;
+	struct rpeer		*peer = bufev->cbarg;
 	ssize_t			 ret;
 	size_t			 len;
 	short			 what = EVBUFFER_WRITE;
@@ -2576,7 +2597,7 @@ relay_tls_writecb(int fd, short event, void *arg)
 	}
 
 	if (EVBUFFER_LENGTH(bufev->output)) {
-		ret = tls_write(cre->tls, EVBUFFER_DATA(bufev->output),
+		ret = tls_write(peer->tls, EVBUFFER_DATA(bufev->output),
 		    EVBUFFER_LENGTH(bufev->output));
 		if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 			goto retry;
@@ -2620,58 +2641,58 @@ relay_bufferevent_add(struct event *ev, int timeout)
 
 #ifdef notyet
 int
-relay_bufferevent_printf(struct ctl_relay_event *cre, const char *fmt, ...)
+relay_bufferevent_printf(struct rpeer *peer, const char *fmt, ...)
 {
 	int	ret;
 	va_list	ap;
 
 	va_start(ap, fmt);
-	ret = evbuffer_add_vprintf(cre->output, fmt, ap);
+	ret = evbuffer_add_vprintf(peer->output, fmt, ap);
 	va_end(ap);
 
-	if (cre->bev != NULL &&
-	    ret != -1 && EVBUFFER_LENGTH(cre->output) > 0 &&
-	    (cre->bev->enabled & EV_WRITE))
-		bufferevent_enable(cre->bev, EV_WRITE);
+	if (peer->bev != NULL &&
+	    ret != -1 && EVBUFFER_LENGTH(peer->output) > 0 &&
+	    (peer->bev->enabled & EV_WRITE))
+		bufferevent_enable(peer->bev, EV_WRITE);
 
 	return (ret);
 }
 #endif
 
 int
-relay_bufferevent_print(struct ctl_relay_event *cre, const char *str)
+relay_bufferevent_print(struct rpeer *peer, const char *str)
 {
-	if (cre->bev == NULL)
-		return (evbuffer_add(cre->output, str, strlen(str)));
-	return (bufferevent_write(cre->bev, str, strlen(str)));
+	if (peer->bev == NULL)
+		return (evbuffer_add(peer->output, str, strlen(str)));
+	return (bufferevent_write(peer->bev, str, strlen(str)));
 }
 
 int
-relay_bufferevent_write_buffer(struct ctl_relay_event *cre,
+relay_bufferevent_write_buffer(struct rpeer *peer,
     struct evbuffer *buf)
 {
-	if (cre->bev == NULL)
-		return (evbuffer_add_buffer(cre->output, buf));
-	return (bufferevent_write_buffer(cre->bev, buf));
+	if (peer->bev == NULL)
+		return (evbuffer_add_buffer(peer->output, buf));
+	return (bufferevent_write_buffer(peer->bev, buf));
 }
 
 int
-relay_bufferevent_write_chunk(struct ctl_relay_event *cre,
+relay_bufferevent_write_chunk(struct rpeer *peer,
     struct evbuffer *buf, size_t size)
 {
 	int ret;
-	ret = relay_bufferevent_write(cre, buf->buffer, size);
+	ret = relay_bufferevent_write(peer, buf->buffer, size);
 	if (ret != -1)
 		evbuffer_drain(buf, size);
 	return (ret);
 }
 
 int
-relay_bufferevent_write(struct ctl_relay_event *cre, void *data, size_t size)
+relay_bufferevent_write(struct rpeer *peer, void *data, size_t size)
 {
-	if (cre->bev == NULL)
-		return (evbuffer_add(cre->output, data, size));
-	return (bufferevent_write(cre->bev, data, size));
+	if (peer->bev == NULL)
+		return (evbuffer_add(peer->output, data, size));
+	return (bufferevent_write(peer->bev, data, size));
 }
 
 int

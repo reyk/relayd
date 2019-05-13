@@ -203,30 +203,39 @@ enum relay_state {
 	STATE_DONE
 };
 
-struct ctl_relay_event {
+struct rpeer {
+	enum direction		 dir;
+
+	struct rpeer		*dst;
+	struct rsession		*con;
+	struct rstream		*stream;
+
 	int			 s;
 	in_port_t		 port;
 	struct sockaddr_storage	 ss;
 	struct bufferevent	*bev;
 	struct evbuffer		*output;
-	struct ctl_relay_event	*dst;
-	struct rsession		*con;
 
 	struct tls		*tls;
 	struct tls_config	*tls_cfg;
 	struct tls		*tls_ctx;
-
 	uint8_t			*tlscert;
 	size_t			 tlscert_len;
 
+	enum relay_state	 state;
+	int			 timedout;
 	off_t			 splicelen;
+};
+
+struct rstream {
+	struct rstream	*dst;
+	struct rpeer		*peer;
+	struct rsession		*con;
+
 	off_t			 toread;
 	size_t			 headerlen;
 	int			 line;
 	int			 done;
-	int			 timedout;
-	enum relay_state	 state;
-	enum direction		 dir;
 
 	/* protocol-specific descriptor */
 	void			*desc;
@@ -558,8 +567,10 @@ struct rsession {
 	objid_t				 se_id;
 	objid_t				 se_relayid;
 	struct sockaddr_storage		 se_sockname;
-	struct ctl_relay_event		 se_in;
-	struct ctl_relay_event		 se_out;
+	struct rpeer			 se_client;
+	struct rpeer			 se_server;
+	struct rstream			 se_in;
+	struct rstream			 se_out;
 	void				*se_priv;
 	SIPHASH_CTX			 se_siphashctx;
 	struct relay_table		*se_table;
@@ -1206,7 +1217,7 @@ int	 relay_privinit(struct relay *);
 void	 relay_notify_done(struct host *, const char *);
 int	 relay_session_cmp(struct rsession *, struct rsession *);
 void	 relay_close(struct rsession *, const char *, int);
-int	 relay_reset_event(struct rsession *, struct ctl_relay_event *);
+int	 relay_reset_event(struct rsession *, struct rpeer *);
 void	 relay_natlook(int, short, void *);
 void	 relay_session(struct rsession *);
 int	 relay_from_table(struct rsession *);
@@ -1217,25 +1228,23 @@ int	 relay_cmp_af(struct sockaddr_storage *,
 	    struct sockaddr_storage *);
 void	 relay_write(struct bufferevent *, void *);
 void	 relay_read(struct bufferevent *, void *);
-int	 relay_splice(struct ctl_relay_event *);
-int	 relay_splicelen(struct ctl_relay_event *);
-int	 relay_spliceadjust(struct ctl_relay_event *);
+int	 relay_splice(struct rpeer *);
+int	 relay_splicelen(struct rpeer *);
+int	 relay_spliceadjust(struct rpeer *);
 void	 relay_error(struct bufferevent *, short, void *);
 int	 relay_preconnect(struct rsession *);
 int	 relay_connect(struct rsession *);
 void	 relay_connected(int, short, void *);
 void	 relay_bindanyreq(struct rsession *, in_port_t, int);
 void	 relay_bindany(int, short, void *);
-void	 relay_dump(struct ctl_relay_event *, const void *, size_t);
+void	 relay_dump(struct rpeer *, const void *, size_t);
 int	 relay_bufferevent_add(struct event *, int);
-int	 relay_bufferevent_print(struct ctl_relay_event *, const char *);
-int	 relay_bufferevent_write_buffer(struct ctl_relay_event *,
-	    struct evbuffer *);
-int	 relay_bufferevent_write_chunk(struct ctl_relay_event *,
+int	 relay_bufferevent_print(struct rpeer *, const char *);
+int	 relay_bufferevent_write_buffer(struct rpeer *, struct evbuffer *);
+int	 relay_bufferevent_write_chunk(struct rpeer *,
 	    struct evbuffer *, size_t);
-int	 relay_bufferevent_write(struct ctl_relay_event *,
-	    void *, size_t);
-int	 relay_test(struct protocol *, struct ctl_relay_event *);
+int	 relay_bufferevent_write(struct rpeer *, void *, size_t);
+int	 relay_test(struct protocol *, struct rstream *);
 void	 relay_calc_skip_steps(struct relay_rules *);
 void	 relay_match(struct kvlist *, struct kv *, struct kv *,
 	    struct kvtree *);
@@ -1259,7 +1268,7 @@ const char
 const char
 	*relay_httperror_byid(u_int);
 int	 relay_http_priv_init(struct rsession *);
-int	 relay_httpdesc_init(struct ctl_relay_event *);
+int	 relay_httpdesc_init(struct rstream *);
 ssize_t	 relay_http_time(time_t, char *, size_t);
 
 /* relay_udp.c */

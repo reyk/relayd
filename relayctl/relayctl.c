@@ -455,11 +455,12 @@ show_session_msg(struct imsg *imsg)
 	case IMSG_CTL_SESSION:
 		con = imsg->data;
 
-		(void)print_host(&con->se_in.ss, a, sizeof(a));
-		(void)print_host(&con->se_out.ss, b, sizeof(b));
+		(void)print_host(&con->se_server.ss, a, sizeof(a));
+		(void)print_host(&con->se_client.ss, b, sizeof(b));
 		printf("session %u:%u %s:%u -> %s:%u\t%s\n",
 		    imsg->hdr.peerid, con->se_id,
-		    a, ntohs(con->se_in.port), b, ntohs(con->se_out.port),
+		    a, ntohs(con->se_server.port),
+		    b, ntohs(con->se_client.port),
 		    con->se_done ? "DONE" : "RUNNING");
 
 		getmonotime(&tv_now);
