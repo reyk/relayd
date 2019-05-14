@@ -102,6 +102,8 @@ static struct privsep_proc procs[] = {
 void
 relay(struct privsep *ps, struct privsep_proc *p)
 {
+	if (hpack_init() == -1)
+		fatalx("failed to init HPACK");
 	env = ps->ps_env;
 	proc_run(ps, p, procs, nitems(procs), relay_init, NULL);
 	relay_http(env);
@@ -2224,6 +2226,9 @@ relay_tls_ctx_create(struct relay *rlay)
 		 */
 		tls_config_skip_private_key_check(tls_cfg);
 
+		/* advertise HTTP/2 */
+		tls_config_set_alpn(tls_cfg, "h2");
+
 		TAILQ_FOREACH(cert, env->sc_certs, cert_entry) {
 			if (cert->cert_relayid != rlay->rl_conf.id ||
 			    cert->cert_fd == -1)
@@ -2252,8 +2257,6 @@ relay_tls_ctx_create(struct relay *rlay)
 				/* error already printed */
 				goto err;
 			}
-
-			log_debug("%s: keyfound %d", __func__, keyfound);
 
 			if (keyfound == 1 &&
 			    tls_config_set_keypair_ocsp_mem(tls_cfg, buf, len,
@@ -2507,6 +2510,11 @@ relay_tls_handshake(int fd, short event, void *arg)
 void
 relay_tls_connected(struct rpeer *peer)
 {
+	const char *alpn = tls_conn_alpn_selected(peer->tls);
+
+	if (alpn != NULL)
+		relay_http2(peer, alpn);
+
 	/*
 	 * Hack libevent - we overwrite the internal bufferevent I/O
 	 * functions to handle the TLS abstraction.

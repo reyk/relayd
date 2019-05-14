@@ -39,6 +39,8 @@
 #include <openssl/ssl.h>
 #include <tls.h>
 
+#include "hpack.h"
+
 #ifndef nitems
 #define	nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
 #endif
@@ -1270,6 +1272,9 @@ const char
 int	 relay_http_priv_init(struct rsession *);
 int	 relay_httpdesc_init(struct rstream *);
 ssize_t	 relay_http_time(time_t, char *, size_t);
+
+/* relay_http2.c */
+void	 relay_http2(struct rpeer *, const char *);
 
 /* relay_udp.c */
 void	 relay_udp_privinit(struct relay *);

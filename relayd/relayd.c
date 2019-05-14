@@ -216,6 +216,10 @@ main(int argc, char *argv[])
 	/* only the parent returns */
 	proc_init(ps, procs, nitems(procs), debug, argc0, argv, proc_id);
 
+	log_warnx("XXX BIG FAT WARNING: THIS BRANCH IS EXPERIMENTAL XXX");
+	log_warnx("XXX HTTP/2 IS *N*O*T* SUPPORTED YET, THIS IS WIP XXX");
+	sleep(3);
+
 	log_procinit("parent");
 	if (!debug && daemon(1, 0) == -1)
 		err(1, "failed to daemonize");
