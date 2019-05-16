@@ -38,6 +38,13 @@ static struct huffman_node *
 		 huffman_new(void);
 static void	 huffman_free(struct huffman_node *);
 
+static struct hbuf *
+		 hbuf_new(unsigned char *, size_t);
+static void	 hbuf_free(struct hbuf *);
+static int	 hbuf_writechar(struct hbuf *, unsigned char);
+static int	 hbuf_writebuf(struct hbuf *, unsigned char *, size_t);
+static unsigned char *
+		 hbuf_release(struct hbuf *, size_t *);
 static int	 hbuf_readchar(struct hbuf *, unsigned char *);
 static int	 hbuf_readbuf(struct hbuf *, unsigned char **, size_t);
 static int	 hbuf_advance(struct hbuf *, size_t);
@@ -77,7 +84,7 @@ hpack_context_free(struct hpack_context *hpack)
 int
 hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
 {
-	struct hbuf		 hbuf;
+	struct hbuf		*hbuf = NULL;
 	struct hpack_context	*ctx = NULL;
 	int			 ret = -1;
 
@@ -87,19 +94,19 @@ hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
 	if (hpack == NULL && (hpack = ctx = hpack_context_new()) == NULL)
 		goto fail;
 
-	memset(&hbuf, 0, sizeof(hbuf));
-	hbuf.buf = buf;
-	hbuf.len = len;
+	if ((hbuf = hbuf_new(buf, len)) == NULL)
+		goto fail;
 
 	do {
-		if (hpack_decode_buf(&hbuf) == -1)
+		if (hpack_decode_buf(hbuf) == -1)
 			goto fail;
-	} while (hbuf_left(&hbuf) > 0);
+	} while (hbuf_left(hbuf) > 0);
 
 	ret = 0;
  fail:
 	/* Free the local context (for single invocations) */
 	hpack_context_free(ctx);
+	hbuf_free(hbuf);
 
 	return (ret);
 }
@@ -340,15 +347,14 @@ huffman_init(void)
 unsigned char *
 huffman_decode(unsigned char *buf, size_t len, size_t *decoded_len)
 {
-	size_t			 n = 0, size = 256, newsize;
-	struct huffman_node	*node;
-	char			*decoded, *ptr;
+	struct huffman_node	*node, *root;
 	unsigned int		 i, j, code;
+	struct hbuf		*hbuf = NULL;
 
-	if ((node = hpack_global.hpack_huffman) == NULL)
+	if ((root = node = hpack_global.hpack_huffman) == NULL)
 		errx(1, "hpack not initialized");		
 
-	if ((decoded = calloc(size, 1)) == NULL)
+	if ((hbuf = hbuf_new(NULL, HUFFMAN_BUFSZ)) == NULL)
 		return (NULL);
 
 	for (i = 0; i < len; i++) {
@@ -359,28 +365,22 @@ huffman_decode(unsigned char *buf, size_t len, size_t *decoded_len)
 				node = node->hpn_one;
 			else
 				node = node->hpn_zero;
-
 			if (node->hpn_sym == -1)
 				continue;
-
-			decoded[n++] = node->hpn_sym;
-			if (n >= size) {
-				newsize = size + 256;
-				if ((ptr = recallocarray(decoded,
-				    size, newsize, 1)) == NULL)
-					goto fail;
-				size = newsize;
-				decoded = ptr;
+			if (hbuf_writechar(hbuf,
+			    (unsigned char)node->hpn_sym) == -1) {
+				DPRINTF("%s: failed to add '%c'", __func__,
+				    node->hpn_sym);
+				goto fail;
 			}
-			node = hpack_global.hpack_huffman;
+			node = root;
 		}
 	}
 
-	*decoded_len = n;
-	return (decoded);
+	return (hbuf_release(hbuf, decoded_len));
  fail:
 	*decoded_len = 0;
-	freezero(decoded, size);
+	hbuf_free(hbuf);
 	return (NULL);
 }
 
@@ -431,37 +431,115 @@ huffman_free(struct huffman_node *root)
 	free(root);
 }
 
+static struct hbuf *
+hbuf_new(unsigned char *data, size_t size)
+{
+	struct hbuf	*buf;
+
+	if ((buf = calloc(1, sizeof(*buf))) == NULL)
+		return (NULL);
+	if (size == 0)
+		size = HUFFMAN_BUFSZ;
+	if ((buf->data = calloc(1, size)) == NULL) {
+		free(buf);
+		return (NULL);
+	}
+	if (data != NULL) {
+		memcpy(buf->data, data, size);
+		buf->wpos = size;
+	}
+	buf->size = buf->wbsz = size;
+	return (buf);
+}
+
+static void
+hbuf_free(struct hbuf *buf)
+{
+	if (buf == NULL)
+		return;
+	freezero(buf->data, buf->size);
+	free(buf);
+}
+
+static int
+hbuf_realloc(struct hbuf *buf, size_t len)
+{
+	unsigned char	*ptr;
+	size_t		 newsize;
+
+	/* Allocate a multiple of the initial write buffer size */
+	newsize = (buf->size + len + (buf->wbsz - 1)) & ~(buf->wbsz - 1);
+
+	DPRINTF("%s: size %zu -> %zu", __func__, buf->size, newsize);
+
+	if ((ptr = recallocarray(buf->data, buf->size, newsize, 1)) == NULL)
+		return (-1);
+	buf->data = ptr;
+	buf->size = newsize;
+
+	return (0);
+}
+
+static int
+hbuf_writechar(struct hbuf *buf, unsigned char c)
+{
+	return (hbuf_writebuf(buf, &c, 1));
+}
+
+static int
+hbuf_writebuf(struct hbuf *buf, unsigned char *data, size_t len)
+{
+	if ((buf->wpos + len > buf->size) &&
+	    hbuf_realloc(buf, len) == -1)
+		return (-1);
+
+	memcpy(buf->data + buf->wpos, data, len);
+	buf->wpos += len;
+
+	return (0);
+}
+
+static unsigned char *
+hbuf_release(struct hbuf *buf, size_t *len)
+{
+	unsigned char	*data;
+	*len = buf->wpos;
+	data = buf->data;
+	free(buf);
+	return (data);
+}
+
 static int
 hbuf_readchar(struct hbuf *buf, unsigned char *c)
 {
-	if (buf->pos + 1 > buf->len)
+	if (buf->rpos + 1 > buf->size)
 		return (-1);
-	*c = *(buf->buf + buf->pos);
+	*c = *(buf->data + buf->rpos);
 	return (0);
 }
 
 static int
 hbuf_readbuf(struct hbuf *buf, unsigned char **ptr, size_t len)
 {
-	if (buf->pos + len > buf->len)
+	if (buf->rpos + len > buf->size)
 		return (-1);
-	*ptr = buf->buf + buf->pos;
+	*ptr = buf->data + buf->rpos;
 	return (0);
 }
 
 static int
 hbuf_advance(struct hbuf *buf, size_t len)
 {
-	if (buf->pos + len > buf->len)
+	if (buf->rpos + len > buf->size)
 		return (-1);
-	buf->pos += len;
+	buf->rpos += len;
 	return (0);
 }
 
 static size_t
 hbuf_left(struct hbuf *buf)
 {
-	if (buf->pos >= buf->len)
+	if (buf->rpos >= buf->size)
 		return (0);
-	return (buf->len - buf->pos);
+	return (buf->size - buf->rpos);
 }

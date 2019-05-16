@@ -38,6 +38,8 @@ char	*huffman_decode_str(unsigned char *, size_t);
 #define DPRINTF		warnx
 #endif
 
+#define HUFFMAN_BUFSZ	256
+
 struct huffman_node {
 	struct huffman_node	*hpn_zero;
 	struct huffman_node	*hpn_one;
@@ -54,9 +56,11 @@ struct hpack_context {
 
 /* Simple internal buffer API */
 struct hbuf {
-	unsigned char	*buf;
-	size_t		 len;
-	size_t		 pos;
+	unsigned char		*data;		/* data pointer */
+	size_t			 size;		/* data size */
+	size_t			 rpos;		/* read position */
+	size_t			 wpos;		/* write position */
+	size_t			 wbsz;		/* realloc buf size */
 };
 
 /*
