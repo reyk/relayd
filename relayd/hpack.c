@@ -38,7 +38,7 @@ static struct huffman_node *
 		 huffman_new(void);
 static void	 huffman_free(struct huffman_node *);
 
-static int	 hbuf_readbyte(struct hbuf *, unsigned char *);
+static int	 hbuf_readchar(struct hbuf *, unsigned char *);
 static int	 hbuf_readbuf(struct hbuf *, unsigned char **, size_t);
 static int	 hbuf_advance(struct hbuf *, size_t);
 static size_t	 hbuf_left(struct hbuf *);
@@ -129,7 +129,7 @@ hpack_decode_int(struct hbuf *buf, unsigned char prefix)
 	if (prefix > 8 || hbuf_left(buf) == 0)
 		return (-1);
 
-	if (hbuf_readbyte(buf, &b) == -1 ||
+	if (hbuf_readchar(buf, &b) == -1 ||
 	    hbuf_advance(buf, 1) == -1)
 		return (-1);
 
@@ -141,7 +141,7 @@ hpack_decode_int(struct hbuf *buf, unsigned char prefix)
 		do {
 			if (i > LONG_MAX)
 				return (-1);
-			if (hbuf_readbyte(buf, &b) == -1 ||
+			if (hbuf_readchar(buf, &b) == -1 ||
 			    hbuf_advance(buf, 1) == -1)
 				return (-1);
 			i += (b & ~0x80) << m;
@@ -185,16 +185,25 @@ static char *
 hpack_decode_str(struct hbuf *buf, unsigned char prefix)
 {
 	long		 i;
-	unsigned char	*ptr;
+	unsigned char	*ptr, c;
 	char		*str;
 
+	if (hbuf_readchar(buf, &c) == -1)
+		return (NULL);
 	if ((i = hpack_decode_int(buf, prefix)) == -1)
 		return (NULL);
 	if (hbuf_readbuf(buf, &ptr, (size_t)i) == -1 ||
 	    hbuf_advance(buf, (size_t)i) == -1)
 		return (NULL);
-	if ((str = huffman_decode_str(ptr, (size_t)i)) == NULL)
-		return (NULL);
+	if ((c & 0x80) == 0x80) {
+		DPRINTF("%s: decoding huffman code", __func__);
+		if ((str = huffman_decode_str(ptr, (size_t)i)) == NULL)
+			return (NULL);
+	} else {
+		if ((str = calloc(1, (size_t)i + 1)) == NULL)
+			return (NULL);
+		memcpy(str, ptr, (size_t)i);
+	}
 	return (str);
 }
 
@@ -229,7 +238,7 @@ hpack_decode_buf(struct hbuf *buf)
 	unsigned char			 c;
 	long				 i;
 
-	if (hbuf_readbyte(buf, &c) == -1)
+	if (hbuf_readchar(buf, &c) == -1)
 		return (-1);
 
 	/* 6.1 Indexed Header Field Representation */
@@ -297,7 +306,7 @@ huffman_init(void)
 		return (-1);
 
 	for (i = 0; i < HPACK_HUFFMAN_SIZE; i++) {
-		hph = &huffman_table[i];	
+		hph = &huffman_table[i];
 		cur = root;
 
 		for (j = hph->hph_length; j > 0; j--) {
@@ -423,7 +432,7 @@ huffman_free(struct huffman_node *root)
 }
 
 static int
-hbuf_readbyte(struct hbuf *buf, unsigned char *c)
+hbuf_readchar(struct hbuf *buf, unsigned char *c)
 {
 	if (buf->pos + 1 > buf->len)
 		return (-1);
