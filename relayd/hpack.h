@@ -16,23 +16,42 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/queue.h>
+
 #ifndef HPACK_H
 #define HPACK_H
 
 struct hpack_context;
 
+struct hpack_header {
+	char			*hdr_name;
+	char			*hdr_value;
+	TAILQ_ENTRY(hpack_header) hdr_entry;
+};
+TAILQ_HEAD(hpack_headerlist, hpack_header);
+
 int	 hpack_init(void);
+
 struct hpack_context *
 	 hpack_context_new(void);
 void	 hpack_context_free(struct hpack_context *);
-int	 hpack_decode(unsigned char *, size_t, struct hpack_context *);
+struct hpack_headerlist *
+	 hpack_decode(unsigned char *, size_t, struct hpack_context *);
+
+struct hpack_header *
+	 hpack_header_new(void);
+struct hpack_header *
+	 hpack_header_add(struct hpack_header *, struct hpack_header *);
+void	 hpack_header_free(struct hpack_header *);
+void	 hpack_headerlist_free(struct hpack_headerlist *);
+
 unsigned char
 	*huffman_decode(unsigned char *, size_t, size_t *);
 char	*huffman_decode_str(unsigned char *, size_t);
 
 #ifdef HPACK_INTERNAL
 
-#ifdef DEBUG
+#ifndef DEBUG
 #define DPRINTF(x...)	do{} while(0)
 #else
 #define DPRINTF		warnx
@@ -51,7 +70,8 @@ struct hpack {
 };
 
 struct hpack_context {
-	void			*notyet;
+	struct hpack_headerlist	*hcx_headers;
+	struct hpack_header	*hcx_next;
 };
 
 /* Simple internal buffer API */

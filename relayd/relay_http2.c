@@ -150,6 +150,8 @@ relay_http2_frame(struct evbuffer *src, struct http2_header *h2,
 void
 relay_http2_readframe(struct bufferevent *bev, void *arg)
 {
+	struct hpack_headerlist	*hdrs;
+	struct hpack_header	*hdr;
 	struct rpeer		*peer = arg;
 	struct rsession		*con = peer->con;
 	struct http2_header	 h2;
@@ -167,13 +169,22 @@ relay_http2_readframe(struct bufferevent *bev, void *arg)
 		ptr = EVBUFFER_DATA(src);
 
 		/* XXX */
-		hpack_decode(ptr + 6, length - 6, NULL);
+		if ((hdrs = hpack_decode(ptr + 6, length - 6, NULL)) == NULL) {
+			relay_close(con, "HTTP/2 empty HEADERS", 0);
+			return;
+		}
+		TAILQ_FOREACH(hdr, hdrs, hdr_entry) {
+			log_debug("%s: header \"%s: %s\"", __func__,
+			    hdr->hdr_name, hdr->hdr_value);
+		}
+		hpack_headerlist_free(hdrs);
 	} else if (h2.h2_type == HTTP2_TYPE_WINDOW_UPDATE) {
 		h2.h2_length[0] = 0;
 		h2.h2_length[1] = 0;
 		h2.h2_length[2] = 0;
 		if (relay_bufferevent_write(peer, &h2, sizeof(h2)) == -1) {
 			relay_close(con, "HTTP/2 settings ACK failed", 0);
+			return;
 		}
 	}
 

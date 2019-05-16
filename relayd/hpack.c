@@ -31,7 +31,11 @@
 static const struct hpack_index *
 		 hpack_get_index(long);
 static char	*hpack_decode_str(struct hbuf *, unsigned char);
-static int	 hpack_decode_buf(struct hbuf *);
+static int	 hpack_decode_buf(struct hbuf *, struct hpack_context *);
+static long	 hpack_decode_index(struct hbuf *, unsigned char,
+		    const struct hpack_index **, struct hpack_context *);
+static int	 hpack_decode_literal(struct hbuf *, unsigned char,
+		    struct hpack_context *);
 
 static int	 huffman_init(void);
 static struct huffman_node *
@@ -81,9 +85,10 @@ hpack_context_free(struct hpack_context *hpack)
 	free(hpack);
 }
 
-int
+struct hpack_headerlist *
 hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
 {
+	struct hpack_headerlist	*hdrs = NULL;
 	struct hbuf		*hbuf = NULL;
 	struct hpack_context	*ctx = NULL;
 	int			 ret = -1;
@@ -93,22 +98,62 @@ hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
 
 	if (hpack == NULL && (hpack = ctx = hpack_context_new()) == NULL)
 		goto fail;
+	if ((hdrs = calloc(1, sizeof(*hdrs))) == NULL)
+		goto fail;
+	TAILQ_INIT(hdrs);
+
+	hpack->hcx_headers = hdrs;
+	hpack->hcx_next = NULL;
 
 	if ((hbuf = hbuf_new(buf, len)) == NULL)
 		goto fail;
 
 	do {
-		if (hpack_decode_buf(hbuf) == -1)
+		if (hpack_decode_buf(hbuf, hpack) == -1)
 			goto fail;
 	} while (hbuf_left(hbuf) > 0);
 
 	ret = 0;
  fail:
 	/* Free the local context (for single invocations) */
-	hpack_context_free(ctx);
 	hbuf_free(hbuf);
+	if (ret != 0) {
+		hpack_headerlist_free(hdrs);
+		hdrs = NULL;
+	} else
+		hdrs = hpack->hcx_headers;
+	hpack->hcx_headers = NULL;
+	hpack->hcx_next = NULL;
+	hpack_context_free(ctx);
 
-	return (ret);
+	return (hdrs);
+}
+
+struct hpack_header *
+hpack_header_new(void)
+{
+	return (calloc(1, sizeof(struct hpack_header)));
+}
+
+void
+hpack_header_free(struct hpack_header *hdr)
+{
+	if (hdr == NULL)
+		return;
+	free(hdr->hdr_name);
+	free(hdr->hdr_value);
+	free(hdr);
+}
+
+void
+hpack_headerlist_free(struct hpack_headerlist *hdrs)
+{
+	struct hpack_header	*hdr;
+
+	while ((hdr = TAILQ_FIRST(hdrs)) != NULL) {
+		TAILQ_REMOVE(hdrs, hdr, hdr_entry);
+		hpack_header_free(hdr);
+	}
 }
 
 static const struct hpack_index *
@@ -161,8 +206,9 @@ hpack_decode_int(struct hbuf *buf, unsigned char prefix)
 
 static long
 hpack_decode_index(struct hbuf *buf, unsigned char prefix,
-    const struct hpack_index **idptr)
+    const struct hpack_index **idptr, struct hpack_context *hpack)
 {
+	struct hpack_header		*hdr = hpack->hcx_next;
 	const struct hpack_index	*id;
 	long				 i;
 	int				 hasvalue;
@@ -176,7 +222,19 @@ hpack_decode_index(struct hbuf *buf, unsigned char prefix,
 	if ((id = hpack_get_index(i)) == NULL)
 		return (0);
 
+	if (hdr == NULL || hdr->hdr_name != NULL || hdr->hdr_value != NULL)
+		errx(1, "invalid header");
+
+	if ((hdr->hdr_name = strdup(id->hpi_name)) == NULL)
+		return (-1);
 	hasvalue = id->hpi_value == NULL ? 0 : 1;
+	if (hasvalue &&
+	    (hdr->hdr_value = strdup(id->hpi_value)) == NULL) {
+		free(hdr->hdr_name);
+		hdr->hdr_name = NULL;
+		return (-1);
+	}
+
 	DPRINTF("%s: index: %ld (%s%s%s)", __func__,
 	    i, id->hpi_name,
 	    hasvalue ? ": " : "",
@@ -215,46 +273,63 @@ hpack_decode_str(struct hbuf *buf, unsigned char prefix)
 }
 
 static int
-hpack_decode_literal(struct hbuf *buf, unsigned char prefix)
+hpack_decode_literal(struct hbuf *buf, unsigned char prefix,
+    struct hpack_context *hpack)
 {
+	struct hpack_header		*hdr = hpack->hcx_next;
 	const struct hpack_index	*id;
 	long				 i;
 	char				*str;
 
-	if ((i = hpack_decode_index(buf, prefix, &id)) == -1)
+	if ((i = hpack_decode_index(buf, prefix, &id, hpack)) == -1)
 		return (-1);
 
 	if (i == 0) {
+		if (hdr == NULL ||
+		    hdr->hdr_name != NULL || hdr->hdr_value != NULL)
+			errx(1, "invalid header");
+
 		if ((str = hpack_decode_str(buf, 7)) == NULL)
 			return (-1);
 		DPRINTF("%s: name: %s", __func__, str);
-		free(str);
+		hdr->hdr_name = str;
+	}
+
+	/* The index might have set a default value */
+	if (hdr->hdr_value != NULL) {
+		free(hdr->hdr_value);
+		hdr->hdr_value = NULL;
 	}
 
 	if ((str = hpack_decode_str(buf, 7)) == NULL)
 		return (-1);
 	DPRINTF("%s: value: %s", __func__, str);
-	free(str);
+	hdr->hdr_value = str;
 
 	return (0);
 }
 
 static int
-hpack_decode_buf(struct hbuf *buf)
+hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
 {
-	unsigned char			 c;
-	long				 i;
+	struct hpack_header	*hdr = NULL;
+	unsigned char		 c;
+	long			 i;
 
 	if (hbuf_readchar(buf, &c) == -1)
-		return (-1);
+		goto fail;
+
+	if ((hdr = hpack_header_new()) == NULL)
+		goto fail;
+	hpack->hcx_next = hdr;
 
 	/* 6.1 Indexed Header Field Representation */
 	if ((c & 0x80) == 0x80) {
 		DPRINTF("%s: 0x%02x: 6.1 index", __func__, c);
 
 		/* 7 bit index */
-		if ((i = hpack_decode_index(buf, 7, NULL)) == -1)
-			return (-1);
+		if ((i = hpack_decode_index(buf, 7, NULL, hpack)) == -1)
+			goto fail;
 	}
 
 	/* 6.2.1. Literal Header Field with Incremental Indexing */
@@ -262,8 +337,8 @@ hpack_decode_buf(struct hbuf *buf)
 		DPRINTF("%s: 0x%02x: 6.2.1 literal indexed", __func__, c);
 
 		/* 6 bit index */
-		if (hpack_decode_literal(buf, 6) == -1)
-			return (-1);
+		if (hpack_decode_literal(buf, 6, hpack) == -1)
+			goto fail;
 	}
 
 	/* 6.2.2. Literal Header Field without Indexing */
@@ -271,8 +346,8 @@ hpack_decode_buf(struct hbuf *buf)
 		DPRINTF("%s: 0x%02x: 6.2.2 literal", __func__, c);
 
 		/* 4 bit index */
-		if (hpack_decode_literal(buf, 4) == -1)
-			return (-1);
+		if (hpack_decode_literal(buf, 4, hpack) == -1)
+			goto fail;
 	}
 
 	/* 6.2.3. Literal Header Field Never Indexed */
@@ -280,8 +355,8 @@ hpack_decode_buf(struct hbuf *buf)
 		DPRINTF("%s: 0x%02x: 6.2.3 literal never indexed", __func__, c);
 
 		/* 4 bit index */
-		if (hpack_decode_literal(buf, 4) == -1)
-			return (-1);
+		if (hpack_decode_literal(buf, 4, hpack) == -1)
+			goto fail;
 	}
 
 	/* 6.3. Dynamic Table Size Update */
@@ -290,16 +365,26 @@ hpack_decode_buf(struct hbuf *buf)
 
 		/* 5 bit index */
 		if (hpack_decode_int(buf, 5) == -1)
-			return (-1);
+			goto fail;
 	}
 
 	/* unknown index */
 	else {
 		DPRINTF("%s: 0x%02x: unknown index", __func__, c);
-		return (-1);
+		goto fail;
 	}
 
+	/* Add header to the list */
+	TAILQ_INSERT_TAIL(hpack->hcx_headers, hdr, hdr_entry);
+	hpack->hcx_next = NULL;
+
 	return (0);
+ fail:
+	DPRINTF("%s: failed", __func__);
+	hpack_header_free(hdr);
+	hpack->hcx_next = NULL;
+
+	return (-1);
 }
 
 int
@@ -352,7 +437,7 @@ huffman_decode(unsigned char *buf, size_t len, size_t *decoded_len)
 	struct hbuf		*hbuf = NULL;
 
 	if ((root = node = hpack_global.hpack_huffman) == NULL)
-		errx(1, "hpack not initialized");		
+		errx(1, "hpack not initialized");
 
 	if ((hbuf = hbuf_new(NULL, HUFFMAN_BUFSZ)) == NULL)
 		return (NULL);
@@ -406,7 +491,7 @@ huffman_decode_str(unsigned char *buf, size_t len)
 		str = NULL;
 	}
 
-	return (str); 
+	return (str);
 }
 
 static struct huffman_node *
