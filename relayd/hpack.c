@@ -115,7 +115,6 @@ hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
 
 	ret = 0;
  fail:
-	/* Free the local context (for single invocations) */
 	hbuf_free(hbuf);
 	if (ret != 0) {
 		hpack_headerlist_free(hdrs);
@@ -124,6 +123,8 @@ hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
 		hdrs = hpack->hcx_headers;
 	hpack->hcx_headers = NULL;
 	hpack->hcx_next = NULL;
+
+	/* Free the local context (for single invocations) */
 	hpack_context_free(ctx);
 
 	return (hdrs);

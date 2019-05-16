@@ -26,6 +26,9 @@ void	 relay_http2_readframe(struct bufferevent *, void *);
 ssize_t	 relay_http2_frame(struct evbuffer *, struct http2_header *,
 	    const char **);
 
+static const char *http2_frame_type[] = HTTP2_FRAME_TYPE;
+static const char *http2_settings_id[] = HTTP2_SETTINGS_ID;
+
 void
 relay_http2(struct rpeer *peer, const char *alpn)
 {
@@ -51,11 +54,7 @@ relay_http2_readpreface(struct bufferevent *bev, void *arg)
 	struct rsession		*con = peer->con;
 	ssize_t			 prefacelen = sizeof(HTTP2_PREFACE) - 1;
 	uint8_t			 preface[prefacelen];
-	const char		*errstr;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
-	struct http2_header	 h2;
-	struct http2_settings	 h2s;
-	ssize_t			 length;
 
 	/*
 	 * Get and validate the HTTP/2 preface
@@ -69,39 +68,8 @@ relay_http2_readpreface(struct bufferevent *bev, void *arg)
 		return;
 	}
 
-	/*
-	 * Get SETTINGS frame
-	 */
-	if ((length = relay_http2_frame(src, &h2, &errstr)) == -1) {
-		relay_close(con, errstr, 0);
-		return;
-	}
-	if (h2.h2_type != HTTP2_TYPE_SETTINGS) {
-		relay_close(con, "missing HTTP/2 settings", 0);
-		return;
-	}
-	for (; length >= (ssize_t)sizeof(h2s); length -= sizeof(h2s)) {
-		if (evbuffer_remove(src, &h2s, sizeof(h2s)) != sizeof(h2s)) {
-			relay_close(con, "short HTTP/2 setting", 0);
-			return;
-		}
-		h2s.h2s_id = ntohs(h2s.h2s_id);
-		h2s.h2s_value = ntohl(h2s.h2s_value);
-
-		log_debug("%s: setting %d: %d", __func__,
-		    h2s.h2s_id,
-		    h2s.h2s_value);
-	}
-
-	h2.h2_length[0] = 0;
-	h2.h2_length[1] = 0;
-	h2.h2_length[2] = 0;
-	h2.h2_flags = HTTP2_F_SETTINGS_ACK;
-	if (relay_bufferevent_write(peer, &h2, sizeof(h2)) == -1) {
-		relay_close(con, "HTTP/2 settings ACK failed", 0);
-	}
-
 	bev->readcb = relay_http2_readframe;
+	bev->readcb(bev, arg);
 }
 
 ssize_t
@@ -111,6 +79,8 @@ relay_http2_frame(struct evbuffer *src, struct http2_header *h2,
 	uint32_t	 length;
 
 	if (evbuffer_remove(src, h2, sizeof(*h2)) != sizeof(*h2)) {
+		log_debug("%s: header size %zu", __func__,
+		    EVBUFFER_LENGTH(src));
 		*errstr = "short HTTP/2 header";
 		return (-1);
 	}
@@ -119,18 +89,7 @@ relay_http2_frame(struct evbuffer *src, struct http2_header *h2,
 	length = h2->h2_length[0] << 16 |
 	    h2->h2_length[1] << 8 | h2->h2_length[2];
 
-	switch (h2->h2_type) {
-	case HTTP2_TYPE_DATA:
-	case HTTP2_TYPE_HEADERS:
-	case HTTP2_TYPE_RST_STREAM:
-	case HTTP2_TYPE_SETTINGS:
-	case HTTP2_TYPE_PUSH_PROMISE:
-	case HTTP2_TYPE_PING:
-	case HTTP2_TYPE_GOAWAY:
-	case HTTP2_TYPE_WINDOW_UPDATE:
-	case HTTP2_TYPE_CONTINUATION:
-		break;
-	default:
+	if (h2->h2_type >= HTTP2_TYPE_MAX) {
 		*errstr = "invalid HTTP/2 frame type";
 		return (-1);
 	}
@@ -138,9 +97,9 @@ relay_http2_frame(struct evbuffer *src, struct http2_header *h2,
 	/* XXX check for the reserved bit */
 	h2->h2_streamid = ntohl(h2->h2_streamid);
 
-	log_debug("%s: length %u type %u flags %u stream id %u", __func__,
+	log_debug("%s: length %u type %s flags 0x%x stream id %u", __func__,
 	    length,
-	    h2->h2_type,
+	    http2_frame_type[h2->h2_type],
 	    h2->h2_flags,
 	    h2->h2_streamid);
 
@@ -152,6 +111,7 @@ relay_http2_readframe(struct bufferevent *bev, void *arg)
 {
 	struct hpack_headerlist	*hdrs;
 	struct hpack_header	*hdr;
+	struct http2_settings	 h2s;
 	struct rpeer		*peer = arg;
 	struct rsession		*con = peer->con;
 	struct http2_header	 h2;
@@ -159,17 +119,32 @@ relay_http2_readframe(struct bufferevent *bev, void *arg)
 	const char		*errstr;
 	ssize_t			 length;
 	uint8_t			*ptr;
+	uint32_t		 window;
 
+	if (EVBUFFER_LENGTH(src) < sizeof(h2))
+		return;
 	if ((length = relay_http2_frame(src, &h2, &errstr)) == -1) {
 		relay_close(con, errstr, 0);
 		return;
 	}
+	if (EVBUFFER_LENGTH(src) < (size_t)length)
+		return;
 
-	if (h2.h2_type == HTTP2_TYPE_HEADERS) {
+	switch (h2.h2_type) {
+	case HTTP2_TYPE_HEADERS:
 		ptr = EVBUFFER_DATA(src);
+		if (h2.h2_flags & HTTP2_F_HEADERS_PRIORITY) {
+			if (length < 6)
+				return;
+			ptr += 6;
+			length -= 6;
+		}
+		if ((h2.h2_flags & HTTP2_F_HEADERS_END_HEADERS) == 0) {
+			relay_close(con, "HTTP/2 non-contigous headers", 0);
+		}
 
 		/* XXX */
-		if ((hdrs = hpack_decode(ptr + 6, length - 6, NULL)) == NULL) {
+		if ((hdrs = hpack_decode(ptr, length, NULL)) == NULL) {
 			relay_close(con, "HTTP/2 empty HEADERS", 0);
 			return;
 		}
@@ -178,14 +153,70 @@ relay_http2_readframe(struct bufferevent *bev, void *arg)
 			    hdr->hdr_name, hdr->hdr_value);
 		}
 		hpack_headerlist_free(hdrs);
-	} else if (h2.h2_type == HTTP2_TYPE_WINDOW_UPDATE) {
+		break;
+
+	case HTTP2_TYPE_WINDOW_UPDATE:
+		if (EVBUFFER_LENGTH(src) < sizeof(window))
+			return;
+		if (evbuffer_remove(src, &window,
+		    sizeof(window)) != sizeof(window)) {
+			relay_close(con, "short HTTP/2 window", 0);
+			return;
+		}
+		window = ntohl(window) & ~0x1;
+		log_debug("%s: window update %u", __func__, window);
+
 		h2.h2_length[0] = 0;
 		h2.h2_length[1] = 0;
 		h2.h2_length[2] = 0;
 		if (relay_bufferevent_write(peer, &h2, sizeof(h2)) == -1) {
+			relay_close(con, "HTTP/2 window ACK failed", 0);
+			return;
+		}
+		break;
+
+	case HTTP2_TYPE_SETTINGS:
+		for (; length >= (ssize_t)sizeof(h2s); length -= sizeof(h2s)) {
+			if (EVBUFFER_LENGTH(src) < sizeof(h2s)) {
+				log_debug("short");
+				return;
+			}
+			if (evbuffer_remove(src,
+			    &h2s, sizeof(h2s)) != sizeof(h2s)) {
+				relay_close(con, "short HTTP/2 setting", 0);
+				return;
+			}
+			h2s.h2s_id = ntohs(h2s.h2s_id);
+			h2s.h2s_value = ntohl(h2s.h2s_value);
+
+			if (h2s.h2s_id >= SETTINGS_MAX) {
+				log_debug("%s: setting <%d>: %d", __func__,
+				    h2s.h2s_id,
+				    h2s.h2s_value);
+			} else {
+				log_debug("%s: setting %s: %d", __func__,
+				    http2_settings_id[h2s.h2s_id],
+				    h2s.h2s_value);
+			}
+		}
+
+		h2.h2_length[0] = 0;
+		h2.h2_length[1] = 0;
+		h2.h2_length[2] = 0;
+		h2.h2_flags = HTTP2_F_SETTINGS_ACK;
+		if (relay_bufferevent_write(peer, &h2, sizeof(h2)) == -1) {
 			relay_close(con, "HTTP/2 settings ACK failed", 0);
 			return;
 		}
+		break;
+
+	case HTTP2_TYPE_GOAWAY:
+		relay_close(con, "HTTP/2 GOAWAY", 0);
+		return;
+
+	default:
+		log_debug("%s: unsupported type %d", __func__, h2.h2_type);
+		break;
 	}
 
 	evbuffer_drain(src, length);
