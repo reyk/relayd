@@ -29,13 +29,18 @@
 #include "hpack.h"
 
 static const struct hpack_index *
-		 hpack_get_index(long);
+		 hpack_table_get(long, struct hpack_table *);
+static int	 hpack_table_add(struct hpack_header *,
+		    struct hpack_table *);
+static int	 hpack_table_evict(long, long, struct hpack_table *);
+static int	 hpack_table_setsize(long, struct hpack_table *);
+
 static char	*hpack_decode_str(struct hbuf *, unsigned char);
-static int	 hpack_decode_buf(struct hbuf *, struct hpack_context *);
+static int	 hpack_decode_buf(struct hbuf *, struct hpack_table *);
 static long	 hpack_decode_index(struct hbuf *, unsigned char,
-		    const struct hpack_index **, struct hpack_context *);
+		    const struct hpack_index **, struct hpack_table *);
 static int	 hpack_decode_literal(struct hbuf *, unsigned char,
-		    struct hpack_context *);
+		    struct hpack_table *);
 
 static int	 huffman_init(void);
 static struct huffman_node *
@@ -66,44 +71,24 @@ hpack_init(void)
 	return (0);
 }
 
-struct hpack_context *
-hpack_context_new()
+struct hpack_headerblock *
+hpack_decode(unsigned char *buf, size_t len, struct hpack_table *hpack)
 {
-	struct hpack_context	*hpack;
-
-	if ((hpack = calloc(1, sizeof(*hpack))) == NULL)
-		return (NULL);
-
-	return (hpack);
-}
-
-void
-hpack_context_free(struct hpack_context *hpack)
-{
-	if (hpack == NULL)
-		return;
-	free(hpack);
-}
-
-struct hpack_headerlist *
-hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
-{
-	struct hpack_headerlist	*hdrs = NULL;
-	struct hbuf		*hbuf = NULL;
-	struct hpack_context	*ctx = NULL;
-	int			 ret = -1;
+	struct hpack_headerblock	*hdrs = NULL;
+	struct hbuf			*hbuf = NULL;
+	struct hpack_table		*ctx = NULL;
+	int				 ret = -1;
 
 	if (len == 0 || len > LONG_MAX)
 		goto fail;
 
-	if (hpack == NULL && (hpack = ctx = hpack_context_new()) == NULL)
+	if (hpack == NULL && (hpack = ctx = hpack_table_new(0)) == NULL)
 		goto fail;
-	if ((hdrs = calloc(1, sizeof(*hdrs))) == NULL)
+	if ((hdrs = hpack_headerblock_new()) == NULL)
 		goto fail;
-	TAILQ_INIT(hdrs);
 
-	hpack->hcx_headers = hdrs;
-	hpack->hcx_next = NULL;
+	hpack->htb_headers = hdrs;
+	hpack->htb_next = NULL;
 
 	if ((hbuf = hbuf_new(buf, len)) == NULL)
 		goto fail;
@@ -117,15 +102,15 @@ hpack_decode(unsigned char *buf, size_t len, struct hpack_context *hpack)
  fail:
 	hbuf_free(hbuf);
 	if (ret != 0) {
-		hpack_headerlist_free(hdrs);
+		hpack_headerblock_free(hdrs);
 		hdrs = NULL;
 	} else
-		hdrs = hpack->hcx_headers;
-	hpack->hcx_headers = NULL;
-	hpack->hcx_next = NULL;
+		hdrs = hpack->htb_headers;
+	hpack->htb_headers = NULL;
+	hpack->htb_next = NULL;
 
-	/* Free the local context (for single invocations) */
-	hpack_context_free(ctx);
+	/* Free the local table (for single invocations) */
+	hpack_table_free(ctx);
 
 	return (hdrs);
 }
@@ -134,6 +119,25 @@ struct hpack_header *
 hpack_header_new(void)
 {
 	return (calloc(1, sizeof(struct hpack_header)));
+}
+
+struct hpack_header *
+hpack_header_add(struct hpack_headerblock *hdrs,
+    const char *name, const char *value)
+{
+	struct hpack_header	*hdr;
+
+	if ((hdr = hpack_header_new()) == NULL)
+		return (NULL);
+	hdr->hdr_name = strdup(name);
+	hdr->hdr_value = strdup(value);
+	if (hdr->hdr_name == NULL || hdr->hdr_value == NULL) {
+		hpack_header_free(hdr);
+		return (NULL);
+	}
+	TAILQ_INSERT_TAIL(hdrs, hdr, hdr_entry);
+
+	return (hdr);
 }
 
 void
@@ -146,31 +150,166 @@ hpack_header_free(struct hpack_header *hdr)
 	free(hdr);
 }
 
+struct hpack_headerblock *
+hpack_headerblock_new(void)
+{
+	struct hpack_headerblock	*hdrs;
+	if ((hdrs = calloc(1, sizeof(*hdrs))) == NULL)
+		return (NULL);
+	TAILQ_INIT(hdrs);
+	return (hdrs);
+}
+
 void
-hpack_headerlist_free(struct hpack_headerlist *hdrs)
+hpack_headerblock_free(struct hpack_headerblock *hdrs)
 {
 	struct hpack_header	*hdr;
 
+	if (hdrs == NULL)
+		return;
 	while ((hdr = TAILQ_FIRST(hdrs)) != NULL) {
 		TAILQ_REMOVE(hdrs, hdr, hdr_entry);
 		hpack_header_free(hdr);
 	}
 }
 
-static const struct hpack_index *
-hpack_get_index(long i)
+struct hpack_table *
+hpack_table_new(size_t max_table_size)
 {
-	struct hpack_index	*id;
+	struct hpack_table	*hpack;
 
-	if (i < 1 || (size_t)i >= HPACK_STATIC_SIZE)
+	if ((hpack = calloc(1, sizeof(*hpack))) == NULL)
+		return (NULL);
+	if ((hpack->htb_dynamic = hpack_headerblock_new()) == NULL) {
+		free(hpack);
+		return (NULL);
+	}
+	hpack->htb_max_table_size = hpack->htb_table_size =
+	    max_table_size == 0 ? HPACK_MAX_TABLE_SIZE : max_table_size;
+
+	return (hpack);
+}
+
+void
+hpack_table_free(struct hpack_table *hpack)
+{
+	if (hpack == NULL)
+		return;
+	hpack_headerblock_free(hpack->htb_dynamic);
+	free(hpack);
+}
+
+static const struct hpack_index *
+hpack_table_get(long index, struct hpack_table *hpack)
+{
+	static struct hpack_index	 idbuf;
+	struct hpack_index		*id = NULL;
+	struct hpack_header		*hdr;
+	long				 dynidx = HPACK_STATIC_SIZE;
+
+	if (index < 1 || index > dynidx + (long)hpack->htb_dynamic_size)
 		return (NULL);
 
-	id = &static_table[i - 1];
-	if (id->hpi_id != i)
-		errx(1, "corrupted HPACK static table %ld != %ld",
-		    id->hpi_id, i);
+	if (index <= dynidx) {
+		/* Static table */
+		id = &static_table[index - 1];
+		if (id->hpi_id != index)
+			errx(1, "corrupted HPACK static table %ld != %ld",
+			    id->hpi_id, index);
+	} else {
+		/* Dynamic table */
+		TAILQ_FOREACH_REVERSE(hdr, hpack->htb_dynamic,
+		    hpack_headerblock, hdr_entry) {
+			dynidx++;
+			if (dynidx == index) {
+				idbuf.hpi_id = index;
+				idbuf.hpi_name = hdr->hdr_name;
+				idbuf.hpi_value = hdr->hdr_value;
+				id = &idbuf;
+				break;
+			}
+		}
+	}
 
 	return (id);
+}
+
+static int
+hpack_table_add(struct hpack_header *hdr, struct hpack_table *hpack)
+{
+	long		 newsize;
+
+	if (hdr->hdr_index != HPACK_INDEX)
+		return (0);
+
+	/*
+	 * Following RFC 7451 section 4.1,
+	 * the additional 32 octets account for an estimated overhead
+	 * associated with an entry.
+	 */
+	newsize = strlen(hdr->hdr_name) + strlen(hdr->hdr_value) + 32;
+
+	if (newsize > hpack->htb_table_size) {
+		/*
+		 * An entry larger than the maximum size causes
+		 * the table to be emptied of all existing entries.
+		 */
+		hpack_table_evict(0, newsize, hpack);
+		return (0);
+	} else
+		hpack_table_evict(hpack->htb_table_size,
+		    newsize, hpack);
+
+	if (hpack_header_add(hpack->htb_dynamic,
+	    hdr->hdr_name, hdr->hdr_value) == NULL)
+		return (-1);
+	hpack->htb_dynamic_entries++;
+	hpack->htb_dynamic_size += newsize;
+
+	return (0);
+}
+
+static int
+hpack_table_evict(long size, long newsize, struct hpack_table *hpack)
+{
+	struct hpack_header	*hdr;
+
+	while (size < (hpack->htb_dynamic_size + newsize) &&
+	    (hdr = TAILQ_FIRST(hpack->htb_dynamic)) != NULL) {
+		TAILQ_REMOVE(hpack->htb_dynamic, hdr, hdr_entry);
+		hpack->htb_dynamic_entries--;
+		hpack->htb_dynamic_size -=
+		    strlen(hdr->hdr_name) +
+		    strlen(hdr->hdr_value) +
+		    32;
+		hpack_header_free(hdr);
+	}
+
+	if (TAILQ_EMPTY(hpack->htb_dynamic) &&
+	    hpack->htb_dynamic_entries != 0 &&
+	    hpack->htb_dynamic_size != 0)
+		errx(1, "corrupted HPACK dynamic table");
+
+	return (0);
+}
+
+static int
+hpack_table_setsize(long size, struct hpack_table *hpack)
+{
+	if (size > hpack->htb_max_table_size)
+		return (-1);
+
+	if (hpack_table_evict(size, 0, hpack) == -1)
+		return (-1);
+	hpack->htb_table_size = size;
+
+	return (0);
+}
+
+size_t
+hpack_table_size(struct hpack_table *hpack)
+{
+	return ((size_t)hpack->htb_dynamic_size);
 }
 
 static long
@@ -207,9 +346,9 @@ hpack_decode_int(struct hbuf *buf, unsigned char prefix)
 
 static long
 hpack_decode_index(struct hbuf *buf, unsigned char prefix,
-    const struct hpack_index **idptr, struct hpack_context *hpack)
+    const struct hpack_index **idptr, struct hpack_table *hpack)
 {
-	struct hpack_header		*hdr = hpack->hcx_next;
+	struct hpack_header		*hdr = hpack->htb_next;
 	const struct hpack_index	*id;
 	long				 i;
 	int				 hasvalue;
@@ -219,9 +358,14 @@ hpack_decode_index(struct hbuf *buf, unsigned char prefix,
 
 	if ((i = hpack_decode_int(buf, prefix)) == -1)
 		return (-1);
+	DPRINTF("%s: index %ld", __func__, i);
 
-	if ((id = hpack_get_index(i)) == NULL)
+	if (i == 0)
 		return (0);
+	if ((id = hpack_table_get(i, hpack)) == NULL) {
+		printf("index not found: %ld\n", i);
+		return (-1);
+	}
 
 	if (hdr == NULL || hdr->hdr_name != NULL || hdr->hdr_value != NULL)
 		errx(1, "invalid header");
@@ -275,9 +419,9 @@ hpack_decode_str(struct hbuf *buf, unsigned char prefix)
 
 static int
 hpack_decode_literal(struct hbuf *buf, unsigned char prefix,
-    struct hpack_context *hpack)
+    struct hpack_table *hpack)
 {
-	struct hpack_header		*hdr = hpack->hcx_next;
+	struct hpack_header		*hdr = hpack->htb_next;
 	const struct hpack_index	*id;
 	long				 i;
 	char				*str;
@@ -311,7 +455,7 @@ hpack_decode_literal(struct hbuf *buf, unsigned char prefix,
 }
 
 static int
-hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
+hpack_decode_buf(struct hbuf *buf, struct hpack_table *hpack)
 {
 	struct hpack_header	*hdr = NULL;
 	unsigned char		 c;
@@ -322,7 +466,7 @@ hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
 
 	if ((hdr = hpack_header_new()) == NULL)
 		goto fail;
-	hpack->hcx_next = hdr;
+	hpack->htb_next = hdr;
 
 	/* 6.1 Indexed Header Field Representation */
 	if ((c & 0x80) == 0x80) {
@@ -330,6 +474,11 @@ hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
 
 		/* 7 bit index */
 		if ((i = hpack_decode_index(buf, 7, NULL, hpack)) == -1)
+			goto fail;
+
+		/* No value means header with empty value */
+		if ((hdr->hdr_value == NULL) &&
+		    (hdr->hdr_value = strdup("")) == NULL)
 			goto fail;
 	}
 
@@ -340,6 +489,7 @@ hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
 		/* 6 bit index */
 		if (hpack_decode_literal(buf, 6, hpack) == -1)
 			goto fail;
+		hdr->hdr_index = HPACK_INDEX;
 	}
 
 	/* 6.2.2. Literal Header Field without Indexing */
@@ -358,6 +508,7 @@ hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
 		/* 4 bit index */
 		if (hpack_decode_literal(buf, 4, hpack) == -1)
 			goto fail;
+		hdr->hdr_index = HPACK_NEVER_INDEX;
 	}
 
 	/* 6.3. Dynamic Table Size Update */
@@ -365,8 +516,13 @@ hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
 		DPRINTF("%s: 0x%02x: 6.3 dynamic table update", __func__, c);
 
 		/* 5 bit index */
-		if (hpack_decode_int(buf, 5) == -1)
+		if ((i = hpack_decode_int(buf, 5)) == -1)
 			goto fail;
+
+		if (hpack_table_setsize(i, hpack) == -1)
+			goto fail;
+
+		return (0);
 	}
 
 	/* unknown index */
@@ -375,15 +531,21 @@ hpack_decode_buf(struct hbuf *buf, struct hpack_context *hpack)
 		goto fail;
 	}
 
+	if (hdr->hdr_name == NULL || hdr->hdr_value == NULL)
+		goto fail;
+
+	if (hpack_table_add(hdr, hpack) == -1)
+		goto fail;
+
 	/* Add header to the list */
-	TAILQ_INSERT_TAIL(hpack->hcx_headers, hdr, hdr_entry);
-	hpack->hcx_next = NULL;
+	TAILQ_INSERT_TAIL(hpack->htb_headers, hdr, hdr_entry);
+	hpack->htb_next = NULL;
 
 	return (0);
  fail:
 	DPRINTF("%s: failed", __func__);
 	hpack_header_free(hdr);
-	hpack->hcx_next = NULL;
+	hpack->htb_next = NULL;
 
 	return (-1);
 }

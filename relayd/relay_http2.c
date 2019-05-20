@@ -109,17 +109,17 @@ relay_http2_frame(struct evbuffer *src, struct http2_header *h2,
 void
 relay_http2_readframe(struct bufferevent *bev, void *arg)
 {
-	struct hpack_headerlist	*hdrs;
-	struct hpack_header	*hdr;
-	struct http2_settings	 h2s;
-	struct rpeer		*peer = arg;
-	struct rsession		*con = peer->con;
-	struct http2_header	 h2;
-	struct evbuffer		*src = EVBUFFER_INPUT(bev);
-	const char		*errstr;
-	ssize_t			 length;
-	uint8_t			*ptr;
-	uint32_t		 window;
+	struct hpack_headerblock	*hdrs;
+	struct hpack_header		*hdr;
+	struct http2_settings		 h2s;
+	struct rpeer			*peer = arg;
+	struct rsession			*con = peer->con;
+	struct http2_header		 h2;
+	struct evbuffer			*src = EVBUFFER_INPUT(bev);
+	const char			*errstr;
+	ssize_t				 length;
+	uint8_t				*ptr;
+	uint32_t			 window;
 
 	if (EVBUFFER_LENGTH(src) < sizeof(h2))
 		return;
@@ -152,7 +152,7 @@ relay_http2_readframe(struct bufferevent *bev, void *arg)
 			log_debug("%s: header \"%s: %s\"", __func__,
 			    hdr->hdr_name, hdr->hdr_value);
 		}
-		hpack_headerlist_free(hdrs);
+		hpack_headerblock_free(hdrs);
 		break;
 
 	case HTTP2_TYPE_WINDOW_UPDATE:
