@@ -23,63 +23,71 @@
 
 struct hpack_table;
 
+enum hpack_header_index {
+	HPACK_NO_INDEX = 0,
+	HPACK_NEVER_INDEX,
+	HPACK_INDEX,
+};
+
 struct hpack_header {
-	char			*hdr_name;
-	char			*hdr_value;
-	unsigned int		 hdr_index;
-	TAILQ_ENTRY(hpack_header) hdr_entry;
+	char				*hdr_name;
+	char				*hdr_value;
+	enum hpack_header_index		 hdr_index;
+	TAILQ_ENTRY(hpack_header)	 hdr_entry;
 };
 TAILQ_HEAD(hpack_headerblock, hpack_header);
 
 int	 hpack_init(void);
 
-struct hpack_table *
-	 hpack_table_new(size_t);
+struct hpack_table
+	*hpack_table_new(size_t);
 void	 hpack_table_free(struct hpack_table *);
 size_t	 hpack_table_size(struct hpack_table *);
 
-struct hpack_headerblock *
-	 hpack_decode(unsigned char *, size_t, struct hpack_table *);
+struct hpack_headerblock
+	*hpack_decode(unsigned char *, size_t, struct hpack_table *);
+unsigned char
+	*hpack_encode(struct hpack_headerblock *, size_t *,
+	    struct hpack_table *);
 
-struct hpack_header *
-	 hpack_header_new(void);
-struct hpack_header *
-	 hpack_header_add(struct hpack_headerblock *,
-	    const char *key, const char *value);
+struct hpack_header
+	*hpack_header_new(void);
+struct hpack_header
+	*hpack_header_add(struct hpack_headerblock *,
+	    const char *, const char *, enum hpack_header_index);
 void	 hpack_header_free(struct hpack_header *);
-struct hpack_headerblock *
-	 hpack_headerblock_new(void);
+struct hpack_headerblock
+	*hpack_headerblock_new(void);
 void	 hpack_headerblock_free(struct hpack_headerblock *);
 
 unsigned char
-	*huffman_decode(unsigned char *, size_t, size_t *);
-char	*huffman_decode_str(unsigned char *, size_t);
+	*hpack_huffman_decode(unsigned char *, size_t, size_t *);
+char	*hpack_huffman_decode_str(unsigned char *, size_t);
+unsigned char
+	*hpack_huffman_encode(unsigned char *, size_t, size_t *);
 
 #ifdef HPACK_INTERNAL
 
 #ifndef DEBUG
-#define DPRINTF(x...)	do{} while(0)
+#define DPRINTF(x...)		do{} while(0)
 #else
-#define DPRINTF		warnx
+#define DPRINTF			warnx
 #endif
 
-#define HUFFMAN_BUFSZ		256
+/* from sys/param.h */
+#define MAX(a,b)		(((a)>(b))?(a):(b))
+
+#define HPACK_HUFFMAN_BUFSZ	256
 #define HPACK_MAX_TABLE_SIZE	4096
 
-enum hpack_header_index {
-	HPACK_NO_INDEX	= 0,
-	HPACK_INDEX,
-	HPACK_NEVER_INDEX,
-};
-
-struct huffman_node {
-	struct huffman_node	*hpn_zero;
-	struct huffman_node	*hpn_one;
-	int			 hpn_sym;
+struct hpack_huffman_node {
+	struct hpack_huffman_node	*hpn_zero;
+	struct hpack_huffman_node	*hpn_one;
+	int				 hpn_sym;
 };
 
 struct hpack {
-	struct huffman_node	*hpack_huffman;
+	struct hpack_huffman_node	*hpack_huffman;
 };
 
 struct hpack_table {
@@ -102,6 +110,21 @@ struct hbuf {
 	size_t			 wpos;		/* write position */
 	size_t			 wbsz;		/* realloc buf size */
 };
+
+/* Masks, flags, and prefixes of the field types */
+#define HPACK_M_INDEX			0x80	/* 7-bit prefix */
+#define HPACK_F_INDEX			0x80	/* index flag */
+#define HPACK_M_LITERAL_INDEX		0xc0	/* 6-bit prefix */
+#define HPACK_F_LITERAL_INDEX		0x40	/* literal index flag */
+#define HPACK_M_LITERAL_NO_INDEX	0xf0	/* 4-bit prefix */
+#define HPACK_F_LITERAL_NO_INDEX	0x00	/* no index flag */
+#define HPACK_M_LITERAL_NEVER_INDEX	0xf0	/* 4-bit prefix */
+#define HPACK_F_LITERAL_NEVER_INDEX	0x10	/* never index flag */
+#define HPACK_M_TABLE_SIZE_UPDATE	0xe0	/* 5-bit prefix */
+#define HPACK_F_TABLE_SIZE_UPDATE	0x20	/* dynamic table size flag */
+#define HPACK_M_LITERAL			0x80	/* 7-bit index */
+#define HPACK_F_LITERAL			0x00	/* literal encoding */
+#define HPACK_F_LITERAL_HUFFMAN		0x80	/* huffman encoding */
 
 /*
  * Appendix A.  Static Table Definition
