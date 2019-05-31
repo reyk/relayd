@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.256 2019/05/29 11:48:29 reyk Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.258 2019/05/31 15:25:57 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -137,13 +137,18 @@ struct ctl_relaytable {
 	u_int32_t	 flags;
 };
 
-struct ctl_relayfd {
-	objid_t		 relayid;
-	int		 type;
+enum fd_type {
+	RELAY_FD_CERT	= 1,
+	RELAY_FD_CACERT	= 2,
+	RELAY_FD_CAFILE	= 3,
+	RELAY_FD_KEY	= 4
 };
-#define RELAY_FD_CERT	1
-#define RELAY_FD_CACERT	2
-#define RELAY_FD_CAFILE	3
+
+struct ctl_relayfd {
+	objid_t		 id;
+	objid_t		 relayid;
+	enum fd_type	 type;
+};
 
 struct ctl_script {
 	objid_t		 host;
@@ -709,6 +714,12 @@ struct relay_ticket_key {
 
 #define HTTPFLAG_WEBSOCKETS	0x01
 
+struct keyname {
+	TAILQ_ENTRY(keyname)	 entry;
+	char			*name;
+};
+TAILQ_HEAD(keynamelist, keyname);
+
 struct protocol {
 	objid_t			 id;
 	u_int32_t		 flags;
@@ -727,6 +738,7 @@ struct protocol {
 	char			 tlscacert[PATH_MAX];
 	char			 tlscakey[PATH_MAX];
 	char			*tlscapass;
+	struct keynamelist	 tlscerts;
 	char			 name[MAX_NAME_SIZE];
 	int			 tickets;
 	enum prototype		 type;
@@ -764,6 +776,16 @@ struct ca_pkey {
 };
 TAILQ_HEAD(ca_pkeylist, ca_pkey);
 
+struct relay_cert {
+	objid_t			 cert_id;
+	objid_t			 cert_relayid;
+	int			 cert_fd;
+	int			 cert_key_fd;
+	EVP_PKEY		*cert_pkey;
+	TAILQ_ENTRY(relay_cert)	 cert_entry;
+};
+TAILQ_HEAD(relaycertlist, relay_cert);
+
 struct relay_config {
 	objid_t			 id;
 	u_int32_t		 flags;
@@ -778,7 +800,6 @@ struct relay_config {
 	struct timeval		 timeout;
 	enum forwardmode	 fwdmode;
 	union hashkey		 hashkey;
-	off_t			 tls_key_len;
 	off_t			 tls_cakey_len;
 };
 
@@ -803,10 +824,8 @@ struct relay {
 	struct tls_config	*rl_tls_client_cfg;
 	struct tls		*rl_tls_ctx;
 
-	int			rl_tls_cert_fd;
-	int			rl_tls_ca_fd;
-	int			rl_tls_cacert_fd;
-	char			*rl_tls_key;
+	int			 rl_tls_ca_fd;
+	int			 rl_tls_cacert_fd;
 	EVP_PKEY		*rl_tls_pkey;
 	X509			*rl_tls_cacertx509;
 	char			*rl_tls_cakey;
@@ -1088,6 +1107,7 @@ struct relayd {
 	struct routerlist	*sc_rts;
 	struct netroutelist	*sc_routes;
 	struct ca_pkeylist	*sc_pkeys;
+	struct relaycertlist	*sc_certs;
 	struct sessionlist	 sc_sessions;
 	char			 sc_demote_group[IFNAMSIZ];
 	u_int16_t		 sc_id;
@@ -1296,8 +1316,11 @@ struct relay	*relay_findbyname(struct relayd *, const char *);
 struct relay	*relay_findbyaddr(struct relayd *, struct relay_config *);
 EVP_PKEY	*pkey_find(struct relayd *, char *hash);
 struct ca_pkey	*pkey_add(struct relayd *, EVP_PKEY *, char *hash);
+struct relay_cert *cert_add(struct relayd *, objid_t);
+struct relay_cert *cert_find(struct relayd *, objid_t);
 char		*relay_load_fd(int, off_t *);
-int		 relay_load_certfiles(struct relayd *, struct relay *);
+int		 relay_load_certfiles(struct relayd *, struct relay *,
+		    const char *);
 int		 expand_string(char *, size_t, const char *, const char *);
 void		 translate_string(char *);
 void		 purge_key(char **, off_t);

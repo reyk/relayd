@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.236 2019/05/29 11:52:56 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.238 2019/05/31 15:25:57 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -169,8 +169,8 @@ typedef struct {
 %token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK CIPHERS CODE
 %token	COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK EXTERNAL FILENAME
 %token	FORWARD FROM HASH HEADER HEADERLEN HOST HTTP ICMP INCLUDE INET INET6
-%token	INTERFACE INTERVAL IP LABEL LISTEN VALUE LOADBALANCE LOG LOOKUP METHOD
-%token	MODE NAT NO DESTINATION NODELAY NOTHING ON PARENT PATH PFTAG PORT
+%token	INTERFACE INTERVAL IP KEYPAIR LABEL LISTEN VALUE LOADBALANCE LOG LOOKUP
+%token	METHOD MODE NAT NO DESTINATION NODELAY NOTHING ON PARENT PATH PFTAG PORT
 %token	PREFORK PRIORITY PROTO QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST
 %token	RESPONSE RETRY QUICK RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION
 %token	SNMP SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TLS
@@ -1029,6 +1029,7 @@ proto		: relay_proto PROTO STRING	{
 			p->tcpbacklog = RELAY_BACKLOG;
 			p->httpheaderlen = RELAY_DEFHEADERLENGTH;
 			TAILQ_INIT(&p->rules);
+			TAILQ_INIT(&p->tlscerts);
 			(void)strlcpy(p->tlsciphers, TLSCIPHERS_DEFAULT,
 			    sizeof(p->tlsciphers));
 			(void)strlcpy(p->tlsecdhecurves, TLSECDHECURVES_DEFAULT,
@@ -1256,6 +1257,22 @@ tlsflags	: SESSION TICKETS { proto->tickets = 1; }
 				YYERROR;
 			}
 			free($3);
+		}
+		| KEYPAIR STRING		{
+			struct keyname	*name;
+
+			if (strlen($2) >= PATH_MAX) {
+				yyerror("keypair name too long");
+				free($2);
+				YYERROR;
+			}
+			if ((name = calloc(1, sizeof(*name))) == NULL) {
+				yyerror("calloc");
+				free($2);
+				YYERROR;
+			}
+			name->name = $2;
+			TAILQ_INSERT_TAIL(&proto->tlscerts, name, entry);
 		}
 		| NO flag			{ proto->tlsflags &= ~($2); }
 		| flag				{ proto->tlsflags |= $1; }
@@ -1710,7 +1727,6 @@ relay		: RELAY STRING	{
 			r->rl_proto = NULL;
 			r->rl_conf.proto = EMPTY_ID;
 			r->rl_conf.dstretry = 0;
-			r->rl_tls_cert_fd = -1;
 			r->rl_tls_ca_fd = -1;
 			r->rl_tls_cacert_fd = -1;
 			TAILQ_INIT(&r->rl_tables);
@@ -1724,6 +1740,7 @@ relay		: RELAY STRING	{
 		} '{' optnl relayopts_l '}'	{
 			struct relay		*r;
 			struct relay_config	*rlconf = &rlay->rl_conf;
+			struct keyname		*name;
 
 			if (relay_findbyname(conf, rlconf->name) != NULL ||
 			    relay_findbyaddr(conf, rlconf) != NULL) {
@@ -1755,10 +1772,20 @@ relay		: RELAY STRING	{
 				rlay->rl_conf.proto = conf->sc_proto_default.id;
 			}
 
-			if (relay_load_certfiles(conf, rlay) == -1) {
+			if (TAILQ_EMPTY(&rlay->rl_proto->tlscerts) &&
+			    relay_load_certfiles(conf, rlay, NULL) == -1) {
 				yyerror("cannot load certificates for relay %s",
 				    rlay->rl_conf.name);
 				YYERROR;
+			}
+			TAILQ_FOREACH(name, &rlay->rl_proto->tlscerts, entry) {
+				if (relay_load_certfiles(conf,
+				    rlay, name->name) == -1) {
+					yyerror("cannot load keypair %s"
+					    " for relay %s", name->name,
+					    rlay->rl_conf.name);
+					YYERROR;
+				}
 			}
 
 			conf->sc_relaycount++;
@@ -2318,6 +2345,7 @@ lookup(char *s)
 		{ "interval",		INTERVAL },
 		{ "ip",			IP },
 		{ "key",		KEY },
+		{ "keypair",		KEYPAIR },
 		{ "label",		LABEL },
 		{ "least-states",	LEASTSTATES },
 		{ "listen",		LISTEN },
@@ -3269,11 +3297,8 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	rb->rl_conf.flags =
 	    (ra->rl_conf.flags & ~F_TLS) | (rc.flags & F_TLS);
 	if (!(rb->rl_conf.flags & F_TLS)) {
-		rb->rl_tls_cert_fd = -1;
 		rb->rl_tls_cacert_fd = -1;
 		rb->rl_tls_ca_fd = -1;
-		rb->rl_tls_key = NULL;
-		rb->rl_conf.tls_key_len = 0;
 	}
 	TAILQ_INIT(&rb->rl_tables);
 
@@ -3296,7 +3321,7 @@ relay_inherit(struct relay *ra, struct relay *rb)
 		goto err;
 	}
 
-	if (relay_load_certfiles(conf, rb) == -1) {
+	if (relay_load_certfiles(conf, rb, NULL) == -1) {
 		yyerror("cannot load certificates for relay %s",
 		    rb->rl_conf.name);
 		goto err;
