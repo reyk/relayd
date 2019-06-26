@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.236 2019/05/29 11:52:56 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.238 2019/05/31 15:25:57 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -1261,6 +1261,11 @@ tlsflags	: SESSION TICKETS { proto->tickets = 1; }
 		| KEYPAIR STRING		{
 			struct keyname	*name;
 
+			if (strlen($2) >= PATH_MAX) {
+				yyerror("keypair name too long");
+				free($2);
+				YYERROR;
+			}
 			if ((name = calloc(1, sizeof(*name))) == NULL) {
 				yyerror("calloc");
 				free($2);
