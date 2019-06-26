@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.177 2019/05/29 11:48:29 reyk Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.180 2019/06/26 12:13:47 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -1263,6 +1263,12 @@ cert_add(struct relayd *env, objid_t id)
 
 	if (id == 0)
 		id = ++last_cert_id;
+	if (id == INT_MAX) {
+		log_warnx("too many tls keypairs defined");
+		free(cert);
+		return (NULL);
+	}
+
 	cert->cert_id = id;
 	cert->cert_fd = -1;
 	cert->cert_key_fd = -1;
@@ -1317,8 +1323,8 @@ relay_load_fd(int fd, off_t *len)
 int
 relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 {
-	char	 certfile[PATH_MAX], ocspfile[PATH_MAX];
-	char	 hbuf[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
+	char	 certfile[PATH_MAX];
+	char	 hbuf[PATH_MAX];
 	struct protocol *proto = rlay->rl_proto;
 	struct relay_cert *cert;
 	int	 useport = htons(rlay->rl_conf.port);
@@ -1375,23 +1381,28 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 
 	if (useport) {
 		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s:%u.key", hbuf, useport) == -1 ||
-		    snprintf(ocspfile, sizeof(ocspfile),
-		    "/etc/ssl/private/%s:%u.ocsp", hbuf, useport) == -1)
+		    "/etc/ssl/private/%s:%u.key", hbuf, useport) == -1)
 			goto fail;
 	} else {
 		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s.key", hbuf) == -1 ||
-		    snprintf(ocspfile, sizeof(ocspfile),
-		    "/etc/ssl/private/%s.ocsp", hbuf) == -1)
+		    "/etc/ssl/private/%s.key", hbuf) == -1)
 			goto fail;
 	}
 	if ((key_fd = open(certfile, O_RDONLY)) == -1)
 		goto fail;
 	log_debug("%s: using private key %s", __func__, certfile);
 
+	if (useport) {
+		if (snprintf(certfile, sizeof(certfile),
+		    "/etc/ssl/%s:%u.ocsp", hbuf, useport) == -1)
+			goto fail;
+	} else {
+		if (snprintf(certfile, sizeof(certfile),
+		    "/etc/ssl/%s.ocsp", hbuf) == -1)
+			goto fail;
+	}
 	if ((ocsp_fd = open(certfile, O_RDONLY)) != -1)
-		log_debug("%s: using OCSP staple file %s", __func__, ocspfile);
+		log_debug("%s: using OCSP staple file %s", __func__, certfile);
 
 	if ((cert = cert_add(env, 0)) == NULL)
 		goto fail;
