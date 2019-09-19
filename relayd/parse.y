@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.238 2019/05/31 15:25:57 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.243 2019/09/18 20:27:53 benno Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -75,7 +75,9 @@ int		 popfile(void);
 int		 check_file_secrecy(int, const char *);
 int		 yyparse(void);
 int		 yylex(void);
-int		 yyerror(const char *, ...);
+int		 yyerror(const char *, ...)
+    __attribute__((__format__ (printf, 1, 2)))
+    __attribute__((__nonnull__ (1)));
 int		 kw_cmp(const void *, const void *);
 int		 lookup(char *);
 int		 igetc(void);
@@ -166,7 +168,7 @@ typedef struct {
 
 %}
 
-%token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK CIPHERS CODE
+%token	APPEND BACKLOG BACKUP BINARY BUFFER CA CACHE SET CHECK CIPHERS CODE
 %token	COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK EXTERNAL FILENAME
 %token	FORWARD FROM HASH HEADER HEADERLEN HOST HTTP ICMP INCLUDE INET INET6
 %token	INTERFACE INTERVAL IP KEYPAIR LABEL LISTEN VALUE LOADBALANCE LOG LOOKUP
@@ -174,7 +176,7 @@ typedef struct {
 %token	PREFORK PRIORITY PROTO QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST
 %token	RESPONSE RETRY QUICK RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION
 %token	SNMP SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TLS
-%token	TO ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL WITH TTL RTABLE
+%token	TO ROUTER RTLABEL TRANSPARENT TRAP URL WITH TTL RTABLE
 %token	MATCH PARAMS RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDHE
 %token	EDH TICKETS CONNECTION CONNECTIONS ERRORS STATE CHANGES CHECKS
 %token	WEBSOCKETS
@@ -350,7 +352,7 @@ port		: PORT HTTP {
 		}
 		| PORT NUMBER {
 			if ($2 <= 0 || $2 > (int)USHRT_MAX) {
-				yyerror("invalid port: %d", $2);
+				yyerror("invalid port: %lld", $2);
 				YYERROR;
 			}
 			$$.val[0] = htons($2);
@@ -387,9 +389,28 @@ sendbuf		: NOTHING		{
 		}
 		;
 
+sendbinbuf	: NOTHING		{
+			table->sendbinbuf = NULL;
+		}
+		| STRING		{
+			if (strlen($1) == 0) {
+				yyerror("empty binary send data");
+				free($1);
+				YYERROR;
+			}
+			table->sendbuf = strdup($1);
+			if (table->sendbuf == NULL)
+				fatal("out of memory");
+			table->sendbinbuf = string2binary($1);
+			if (table->sendbinbuf == NULL)
+				fatal("failed in binary send data");
+			free($1);
+		}
+		;
+
 main		: INTERVAL NUMBER	{
 			if ((conf->sc_conf.interval.tv_sec = $2) < 0) {
-				yyerror("invalid interval: %d", $2);
+				yyerror("invalid interval: %lld", $2);
 				YYERROR;
 			}
 		}
@@ -403,7 +424,7 @@ main		: INTERVAL NUMBER	{
 		| PREFORK NUMBER	{
 			if ($2 <= 0 || $2 > PROC_MAX_INSTANCES) {
 				yyerror("invalid number of preforked "
-				    "relays: %d", $2);
+				    "relays: %lld", $2);
 				YYERROR;
 			}
 			conf->sc_conf.prefork_relay = $2;
@@ -434,20 +455,8 @@ main		: INTERVAL NUMBER	{
 trap		: /* nothing */		{ $$ = 0; }
 		| TRAP			{ $$ = 1; }
 
-loglevel	: UPDATES		{ /* remove 6.4-current */
-					  $$ = RELAYD_OPT_LOGUPDATE;
-					  log_warnx("log updates deprecated, "
-					      "update configuration");
-					}
-		| STATE CHANGES		{ $$ = RELAYD_OPT_LOGUPDATE; }
+loglevel	: STATE CHANGES		{ $$ = RELAYD_OPT_LOGUPDATE; }
 		| HOST CHECKS		{ $$ = RELAYD_OPT_LOGHOSTCHECK; }
-		| ALL			{ /* remove 6.4-current */
-					  $$ = (RELAYD_OPT_LOGHOSTCHECK|
-						RELAYD_OPT_LOGCON|
-						RELAYD_OPT_LOGCONERR);
-					  log_warnx("log all deprecated, "
-					      "update configuration");
-					}
 		| CONNECTION		{ $$ = (RELAYD_OPT_LOGCON |
 						RELAYD_OPT_LOGCONERR); }
 		| CONNECTION ERRORS	{ $$ = RELAYD_OPT_LOGCONERR; }
@@ -895,7 +904,7 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 			}
 			table->conf.check = CHECK_HTTP_CODE;
 			if ((table->conf.retcode = $5) <= 0) {
-				yyerror("invalid HTTP code: %d", $5);
+				yyerror("invalid HTTP code: %lld", $5);
 				free($2);
 				free($3);
 				YYERROR;
@@ -948,6 +957,36 @@ tablecheck	: ICMP			{ table->conf.check = CHECK_ICMP; }
 			}
 			translate_string(table->conf.exbuf);
 			free($4);
+		}
+		| BINARY SEND sendbinbuf EXPECT STRING opttls {
+			table->conf.check = CHECK_BINSEND_EXPECT;
+			if ($6) {
+				conf->sc_conf.flags |= F_TLS;
+				table->conf.flags |= F_TLS;
+			}
+			if (strlen($5) == 0) {
+				yyerror("empty binary expect data");
+				free($5);
+				YYERROR;
+			}
+			if (strlcpy(table->conf.exbuf, $5,
+			    sizeof(table->conf.exbuf))
+			    >= sizeof(table->conf.exbuf)) {
+				yyerror("expect buffer truncated");
+				free($5);
+				YYERROR;
+			}
+			struct ibuf *ibuf = string2binary($5);
+			if (ibuf == NULL) {
+				yyerror("failed in binary expect data buffer");
+				ibuf_free(ibuf);
+				free($5);
+				YYERROR;
+			}
+			memcpy(table->conf.exbinbuf, ibuf->buf,
+			    ibuf_size(ibuf));
+			ibuf_free(ibuf);
+			free($5);
 		}
 		| SCRIPT STRING {
 			table->conf.check = CHECK_SCRIPT;
@@ -1094,7 +1133,7 @@ httpflags_l	: httpflags comma httpflags_l
 
 httpflags	: HEADERLEN NUMBER	{
 			if ($2 < 0 || $2 > RELAY_MAXHEADERLENGTH) {
-				yyerror("invalid headerlen: %d", $2);
+				yyerror("invalid headerlen: %lld", $2);
 				YYERROR;
 			}
 			proto->httpheaderlen = $2;
@@ -1115,7 +1154,7 @@ tcpflags	: SACK			{ proto->tcpflags |= TCPFLAG_SACK; }
 		| NO SPLICE		{ proto->tcpflags |= TCPFLAG_NSPLICE; }
 		| BACKLOG NUMBER	{
 			if ($2 < 0 || $2 > RELAY_MAX_BACKLOG) {
-				yyerror("invalid backlog: %d", $2);
+				yyerror("invalid backlog: %lld", $2);
 				YYERROR;
 			}
 			proto->tcpbacklog = $2;
@@ -1123,13 +1162,13 @@ tcpflags	: SACK			{ proto->tcpflags |= TCPFLAG_SACK; }
 		| SOCKET BUFFER NUMBER	{
 			proto->tcpflags |= TCPFLAG_BUFSIZ;
 			if ((proto->tcpbufsiz = $3) < 0) {
-				yyerror("invalid socket buffer size: %d", $3);
+				yyerror("invalid socket buffer size: %lld", $3);
 				YYERROR;
 			}
 		}
 		| IP STRING NUMBER	{
 			if ($3 < 0) {
-				yyerror("invalid ttl: %d", $3);
+				yyerror("invalid ttl: %lld", $3);
 				free($2);
 				YYERROR;
 			}
@@ -1901,7 +1940,7 @@ forwardspec	: STRING port retry	{
 
 			TAILQ_INIT(&al);
 			if (host($1, &al, 1, &$2, NULL, -1) <= 0) {
-				yyerror("invalid listen ip: %s", $1);
+				yyerror("invalid forward ip: %s", $1);
 				free($1);
 				YYERROR;
 			}
@@ -2072,7 +2111,7 @@ routeoptsl	: ROUTE addrprefix {
 				YYERROR;
 			}
 			if ($2 < 0 || $2 > RT_TABLEID_MAX) {
-				yyerror("invalid rtable id %d", $2);
+				yyerror("invalid rtable id %lld", $2);
 				YYERROR;
 			}
 			router->rt_conf.rtable = $2;
@@ -2150,7 +2189,7 @@ hostflags	: RETRY NUMBER		{
 				YYERROR;
 			}
 			if ($2 < 0) {
-				yyerror("invalid retry value: %d\n", $2);
+				yyerror("invalid retry value: %lld\n", $2);
 				YYERROR;
 			}
 			hst->conf.retry = $2;
@@ -2161,7 +2200,7 @@ hostflags	: RETRY NUMBER		{
 				YYERROR;
 			}
 			if ($2 < 0) {
-				yyerror("invalid parent value: %d\n", $2);
+				yyerror("invalid parent value: %lld\n", $2);
 				YYERROR;
 			}
 			hst->conf.parentid = $2;
@@ -2172,7 +2211,7 @@ hostflags	: RETRY NUMBER		{
 				YYERROR;
 			}
 			if ($2 < 0 || $2 > RTP_MAX) {
-				yyerror("invalid priority value: %d\n", $2);
+				yyerror("invalid priority value: %lld\n", $2);
 				YYERROR;
 			}
 			hst->conf.priority = $2;
@@ -2183,7 +2222,7 @@ hostflags	: RETRY NUMBER		{
 				YYERROR;
 			}
 			if ($3 < 0) {
-				yyerror("invalid ttl value: %d\n", $3);
+				yyerror("invalid ttl value: %lld\n", $3);
 				YYERROR;
 			}
 			hst->conf.ttl = $3;
@@ -2220,7 +2259,7 @@ addrprefix	: address '/' NUMBER 		{
 			    ($3 > 32 || $3 < 0)) ||
 			    ($$.ss.ss_family == AF_INET6 &&
 			    ($3 > 128 || $3 < 0))) {
-				yyerror("invalid prefixlen %d", $3);
+				yyerror("invalid prefixlen %lld", $3);
 				YYERROR;
 			}
 			$$.prefixlen = $3;
@@ -2237,7 +2276,7 @@ addrprefix	: address '/' NUMBER 		{
 retry		: /* empty */		{ $$ = 0; }
 		| RETRY NUMBER		{
 			if (($$ = $2) < 0) {
-				yyerror("invalid retry value: %d\n", $2);
+				yyerror("invalid retry value: %lld\n", $2);
 				YYERROR;
 			}
 		}
@@ -2246,7 +2285,7 @@ retry		: /* empty */		{ $$ = 0; }
 timeout		: NUMBER
 		{
 			if ($1 < 0) {
-				yyerror("invalid timeout: %d\n", $1);
+				yyerror("invalid timeout: %lld\n", $1);
 				YYERROR;
 			}
 			$$.tv_sec = $1 / 1000;
@@ -2303,10 +2342,10 @@ lookup(char *s)
 {
 	/* this has to be sorted always */
 	static const struct keywords keywords[] = {
-		{ "all",		ALL },
 		{ "append",		APPEND },
 		{ "backlog",		BACKLOG },
 		{ "backup",		BACKUP },
+		{ "binary",		BINARY },
 		{ "block",		BLOCK },
 		{ "buffer",		BUFFER },
 		{ "ca",			CA },
@@ -2410,7 +2449,6 @@ lookup(char *s)
 		{ "transparent",	TRANSPARENT },
 		{ "trap",		TRAP },
 		{ "ttl",		TTL },
-		{ "updates",		UPDATES },
 		{ "url",		URL },
 		{ "value",		VALUE },
 		{ "websockets",		WEBSOCKETS },
@@ -2888,6 +2926,8 @@ load_config(const char *filename, struct relayd *x_conf)
 			}
 			if (table->sendbuf != NULL)
 				free(table->sendbuf);
+			if (table->sendbinbuf != NULL)
+				ibuf_free(table->sendbinbuf);
 			free(table);
 			continue;
 		}
@@ -3385,7 +3425,7 @@ is_if_in_group(const char *ifname, const char *groupname)
 	int			 s;
 	int			 ret = 0;
 
-	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
 		err(1, "socket");
 
 	memset(&ifgr, 0, sizeof(ifgr));

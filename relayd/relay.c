@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.248 2019/06/26 12:13:47 reyk Exp $	*/
+/*	$OpenBSD: relay.c,v 1.250 2019/07/13 06:53:00 chrisz Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -1638,7 +1638,8 @@ relay_connect(struct rsession *con)
 
 	getmonotime(&con->se_tv_start);
 
-	if (!TAILQ_EMPTY(&rlay->rl_tables)) {
+	if (con->se_out.ss.ss_family == AF_UNSPEC &&
+	    !TAILQ_EMPTY(&rlay->rl_tables)) {
 		if (relay_from_table(con) != 0)
 			return (-1);
 	} else if (con->se_out.ss.ss_family == AF_UNSPEC) {
@@ -2504,7 +2505,7 @@ relay_tls_readcb(int fd, short event, void *arg)
 	ret = tls_read(cre->tls, rbuf, howmuch);
 	if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 		goto retry;
-	} else if (ret < 0) {
+	} else if (ret == -1) {
 		what |= EVBUFFER_ERROR;
 		goto err;
 	}
@@ -2563,7 +2564,7 @@ relay_tls_writecb(int fd, short event, void *arg)
 		    EVBUFFER_LENGTH(bufev->output));
 		if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 			goto retry;
-		} else if (ret < 0) {
+		} else if (ret == -1) {
 			what |= EVBUFFER_ERROR;
 			goto err;
 		}
