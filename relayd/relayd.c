@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.180 2019/06/26 12:13:47 reyk Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.182 2019/09/15 19:23:29 rob Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -222,11 +222,6 @@ main(int argc, char *argv[])
 
 	if (ps->ps_noaction == 0)
 		log_info("startup");
-
-	if (unveil("/", "r") == -1)
-		err(1, "unveil");
-	if (unveil(NULL, NULL) == -1)
-		err(1, "unveil");
 
 	event_init();
 
@@ -535,6 +530,7 @@ purge_table(struct relayd *env, struct tablelist *head, struct table *table)
 		free(host);
 	}
 	free(table->sendbuf);
+	ibuf_free(table->sendbinbuf);
 	tls_config_free(table->tls_cfg);
 
 	if (head != NULL)
