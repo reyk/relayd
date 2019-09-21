@@ -61,11 +61,11 @@ void		 relay_ruledebug(struct relay_rule *);
 void		 relay_init(struct privsep *, struct privsep_proc *p, void *);
 void		 relay_launch(void);
 int		 relay_socket(struct sockaddr_storage *, in_port_t,
-		    struct protocol *, int, int);
+		    struct protocol *, int, int, int);
 int		 relay_socket_listen(struct sockaddr_storage *, in_port_t,
 		    struct protocol *);
 int		 relay_socket_connect(struct sockaddr_storage *, in_port_t,
-		    struct protocol *, int);
+		    struct protocol *, int, int);
 
 void		 relay_accept(int, short, void *);
 void		 relay_input(struct rsession *);
@@ -341,8 +341,11 @@ relay_init(struct privsep *ps, struct privsep_proc *p, void *arg)
 	/* Unlimited file descriptors (use system limits) */
 	socket_rlimit(-1);
 
+#if 1
+	/* XXX pledge doesn't allow setsockopt with SO_RTABLE */
 	if (pledge("stdio recvfd inet", NULL) == -1)
 		fatal("pledge");
+#endif
 
 	/* Schedule statistics timer */
 	evtimer_set(&env->sc_statev, relay_statistics, ps);
@@ -532,7 +535,7 @@ relay_socket_getport(struct sockaddr_storage *ss)
 
 int
 relay_socket(struct sockaddr_storage *ss, in_port_t port,
-    struct protocol *proto, int fd, int reuseport)
+    struct protocol *proto, int fd, int reuseport, int rtable)
 {
 	struct linger	lng;
 	int		s = -1, val;
@@ -567,6 +570,10 @@ relay_socket(struct sockaddr_storage *ss, in_port_t port,
 		    &val, sizeof(val)) == -1)
 			goto bad;
 	}
+	if (fd == -1 && rtable > -1)
+		if (setsockopt(s, SOL_SOCKET, SO_RTABLE, &rtable,
+		    sizeof(int)) == -1)
+			goto bad;
 
 	/*
 	 * IP options
@@ -634,11 +641,11 @@ relay_socket(struct sockaddr_storage *ss, in_port_t port,
 
 int
 relay_socket_connect(struct sockaddr_storage *ss, in_port_t port,
-    struct protocol *proto, int fd)
+    struct protocol *proto, int fd, int rtable)
 {
 	int	s;
 
-	if ((s = relay_socket(ss, port, proto, fd, 0)) == -1)
+	if ((s = relay_socket(ss, port, proto, fd, 0, rtable)) == -1)
 		return (-1);
 
 	if (connect(s, (struct sockaddr *)ss, ss->ss_len) == -1) {
@@ -659,7 +666,7 @@ relay_socket_listen(struct sockaddr_storage *ss, in_port_t port,
 {
 	int s;
 
-	if ((s = relay_socket(ss, port, proto, -1, 1)) == -1)
+	if ((s = relay_socket(ss, port, proto, -1, 1, -1)) == -1)
 		return (-1);
 
 	if (bind(s, (struct sockaddr *)ss, ss->ss_len) == -1)
@@ -1149,6 +1156,7 @@ relay_accept(int fd, short event, void *arg)
 	con->se_out.dir = RELAY_DIR_RESPONSE;
 	con->se_retry = rlay->rl_conf.dstretry;
 	con->se_bnds = -1;
+	con->se_rtable = -1;
 	con->se_out.port = rlay->rl_conf.dstport;
 	switch (ss.ss_family) {
 	case AF_INET:
@@ -1387,6 +1395,7 @@ relay_from_table(struct rsession *con)
 		rlt->rlt_index = host->idx + 1;
 	con->se_retry = host->conf.retry;
 	con->se_out.port = table->conf.port;
+	con->se_rtable = table->conf.rtable;
 	bcopy(&host->conf.ss, &con->se_out.ss, sizeof(con->se_out.ss));
 
 	return (0);
@@ -1553,7 +1562,7 @@ relay_connect_retry(int fd, short sig, void *arg)
 
  retry:
 	if ((con->se_out.s = relay_socket_connect(&con->se_out.ss,
-	    con->se_out.port, rlay->rl_proto, bnds)) == -1) {
+	    con->se_out.port, rlay->rl_proto, bnds, con->se_rtable)) == -1) {
 		log_debug("%s: session %d: "
 		    "forward failed: %s, %s", __func__,
 		    con->se_id, strerror(errno),
@@ -1674,7 +1683,7 @@ relay_connect(struct rsession *con)
 
  retry:
 	if ((con->se_out.s = relay_socket_connect(&con->se_out.ss,
-	    con->se_out.port, rlay->rl_proto, bnds)) == -1) {
+	    con->se_out.port, rlay->rl_proto, bnds, con->se_rtable)) == -1) {
 		if (errno == ENFILE || errno == EMFILE) {
 			log_debug("%s: session %d: forward failed: %s",
 			    __func__, con->se_id, strerror(errno));

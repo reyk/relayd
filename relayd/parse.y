@@ -741,6 +741,7 @@ tablespec	: table			{
 			table = tb;
 			dstmode = RELAY_DSTMODE_DEFAULT;
 			hashkey = NULL;
+			table->conf.rtable = -1;
 		} tableopts_l		{
 			struct table	*tb;
 			if (table->conf.port == 0)
@@ -843,6 +844,17 @@ tableopts	: CHECK tablecheck
 				dstmode = $2;
 				break;
 			}
+		}
+		| RTABLE NUMBER {
+			if (table->conf.rtable != -1) {
+				yyerror("rtable already specified");
+				YYERROR;
+			}
+			if ($2 < 0 || $2 > RT_TABLEID_MAX) {
+				yyerror("invalid rtable id %lld", $2);
+				YYERROR;
+			}
+			table->conf.rtable = $2;
 		}
 		;
 
@@ -2103,18 +2115,6 @@ routeoptsl	: ROUTE addrprefix {
 			router->rt_gwtable->conf.flags |= F_USED;
 			router->rt_conf.gwtable = $3->conf.id;
 			router->rt_conf.gwport = $3->conf.port;
-		}
-		| RTABLE NUMBER {
-			if (router->rt_conf.rtable) {
-				yyerror("router %s rtable already specified",
-				    router->rt_conf.name);
-				YYERROR;
-			}
-			if ($2 < 0 || $2 > RT_TABLEID_MAX) {
-				yyerror("invalid rtable id %lld", $2);
-				YYERROR;
-			}
-			router->rt_conf.rtable = $2;
 		}
 		| RTLABEL STRING {
 			if (strlcpy(router->rt_conf.label, $2,

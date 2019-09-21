@@ -70,8 +70,11 @@ hce_init(struct privsep *ps, struct privsep_proc *p, void *arg)
 	/* Allow maximum available sockets for TCP checks */
 	socket_rlimit(-1);
 
+#if 1
+	/* XXX pledge doesn't allow setsockopt with SO_RTABLE */
 	if (pledge("stdio recvfd inet", NULL) == -1)
 		fatal("%s: pledge", __func__);
+#endif
 }
 
 void

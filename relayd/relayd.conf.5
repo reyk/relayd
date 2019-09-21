@@ -421,6 +421,9 @@ keyword in
 .It Ic interval Ar number
 Override the global interval and specify one for this table.
 It must be a multiple of the global interval.
+.It Ic rtable Ar id
+Use the kernel routing domain or table with the specified
+.Ar id .
 .It Ic timeout Ar number
 Set the timeout in milliseconds for each host that is checked using
 TCP as the transport.
@@ -1448,9 +1451,6 @@ This entry is mandatory and must be specified once.
 Specify the network address and prefix length of a route destination
 that is reachable via the active gateways.
 This entry must be specified at least once in a router directive.
-.It Ic rtable Ar id
-Add the routes to the kernel routing table with the specified
-.Ar id .
 .It Ic rtlabel Ar label
 Add the routes with the specified
 .Ar label

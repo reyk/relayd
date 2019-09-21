@@ -509,6 +509,7 @@ struct table_config {
 	char			 digest[41]; /* length of sha1 digest * 2 */
 	u_int8_t		 digest_type;
 	enum forwardmode	 fwdmode;
+	int			 rtable;
 };
 
 struct table {
@@ -583,6 +584,7 @@ struct rsession {
 	int				 se_bnds;
 	u_int16_t			 se_tag;
 	u_int16_t			 se_label;
+	int				 se_rtable;
 
 	int				 se_cid;
 	pid_t				 se_pid;

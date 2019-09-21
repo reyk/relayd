@@ -82,6 +82,11 @@ check_tcp(struct ctl_tcp_event *cte)
 	if (setsockopt(s, SOL_SOCKET, SO_LINGER, &lng, sizeof(lng)) == -1)
 		goto bad;
 
+	if (cte->table->conf.rtable > -1)
+		if (setsockopt(s, SOL_SOCKET, SO_RTABLE,
+		    &cte->table->conf.rtable, sizeof(int)) == -1)
+			goto bad;
+
 	if (cte->host->conf.ttl > 0)
 		switch (cte->host->conf.ss.ss_family) {
 		case AF_INET:
