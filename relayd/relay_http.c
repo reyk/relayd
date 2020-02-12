@@ -524,9 +524,10 @@ relay_read_http(struct bufferevent *bev, void *arg)
 
 		/*
 		 * Ask the server to close the connection after this request
-		 * since we don't read any further request headers.
+		 * since we don't read any further request headers, unless upgrade
+		 * is requested, in which case we do NOT want to add this header.
 		 */
-		if (cre->toread == TOREAD_UNLIMITED)
+		if (cre->toread == TOREAD_UNLIMITED && upgrade == NULL)
 			if (kv_add(&desc->http_headers, "Connection",
 			    "close", 0) == NULL)
 				goto fail;
