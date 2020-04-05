@@ -647,7 +647,8 @@ struct relay_rule {
 #define RULE_SKIP_SRC		 3
 #define RULE_SKIP_DST		 4
 #define RULE_SKIP_METHOD	 5
-#define RULE_SKIP_COUNT		 6
+#define RULE_SKIP_STATUS	 6
+#define RULE_SKIP_COUNT		 7
 	struct relay_rule	*rule_skip[RULE_SKIP_COUNT];
 
 #define RULE_FLAG_QUICK		0x01
@@ -664,6 +665,7 @@ struct relay_rule {
 	struct relay_table	*rule_table;
 
 	u_int			 rule_method;
+	u_int			 rule_status;
 	char			 rule_labelname[LABEL_NAME_SIZE];
 	char			 rule_tablename[TABLE_NAME_SIZE];
 	char			 rule_taggedname[TAG_NAME_SIZE];

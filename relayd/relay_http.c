@@ -1816,6 +1816,8 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 		    (desc->http_method == HTTP_METHOD_RESPONSE ||
 		     desc->http_method != r->rule_method))
 			RELAY_GET_SKIP_STEP(RULE_SKIP_METHOD);
+		else if (r->rule_status && desc->http_status != r->rule_status)
+			RELAY_GET_SKIP_STEP(RULE_SKIP_STATUS);
 		else if (r->rule_tagged && con->se_tag != r->rule_tagged)
 			RELAY_GET_NEXT_STEP;
 		else if (relay_httpheader_test(cre, r, &matches) != 0)
@@ -1917,6 +1919,8 @@ relay_calc_skip_steps(struct relay_rules *rules)
 			RELAY_SET_SKIP_STEPS(RULE_SKIP_DST);
 		else if (cur->rule_method != prev->rule_method)
 			RELAY_SET_SKIP_STEPS(RULE_SKIP_METHOD);
+		else if (cur->rule_status != prev->rule_status)
+			RELAY_SET_SKIP_STEPS(RULE_SKIP_STATUS);
 
 		prev = cur;
 		cur = TAILQ_NEXT(cur, rule_entry);
