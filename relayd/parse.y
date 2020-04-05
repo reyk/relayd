@@ -1448,6 +1448,13 @@ ruleopts	: METHOD STRING					{
 			rule->rule_method = id;
 			free($2);
 		}
+		| CODE NUMBER					{
+			if ($2 < 100 || $2 > 599) {
+				yyerror("invalid HTTP code: %lld", $2);
+				YYERROR;
+			}
+			rule->rule_status = $2;
+		}
 		| COOKIE key_option STRING value		{
 			keytype = KEY_TYPE_COOKIE;
 			rule->rule_kv[keytype].kv_key = strdup($3);
